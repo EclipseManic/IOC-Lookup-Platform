@@ -1,0 +1,57 @@
+- generic [ref=e2]:
+  - navigation [ref=e3]:
+    - generic [ref=e4]:
+      - generic [ref=e11]:
+        - generic [ref=e12]: IOC Universal
+        - generic [ref=e13]: threat intelligence lookup
+      - generic [ref=e14]:
+        - button "Home" [ref=e15] [cursor=pointer]
+        - button "Investigations" [ref=e16] [cursor=pointer]
+        - button "Batch" [ref=e17] [cursor=pointer]
+  - generic [ref=e18]:
+    - generic [ref=e22]:
+      - generic [ref=e23]:
+        - generic [ref=e24]: Universal IOC Lookup Platform
+        - heading "Refang, Enrich & Score" [level=1] [ref=e26]
+        - paragraph [ref=e27]: Query any IOC across VirusTotal, AbuseIPDB, ThreatFox, MalwareBazaar, and urlscan.io with real-time progress, composite scoring, deep enrichment, and investigation workflow.
+        - generic [ref=e28]:
+          - generic [ref=e29]:
+            - generic [ref=e30]: $
+            - textbox "IP, hash, domain, URL, email..." [active] [ref=e31]
+            - button "Lookup" [ref=e32] [cursor=pointer]
+          - generic [ref=e33]:
+            - generic [ref=e34]: "Quick:"
+            - button "212.192.246.151" [ref=e35] [cursor=pointer]
+            - button "google.com" [ref=e36] [cursor=pointer]
+            - button "8.8.8.8" [ref=e37] [cursor=pointer]
+            - button "Sample MD5" [ref=e38] [cursor=pointer]
+      - generic [ref=e39]:
+        - generic [ref=e40]: ioc_lookup.json
+        - generic [ref=e45]: "{ \"ioc\": \"212.192.246.151\", \"verdict\": \"malicious\", \"score\": 87.3, \"sources\": [ { \"VT\": 23 detections }, { \"AbuseIPDB\": 89% confidence }, { \"ThreatFox\": \"C2 server\" } ], \"enrichment\": { \"geo\": \"RU\", \"rdns\": \"host.example.com\" } }"
+    - generic [ref=e47]:
+      - heading "Supported IOC Types" [level=3] [ref=e48]
+      - generic [ref=e49]:
+        - generic [ref=e50]:
+          - generic [ref=e51]: IPv4
+          - generic [ref=e52]: IP Addresses
+          - generic [ref=e53]: GeoIP, ASN, reverse DNS, WHOIS, RDAP enforcement
+        - generic [ref=e54]:
+          - generic [ref=e55]: Dom
+          - generic [ref=e56]: Domains
+          - generic [ref=e57]: WHOIS age, DNS records, SSL cert, threat intel correlation
+        - generic [ref=e58]:
+          - generic [ref=e59]: URL
+          - generic [ref=e60]: URLs
+          - generic [ref=e61]: Redirect chain, host extraction, full enrichment pipeline
+        - generic [ref=e62]:
+          - generic [ref=e63]: Hash
+          - generic [ref=e64]: File Hashes
+          - generic [ref=e65]: MD5, SHA1, SHA256 — malware family, signatures, tags
+        - generic [ref=e66]:
+          - generic [ref=e67]: Email
+          - generic [ref=e68]: Emails
+          - generic [ref=e69]: Domain extraction, WHOIS, VT lookups
+        - generic [ref=e70]:
+          - generic [ref=e71]: CVE
+          - generic [ref=e72]: CVE / Other
+          - generic [ref=e73]: Search-based types with pattern detection

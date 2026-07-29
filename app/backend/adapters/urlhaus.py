@@ -1,0 +1,135 @@
+import httpx
+
+from app.backend.adapters.base import NormalizedResult, RateLimitConfig, SourceAdapter, is_valid_api_key
+
+
+class URLHausAdapter(SourceAdapter):
+    name = "URLhaus"
+    supported_types = ["url", "domain"]
+    rate_limit = RateLimitConfig(requests_per_minute=60)
+
+    async def _query_host(self, ioc_value: str) -> dict:
+        client = self._get_client()
+        resp = await client.post(
+                "https://urlhaus-api.abuse.ch/v1/host/",
+                data={"host": ioc_value},
+                headers={"Content-Type": "application/x-www-form-urlencoded"},
+                timeout=15,
+            )
+        if resp.status_code == 429:
+            return {"query_status": "rate_limited"}
+        if resp.status_code != 200:
+            return {}
+        return resp.json()
+
+    async def _query_url(self, ioc_value: str) -> dict:
+        client = self._get_client()
+        resp = await client.post(
+                "https://urlhaus-api.abuse.ch/v1/url/",
+                data={"url": ioc_value},
+                headers={"Content-Type": "application/x-www-form-urlencoded"},
+                timeout=15,
+            )
+        if resp.status_code == 429:
+            return {"query_status": "rate_limited"}
+        if resp.status_code != 200:
+            return {}
+        return resp.json()
+
+    async def _query_payload(self, ioc_value: str) -> dict:
+        client = self._get_client()
+        resp = await client.post(
+                "https://urlhaus-api.abuse.ch/v1/payload/",
+                data={"hash": ioc_value},
+                headers={"Content-Type": "application/x-www-form-urlencoded"},
+                timeout=15,
+            )
+        if resp.status_code == 429:
+            return {"query_status": "rate_limited"}
+        if resp.status_code != 200:
+            return {}
+        return resp.json()
+
+    async def _query_tag(self, tag: str) -> dict:
+        client = self._get_client()
+        resp = await client.post(
+                "https://urlhaus-api.abuse.ch/v1/tag/",
+                data={"tag": tag},
+                headers={"Content-Type": "application/x-www-form-urlencoded"},
+                timeout=15,
+            )
+        if resp.status_code == 429:
+            return {"query_status": "rate_limited"}
+        if resp.status_code != 200:
+            return {}
+        return resp.json()
+
+    async def lookup(self, ioc_value: str, ioc_type: str) -> NormalizedResult:
+        if ioc_type == "domain":
+            data = await self._query_host(ioc_value)
+        else:
+            data = await self._query_url(ioc_value)
+
+        if not data:
+            return NormalizedResult(
+                ioc=ioc_value, ioc_type=ioc_type, source=self.name,
+                verdict="unknown", raw_score=0.0,
+            )
+
+        if data.get("query_status") == "rate_limited":
+            return NormalizedResult(
+                ioc=ioc_value, ioc_type=ioc_type, source=self.name,
+                verdict="unknown", tags=["rate_limited"],
+            )
+
+        query_status = data.get("query_status", "")
+
+        if query_status == "ok":
+            tags = ["malware_url"]
+            threat = data.get("threat", "")
+            if threat:
+                tags.append(f"threat:{threat}")
+            for t in data.get("tags", []):
+                if isinstance(t, str):
+                    tags.append(t)
+            ref = data.get("urlhaus_reference", "")
+            if ref:
+                tags.append(f"ref:{ref}")
+
+            if threat:
+                try:
+                    tag_data = await self._query_tag(threat)
+                    if tag_data.get("query_status") == "ok":
+                        tag_urls = tag_data.get("urls", [])
+                        if isinstance(tag_urls, list):
+                            tags.append(f"tag_urls:{len(tag_urls)}")
+                except Exception:
+                    pass
+
+            url_status = data.get("url_status", "")
+            if url_status == "online":
+                verdict = "malicious"
+                raw_score = 1.0
+            elif url_status in ("offline", "unknown"):
+                verdict = "suspicious"
+                raw_score = 0.5
+            else:
+                verdict = "unknown"
+                raw_score = 0.0
+
+            urls = data.get("urls", [])
+            if isinstance(urls, list):
+                for u in urls[:10]:
+                    if isinstance(u, dict):
+                        tags.append(f"url:{u.get('url', '')[:80]}")
+
+            return NormalizedResult(
+                ioc=ioc_value, ioc_type=ioc_type, source=self.name,
+                verdict=verdict, raw_score=raw_score, tags=tags,
+                source_link=ref or None, reports_count=len(urls) if isinstance(urls, list) else 0,
+            )
+
+        return NormalizedResult(
+            ioc=ioc_value, ioc_type=ioc_type, source=self.name,
+            verdict="unknown", raw_score=0.0,
+        )

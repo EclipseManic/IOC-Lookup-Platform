@@ -1,0 +1,248 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8"/>
+<meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+<title>IOC Universal — Threat Intelligence Lookup Platform</title>
+<link rel="preconnect" href="https://fonts.googleapis.com"/>
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin/>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&family=JetBrains+Mono:wght@400;500;600;700&display=swap" rel="stylesheet"/>
+<link rel="stylesheet" href="/static/style.css"/>
+</head>
+<body>
+
+<div id="app">
+  <nav class="navbar">
+    <div class="nav-inner">
+      <div class="nav-left">
+        <div class="nav-brand">
+          <svg class="brand-icon" width="28" height="28" viewBox="0 0 28 28" fill="none"><rect x="2" y="2" width="24" height="24" rx="6" stroke="currentColor" stroke-width="2"/><path d="M8 14h12M14 8v12" stroke="currentColor" stroke-width="2" stroke-linecap="round"/><circle cx="14" cy="14" r="3" fill="currentColor" opacity="0.4"/></svg>
+          <div class="brand-text">
+            <span class="brand-title">IOC Universal</span>
+            <span class="brand-sub">threat intelligence lookup</span>
+          </div>
+        </div>
+      </div>
+      <div class="nav-right">
+        <button class="nav-btn is-active" id="nav-landing" onclick="switchView('landing')">Home</button>
+        <button class="nav-btn" id="nav-results" onclick="switchView('results')" style="display:none">Results</button>
+        <button class="nav-btn" id="nav-timeline" onclick="switchView('timeline')">Timeline</button>
+        <button class="nav-btn" id="nav-compare" onclick="openCompare()">Compare</button>
+        <button class="nav-btn" id="nav-investigations" onclick="switchView('investigations')">Investigations</button>
+        <button class="nav-btn" id="nav-batch" onclick="switchView('batch')">Batch</button>
+      </div>
+    </div>
+  </nav>
+
+  <!-- LANDING -->
+  <section id="view-landing" class="view is-active">
+    <div class="hero">
+      <div class="hero-grid-bg"></div>
+      <div class="hero-radial"></div>
+      <div class="hero-inner">
+        <div class="hero-content">
+          <div class="eyebrow"><span class="pulse-dot"></span>Universal IOC Lookup Platform</div>
+          <h1 class="hero-title">Refang, <span class="hero-accent">Enrich</span> &amp; Score</h1>
+          <p class="hero-desc">Query any IOC across VirusTotal, AbuseIPDB, ThreatFox, MalwareBazaar, and urlscan.io with real-time progress, composite scoring, deep enrichment, and investigation workflow.</p>
+          <div class="search-section">
+            <div class="search-bar" id="landing-search">
+              <span class="prompt">$</span>
+              <input type="text" id="search-input" placeholder="IP, hash, domain, URL, email..." autofocus/>
+              <button class="btn btn-primary" id="search-btn">Lookup</button>
+            </div>
+            <div class="quick-examples">
+              <span class="examples-label">Quick:</span>
+              <button class="example-chip" data-value="212.192.246.151">212.192.246.151</button>
+              <button class="example-chip" data-value="google.com">google.com</button>
+              <button class="example-chip" data-value="8.8.8.8">8.8.8.8</button>
+              <button class="example-chip" data-value="d41d8cd98f00b204e9800998ecf8427e">Sample MD5</button>
+            </div>
+          </div>
+        </div>
+        <div class="hero-terminal">
+          <div class="term-chrome">
+            <span class="dot dot-red"></span><span class="dot dot-yellow"></span><span class="dot dot-green"></span>
+            <span class="term-title">ioc_lookup.json</span>
+          </div>
+          <div class="term-body">{ <span class="tk-key">"ioc"</span>: <span class="tk-str">"212.192.246.151"</span>,
+  <span class="tk-key">"verdict"</span>: <span class="tk-str tk-verdict-mal">"malicious"</span>,
+  <span class="tk-key">"score"</span>: <span class="tk-num">87.3</span>,
+  <span class="tk-key">"sources"</span>: [
+    { <span class="tk-key">"VT"</span>: <span class="tk-num">23</span> <span class="tk-dim">detections</span> },
+    { <span class="tk-key">"AbuseIPDB"</span>: <span class="tk-num">89%</span> <span class="tk-dim">confidence</span> },
+    { <span class="tk-key">"ThreatFox"</span>: <span class="tk-str">"C2 server"</span> }
+  ],
+  <span class="tk-key">"enrichment"</span>: {
+    <span class="tk-key">"geo"</span>: <span class="tk-str">"RU"</span>,
+    <span class="tk-key">"rdns"</span>: <span class="tk-str">"host.example.com"</span> } }</div>
+        </div>
+      </div>
+    </div>
+
+    <div class="section-container">
+      <div class="error-bar" id="landing-error" hidden></div>
+      <div class="spinner" id="landing-spinner" hidden></div>
+
+      <section class="panel-section" style="margin-bottom:2rem">
+        <h3 class="panel-title">Supported IOC Types</h3>
+        <div class="feature-grid">
+          <div class="feature-card"><span class="fc-icon">IPv4</span><span class="fc-label">IP Addresses</span><span class="fc-desc">GeoIP, ASN, reverse DNS, WHOIS, RDAP enforcement</span></div>
+          <div class="feature-card"><span class="fc-icon">Dom</span><span class="fc-label">Domains</span><span class="fc-desc">WHOIS age, DNS records, SSL cert, threat intel correlation</span></div>
+          <div class="feature-card"><span class="fc-icon">URL</span><span class="fc-label">URLs</span><span class="fc-desc">Redirect chain, host extraction, full enrichment pipeline</span></div>
+          <div class="feature-card"><span class="fc-icon">Hash</span><span class="fc-label">File Hashes</span><span class="fc-desc">MD5, SHA1, SHA256 — malware family, signatures, tags</span></div>
+          <div class="feature-card"><span class="fc-icon">Email</span><span class="fc-label">Emails</span><span class="fc-desc">Domain extraction, WHOIS, VT lookups</span></div>
+          <div class="feature-card"><span class="fc-icon">CVE</span><span class="fc-label">CVE / Other</span><span class="fc-desc">Search-based types with pattern detection</span></div>
+        </div>
+      </section>
+
+      <section class="panel-section adapter-health-section">
+        <div class="health-header">
+          <h3 class="panel-title">Adapter Health</h3>
+          <span class="health-summary" id="health-summary">Loading...</span>
+        </div>
+        <div class="health-grid" id="health-grid"></div>
+      </section>
+    </div>
+  </section>
+
+  <!-- RESULTS -->
+  <section id="view-results" class="view">
+    <div class="section-container">
+      <div class="results-omnibar">
+        <span class="prompt">$</span>
+        <input type="text" id="omnibar-input" placeholder="Enter another IOC..."/>
+        <button class="btn btn-primary" id="omnibar-btn">Lookup</button>
+        <button class="btn btn-secondary" id="save-to-inv-btn">Save</button>
+      </div>
+      <div class="spinner" id="results-spinner" hidden></div>
+      <div class="error-bar" id="results-error" hidden></div>
+
+      <!-- Pipeline Progress -->
+      <div id="pipeline-progress" style="display:none">
+        <div class="pipeline-bar">
+          <div class="pipeline-fill" id="pipeline-fill"></div>
+        </div>
+        <div class="pipeline-stages" id="pipeline-stages"></div>
+      </div>
+
+      <!-- Results Content -->
+      <div id="result-content" style="display:none">
+        <div class="breadcrumbs" id="breadcrumbs" style="display:none"></div>
+        <div class="threat-header" id="threat-header"></div>
+
+        <!-- View Toggle: Analyst / Executive -->
+        <div class="view-toggle" id="view-toggle" style="display:none">
+          <button class="toggle-btn is-active" data-view="analyst" onclick="switchResultView('analyst')">Analyst View</button>
+          <button class="toggle-btn" data-view="executive" onclick="switchResultView('executive')">Executive Summary</button>
+        </div>
+
+        <!-- Executive Summary Panel (shown in executive mode) -->
+        <div class="executive-summary-panel" id="executive-summary-panel" style="display:none">
+          <div class="exec-summary-verdict">
+            <span class="exec-verdict-badge" id="exec-verdict-badge"></span>
+            <span class="exec-score-label">Score: <strong id="exec-score-num"></strong></span>
+            <span class="exec-action-badge" id="exec-action-badge"></span>
+          </div>
+          <div class="executive-summary-content" id="executive-summary-content"></div>
+          <div class="executive-summary-action" id="executive-summary-action"></div>
+          <div class="executive-summary-note">This summary is generated deterministically from the structured analysis data. An LLM-powered version can replace this template when an API key is configured.</div>
+        </div>
+
+        <div class="analyst-view-panel" id="analyst-view-panel">
+          <div class="tab-bar">
+          <button class="tab-btn is-active" data-tab="overview">Overview</button>
+          <button class="tab-btn" data-tab="sources">Sources</button>
+          <button class="tab-btn" data-tab="enrichment">Enrichment</button>
+          <button class="tab-btn" data-tab="relations">Relations</button>
+          <button class="tab-btn" data-tab="graph">Graph</button>
+          <button class="tab-btn" data-tab="export">Export</button>
+        </div>
+        <div class="tab-panel is-active" id="panel-overview"></div>
+        <div class="tab-panel" id="panel-sources"></div>
+        <div class="tab-panel" id="panel-enrichment"></div>
+        <div class="tab-panel" id="panel-relations"></div>
+        <div class="tab-panel" id="panel-graph"></div>
+        <div class="tab-panel" id="panel-export"></div>
+      </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- TIMELINE -->
+  <section id="view-timeline" class="view">
+    <div class="section-container">
+      <div class="view-header">
+        <h2 class="section-title">Session Timeline</h2>
+        <button class="btn btn-secondary" onclick="clearSession()">Clear History</button>
+      </div>
+      <div id="timeline-content"></div>
+    </div>
+  </section>
+
+  <!-- COMPARE -->
+  <section id="view-compare" class="view">
+    <div class="section-container">
+      <div id="compare-content"></div>
+    </div>
+  </section>
+
+  <!-- INVESTIGATIONS -->
+  <section id="view-investigations" class="view">
+    <div class="section-container">
+      <div class="view-header">
+        <h2 class="section-title">Investigations</h2>
+        <button class="btn btn-primary" id="new-inv-btn">+ New Investigation</button>
+      </div>
+      <div class="investigations-grid" id="inv-grid"></div>
+
+      <div id="inv-detail" style="display:none">
+        <div class="inv-detail-header">
+          <button class="btn btn-secondary" id="inv-back-btn">&larr; Back</button>
+          <h3 id="inv-detail-name"></h3>
+          <button class="btn btn-secondary" id="inv-export-btn">Export</button>
+          <button class="btn btn-secondary" id="inv-delete-btn" style="color:var(--red)">Delete</button>
+        </div>
+        <div class="inv-detail-iocs" id="inv-detail-iocs"></div>
+      </div>
+    </div>
+  </section>
+
+  <!-- BATCH -->
+  <section id="view-batch" class="view">
+    <div class="section-container">
+      <div class="view-header">
+        <h2 class="section-title">Batch IOC Analysis</h2>
+      </div>
+      <div class="batch-layout">
+        <div class="batch-upload">
+          <div class="drop-zone" id="drop-zone">
+            <svg width="48" height="48" viewBox="0 0 48 48" fill="none"><path d="M24 32V16m-8 8l8-8 8 8M10 36h28" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" opacity="0.5"/></svg>
+            <p>Drop a CSV or JSON file here</p>
+            <span class="dz-hint">or paste IOCs below (one per line)</span>
+            <textarea class="batch-textarea" id="batch-textarea" placeholder="8.8.8.8&#10;google.com&#10;212.192.246.151&#10;d41d8cd98f00b204e9800998ecf8427e"></textarea>
+            <button class="btn btn-primary" id="batch-analyze-btn">Analyze All</button>
+          </div>
+        </div>
+        <div class="batch-progress" id="batch-progress" style="display:none">
+          <div class="pipeline-bar"><div class="pipeline-fill" id="batch-fill"></div></div>
+          <div class="batch-summary" id="batch-summary"></div>
+          <div class="batch-subtasks" id="batch-subtasks"></div>
+        </div>
+      </div>
+    </div>
+  </section>
+</div>
+
+<!-- Modal -->
+<div class="modal-overlay" id="modal-overlay" onclick="closeModal()"></div>
+<div class="modal" id="modal">
+  <div class="modal-header">
+    <h3 id="modal-title"></h3>
+    <button class="modal-close" onclick="closeModal()">&times;</button>
+  </div>
+  <div class="modal-body" id="modal-body"></div>
+</div>
+
+<script src="/static/app.js?v=8"></script>
+</body>
+</html>

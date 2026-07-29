@@ -1,0 +1,34 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+.eggs/
+
+# Environment
+.env
+
+# Node
+node_modules/
+ui/node_modules/
+ui/dist/
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Project specific
+data/ioc_platform.db
+ui/tsconfig.tsbuildinfo
+
+# OpenCode config
+.opencode/
+
+# Planning / working dirs
+.planning/
+undefined/

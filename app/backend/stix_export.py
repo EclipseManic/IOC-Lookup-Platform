@@ -1,0 +1,238 @@
+import csv
+import io
+import uuid
+from datetime import datetime, timezone
+
+_STIX_IOC_MAP: dict[str, str] = {
+    "ipv4": "ipv4-addr",
+    "ipv6": "ipv6-addr",
+    "domain": "domain-name",
+    "url": "url",
+    "md5": "file",
+    "sha1": "file",
+    "sha256": "file",
+    "email": "email-addr",
+    "cve": "vulnerability",
+}
+
+_HASH_KEYS: dict[str, str] = {
+    "md5": "MD5",
+    "sha1": "SHA-1",
+    "sha256": "SHA-256",
+}
+
+
+def _ts() -> str:
+    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.000Z")
+
+
+def _stix_id(prefix: str) -> str:
+    return f"{prefix}--{uuid.uuid4()}"
+
+
+def _verdict_to_labels(verdict: str) -> list[str]:
+    m = {"malicious": ["malicious-activity"], "suspicious": ["suspicious-activity"],
+         "clean": ["benign"], "unknown": ["unknown"]}
+    return m.get(verdict, ["unknown"])
+
+
+def _build_pattern(value: str, ioc_type: str) -> str:
+    obj_type = _STIX_IOC_MAP.get(ioc_type, "observed-data")
+    if obj_type == "file":
+        key = _HASH_KEYS.get(ioc_type, "SHA-256")
+        return f"[file:hashes.{key} = '{value}']"
+    if obj_type == "ipv4-addr":
+        return f"[ipv4-addr:value = '{value}']"
+    if obj_type == "ipv6-addr":
+        return f"[ipv6-addr:value = '{value}']"
+    if obj_type == "domain-name":
+        return f"[domain-name:value = '{value}']"
+    if obj_type == "url":
+        return f"[url:value = '{value}']"
+    if obj_type == "email-addr":
+        return f"[email-addr:value = '{value}']"
+    if obj_type == "vulnerability":
+        return f"[vulnerability:name = '{value}']"
+    return f"[observed-data:value = '{value}']"
+
+
+def _ioc_to_observable(value: str, ioc_type: str) -> dict:
+    obj_type = _STIX_IOC_MAP.get(ioc_type, "observed-data")
+    if obj_type == "file":
+        key = _HASH_KEYS.get(ioc_type, "SHA-256")
+        return {"type": "file", "hashes": {key: value}}
+    if obj_type == "email-addr":
+        return {"type": "email-addr", "value": value}
+    if obj_type == "vulnerability":
+        return {"type": "vulnerability", "name": value}
+    return {"type": obj_type, "value": value}
+
+
+def _build_identity(source: str) -> dict:
+    return {
+        "type": "identity",
+        "id": _stix_id("identity"),
+        "created": _ts(),
+        "modified": _ts(),
+        "name": source,
+        "identity_class": "organization",
+    }
+
+
+def build_stix_bundle(response: dict) -> dict:
+    objects = []
+    ioc_value = response.get("normalized", response.get("input", ""))
+    ioc_type = response.get("ioc_type", "unknown")
+    composite = response.get("composite", {})
+    score = composite.get("score", 0)
+    verdict = composite.get("verdict", "unknown")
+    results = response.get("results", [])
+    enrichment = response.get("enrichment", {})
+
+    indicator_id = _stix_id("indicator")
+    objects.append({
+        "type": "indicator",
+        "id": indicator_id,
+        "created": _ts(),
+        "modified": _ts(),
+        "name": ioc_value,
+        "description": f"{ioc_type} indicator with {verdict} verdict (score: {score})",
+        "indicator_types": _verdict_to_labels(verdict),
+        "pattern": _build_pattern(ioc_value, ioc_type),
+        "pattern_type": "stix",
+        "valid_from": _ts(),
+        "score": int(score),
+    })
+
+    main_obs_id = _stix_id("observed-data")
+    objects.append({
+        "type": "observed-data",
+        "id": main_obs_id,
+        "created": _ts(),
+        "modified": _ts(),
+        "first_observed": _ts(),
+        "last_observed": _ts(),
+        "number_observed": 1,
+        "objects": {"0": _ioc_to_observable(ioc_value, ioc_type)},
+    })
+
+    relationship_ids: list[str] = []
+    for r in results:
+        source_name = r.get("source", "Unknown")
+        r_indicator_id = _stix_id("indicator")
+        verdict_label = _verdict_to_labels(r.get("verdict", "unknown"))
+        indicator_types = ["malicious-activity"] + verdict_label if r.get("confidence") in ("high", "medium") else verdict_label
+
+        objects.append({
+            "type": "indicator",
+            "id": r_indicator_id,
+            "created": _ts(),
+            "modified": _ts(),
+            "name": f"{ioc_value} — {source_name}",
+            "description": f"{source_name}: {r.get('verdict', 'unknown')} (score: {r.get('raw_score', 'N/A')})",
+            "indicator_types": indicator_types,
+            "pattern": _build_pattern(ioc_value, ioc_type),
+            "pattern_type": "stix",
+            "valid_from": _ts(),
+        })
+
+        identity = _build_identity(source_name)
+        objects.append(identity)
+
+        r_obs_id = _stix_id("observed-data")
+        objects.append({
+            "type": "observed-data",
+            "id": r_obs_id,
+            "created": _ts(),
+            "modified": _ts(),
+            "first_observed": _ts(),
+            "last_observed": _ts(),
+            "number_observed": 1,
+            "objects": {"0": _ioc_to_observable(ioc_value, ioc_type)},
+        })
+
+        for src_ref, tgt_ref, rtype in [(r_indicator_id, r_obs_id, "indicates"), (identity["id"], r_indicator_id, "attributed-to")]:
+            rel_id = _stix_id("relationship")
+            objects.append({
+                "type": "relationship",
+                "id": rel_id,
+                "created": _ts(),
+                "modified": _ts(),
+                "relationship_type": rtype,
+                "source_ref": src_ref,
+                "target_ref": tgt_ref,
+                "description": f"{source_name}: {r.get('verdict', 'unknown')}",
+            })
+            relationship_ids.append(rel_id)
+
+    if results:
+        objects.append({
+            "type": "sighting",
+            "id": _stix_id("sighting"),
+            "created": _ts(),
+            "modified": _ts(),
+            "sighting_of_ref": indicator_id,
+            "where_sighted_refs": [],
+            "count": len(results),
+            "summary": True,
+        })
+
+    geoip = enrichment.get("geoip", {})
+    if geoip and geoip.get("country"):
+        loc_id = _stix_id("location")
+        objects.append({
+            "type": "location",
+            "id": loc_id,
+            "created": _ts(),
+            "modified": _ts(),
+            "country": geoip["country"],
+            "administrative_area": geoip.get("city", ""),
+        })
+        for obj in objects:
+            if obj["type"] == "sighting" and obj["sighting_of_ref"] == indicator_id:
+                obj["where_sighted_refs"].append(loc_id)
+                break
+
+    for rel in response.get("relationships", []):
+        rel_id = _stix_id("relationship")
+        objects.append({
+            "type": "relationship",
+            "id": rel_id,
+            "created": _ts(),
+            "modified": _ts(),
+            "relationship_type": rel.get("relationship", "related-to"),
+            "source_ref": indicator_id,
+            "target_ref": main_obs_id,
+            "description": f"{rel.get('source_ioc', '')} → {rel.get('target_ioc', '')} via {rel.get('via_source', '')}",
+        })
+
+    objects.append({
+        "type": "identity",
+        "id": _stix_id("identity"),
+        "created": _ts(),
+        "modified": _ts(),
+        "name": "IOC Platform",
+        "identity_class": "system",
+    })
+
+    return {
+        "type": "bundle",
+        "id": f"bundle--{uuid.uuid4()}",
+        "objects": objects,
+    }
+
+
+def results_to_csv(results: list[dict]) -> str:
+    output = io.StringIO()
+    writer = csv.writer(output)
+    writer.writerow(["Source", "IOC Type", "Verdict", "Score", "Confidence", "Malware Family",
+                     "Reports Count", "Tags", "Categories", "MITRE ATT&CK", "Source Link"])
+    for r in results:
+        writer.writerow([
+            r.get("source", ""), r.get("ioc_type", ""), r.get("verdict", ""),
+            r.get("raw_score", ""), r.get("confidence", ""), r.get("malware_family", ""),
+            r.get("reports_count", ""), "; ".join(r.get("tags", [])),
+            "; ".join(r.get("categories", [])), "; ".join(r.get("mitre_attck", [])),
+            r.get("source_link", ""),
+        ])
+    return output.getvalue()
