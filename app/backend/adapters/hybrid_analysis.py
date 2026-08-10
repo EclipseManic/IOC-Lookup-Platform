@@ -36,7 +36,7 @@ class HybridAnalysisAdapter(SourceAdapter):
         if resp.status_code == 404:
             return NormalizedResult(
                 ioc=ioc_value, ioc_type=ioc_type, source=self.name,
-                verdict="unknown", raw_score=0.0,
+                verdict="unknown", raw_score=0.0, status="not_found",
             )
         if resp.status_code == 429:
             return NormalizedResult(
@@ -53,7 +53,7 @@ class HybridAnalysisAdapter(SourceAdapter):
         if not isinstance(data, list) or not data:
             return NormalizedResult(
                 ioc=ioc_value, ioc_type=ioc_type, source=self.name,
-                verdict="unknown", raw_score=0.0,
+                verdict="unknown", raw_score=0.0, status="not_found",
             )
 
         report = data[0]
@@ -83,13 +83,15 @@ class HybridAnalysisAdapter(SourceAdapter):
         tags.append(f"score:{threat_score}")
 
         vx_family = report.get("vx_family", "")
-        malware_family = vx_family or None
+        submit_name = report.get("submit_name", "")
+        malware_family = vx_family or submit_name or None
 
         mitre = []
-        if verdict in ("malicious", "suspicious") and ioc_value:
+        if verdict in ("malicious", "suspicious"):
+            sha256 = report.get("sha256", "") or ioc_value
             try:
                 mitre_resp = await client.get(
-                    f"https://hybrid-analysis.com/api/v2/report/{ioc_value}/mitre",
+                    f"https://hybrid-analysis.com/api/v2/report/{sha256}/mitre",
                     headers={
                         "api-key": self.api_key,
                         "user-agent": "IOC-Platform/1.0",
@@ -105,12 +107,12 @@ class HybridAnalysisAdapter(SourceAdapter):
                                 aid = entry.get("id", entry.get("attack_id", ""))
                                 if aid:
                                     mitre.append(aid)
-            except Exception:
-                pass
+            except Exception as exc:
+                logger.debug("Hybrid Analysis MITRE extraction failed: %s", exc)
         if not mitre:
             mitre = report.get("mitre_attack_ids", [])
-
-        submit_name = report.get("submit_name", "")
+        if isinstance(submit_name, str) and submit_name:
+            tags.append(f"family:{submit_name}")
 
         extracted_files = report.get("extracted_files", [])
         dropped = []

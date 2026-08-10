@@ -32,6 +32,15 @@ def test_classify_domain():
     assert classify_ioc("google.com") == "domain"
 
 
+def test_classify_domain_with_http_prefix_skips_domain():
+    assert classify_ioc("http.example.com") == "unknown"
+
+
+def test_classify_invalid_ipv4_octets():
+    assert classify_ioc("999.1.1.1") == "unknown"
+    assert classify_ioc("256.256.256.256") == "unknown"
+
+
 def test_classify_url():
     assert classify_ioc("https://evil.com/path") == "url"
 
@@ -60,6 +69,22 @@ def test_classify_cve():
 
 def test_classify_ipv6():
     assert classify_ioc("fe80:0000:0000:0000:0000:0000:0000:0001") == "ipv6"
+
+
+def test_classify_compressed_ipv6():
+    assert classify_ioc("2606:4700:4700::1111") == "ipv6"
+
+
+def test_classify_ssdeep_not_ipv6():
+    assert classify_ioc("3:abc:def") == "ssdeep"
+
+
+def test_classify_named_pipe_before_mutex():
+    assert classify_ioc(r"\\host\pipe\mypipe") == "named_pipe"
+
+
+def test_classify_registry_key_before_mutex():
+    assert classify_ioc(r"HKLM\Software\Test") == "registry_key"
 
 
 def test_classify_unknown():

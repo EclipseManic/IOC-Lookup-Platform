@@ -32,7 +32,7 @@ def get_client() -> AsyncClient:
     global _SHARED_CLIENT
     if _SHARED_CLIENT is None:
         _SHARED_CLIENT = AsyncClient(
-            limits=Limits(max_connections=100, max_keepalive_connections=20),
+            limits=Limits(max_connections=200, max_keepalive_connections=50),
             timeout=DEFAULT_TIMEOUT,
             follow_redirects=True,
         )

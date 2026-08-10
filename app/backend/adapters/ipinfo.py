@@ -6,7 +6,8 @@ from app.backend.config import settings
 
 class IPinfoAdapter(SourceAdapter):
     name = "IPinfo"
-    supported_types = ["ipv4"]
+    supported_types = ["ipv4", "ipv6"]
+    public_without_key = True
     rate_limit = RateLimitConfig(requests_per_minute=30)
 
     def __init__(self):
@@ -51,7 +52,7 @@ class IPinfoAdapter(SourceAdapter):
     async def _paid_lookup(self, client, ioc_value: str, ioc_type: str) -> NormalizedResult:
         resp = await client.get(
                 f"https://ipinfo.io/{ioc_value}/json",
-                params={"token": self.api_key},
+                headers={"Authorization": f"Bearer {self.api_key}"},
                 timeout=10,
             )
 
@@ -97,14 +98,27 @@ class IPinfoAdapter(SourceAdapter):
             if asn_name: tags.append(f"asn_name:{asn_name}")
 
         hosting = data.get("hosting", {})
+        is_hosting = False
+        is_bogon = False
         if isinstance(hosting, dict):
-            if hosting.get("is_hosting", False):
+            is_hosting = bool(hosting.get("is_hosting", False))
+            is_bogon = bool(hosting.get("is_bogon", False))
+            if is_hosting:
                 tags.append("is_hosting")
-            if hosting.get("is_bogon", False):
+            if is_bogon:
                 tags.append("is_bogon")
+
+        raw_score = None
+        verdict = "unknown"
+        if is_bogon:
+            raw_score = 0.3
+            verdict = "suspicious"
+        elif is_hosting:
+            raw_score = 0.2
+            verdict = "suspicious"
 
         return NormalizedResult(
             ioc=ioc_value, ioc_type=ioc_type, source=self.name,
-            verdict="unknown", raw_score=None, tags=tags,
+            verdict=verdict, raw_score=raw_score, tags=tags,
             categories=categories,
         )

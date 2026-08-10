@@ -1,4 +1,5 @@
 import asyncio
+import threading
 import time
 
 import httpx
@@ -9,7 +10,7 @@ from app.backend.config import settings
 
 class AbuseIPDBAdapter(SourceAdapter):
     name = "AbuseIPDB"
-    supported_types = ["ipv4"]
+    supported_types = ["ipv4", "ipv6"]
     rate_limit = RateLimitConfig(requests_per_minute=30, requests_per_day=1000)
 
     DAILY_LIMIT = 1000
@@ -21,17 +22,30 @@ class AbuseIPDBAdapter(SourceAdapter):
     _blacklist: dict[str, int] = {}
     _blacklist_updated: float = 0
     _blacklist_lock = asyncio.Lock()
+    _daily_quota_lock = threading.Lock()
     BLACKLIST_TTL = 86400  # 24h (free tier limit)
 
     def __init__(self):
         self.api_key = settings.abuseipdb_api_key
 
+    def _consume_daily_quota(self) -> bool:
+        with AbuseIPDBAdapter._daily_quota_lock:
+            now = time.time()
+            if now > AbuseIPDBAdapter._quota_reset_time:
+                AbuseIPDBAdapter._daily_requests_used = 0
+                AbuseIPDBAdapter._quota_reset_time = now + 86400
+            if AbuseIPDBAdapter._daily_requests_used >= AbuseIPDBAdapter.DAILY_LIMIT:
+                return False
+            AbuseIPDBAdapter._daily_requests_used += 1
+            return True
+
     def _check_daily_quota(self) -> bool:
-        now = time.time()
-        if now > self._quota_reset_time:
-            self._daily_requests_used = 0
-            self._quota_reset_time = now + 86400
-        return self._daily_requests_used < self.DAILY_LIMIT
+        with AbuseIPDBAdapter._daily_quota_lock:
+            now = time.time()
+            if now > AbuseIPDBAdapter._quota_reset_time:
+                AbuseIPDBAdapter._daily_requests_used = 0
+                AbuseIPDBAdapter._quota_reset_time = now + 86400
+            return AbuseIPDBAdapter._daily_requests_used < AbuseIPDBAdapter.DAILY_LIMIT
 
     def _update_rate_headers(self, resp):
         try:
@@ -42,8 +56,8 @@ class AbuseIPDBAdapter(SourceAdapter):
                 self._remaining = int(remaining)
             if reset:
                 self._reset_time = int(reset)
-        except Exception:
-            pass
+        except Exception as exc:
+            logger.debug("AbuseIPDB rate-limit header parse failed: %s", exc)
 
     async def _refresh_blacklist(self):
         if time.time() - self._blacklist_updated < self.BLACKLIST_TTL:
@@ -68,8 +82,8 @@ class AbuseIPDBAdapter(SourceAdapter):
                         for item in items if isinstance(item, dict) and "ipAddress" in item
                     }
                     self._blacklist_updated = time.time()
-            except Exception:
-                pass
+            except Exception as exc:
+                logger.warning("AbuseIPDB blacklist refresh failed: %s", exc)
 
     async def lookup(self, ioc_value: str, ioc_type: str) -> NormalizedResult:
         if not is_valid_api_key(self.api_key):
@@ -87,7 +101,11 @@ class AbuseIPDBAdapter(SourceAdapter):
         await self._refresh_blacklist()
         bl_score = self._blacklist.get(ioc_value)
         if bl_score is not None:
-            AbuseIPDBAdapter._daily_requests_used += 1
+            if not self._consume_daily_quota():
+                return NormalizedResult(
+                    ioc=ioc_value, ioc_type=ioc_type, source=self.name,
+                    verdict="unknown", tags=["daily_quota_exhausted"],
+                )
             score = bl_score / 100.0
             confidence = "high" if bl_score >= 95 else "medium"
             return NormalizedResult(
@@ -127,7 +145,11 @@ class AbuseIPDBAdapter(SourceAdapter):
             )
 
         self._update_rate_headers(resp)
-        AbuseIPDBAdapter._daily_requests_used += 1
+        if not self._consume_daily_quota():
+            return NormalizedResult(
+                ioc=ioc_value, ioc_type=ioc_type, source=self.name,
+                verdict="unknown", tags=["daily_quota_exhausted"],
+            )
 
         data = resp.json().get("data", {})
         score = data.get("abuseConfidenceScore", 0) / 100.0
@@ -179,16 +201,14 @@ class AbuseIPDBAdapter(SourceAdapter):
         categories = list(data.get("categories", {}).values()) if isinstance(data.get("categories"), dict) else []
 
         reports = data.get("reports", []) or []
-        samples = []
-        for r in reports[:5]:
+        reports_out = []
+        for r in reports[:20]:
             if isinstance(r, dict):
-                cat = ", ".join(str(c) for c in r.get("categories", [])) if r.get("categories") else ""
-                comment = r.get("comment", "")
-                item = cat
-                if comment:
-                    item += f" — {comment}"
-                if item:
-                    samples.append(item[:120])
+                reports_out.append({
+                    "categories": list(r.get("categories", []) or []),
+                    "comment": r.get("comment", ""),
+                    "reported_at": r.get("reportedAt", ""),
+                })
 
         return NormalizedResult(
             ioc=ioc_value,
@@ -203,7 +223,7 @@ class AbuseIPDBAdapter(SourceAdapter):
             last_seen=self._parse_dt(last_reported) if last_reported else None,
             source_link=f"https://www.abuseipdb.com/check/{ioc_value}",
             reports_count=total_reports,
-            samples=samples,
+            reports=reports_out,
         )
 
     def _parse_dt(self, val: str):

@@ -26,6 +26,22 @@ def _ts() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.000Z")
 
 
+def _fmt_ts(value) -> str:
+    if value is None:
+        return _ts()
+    if isinstance(value, datetime):
+        if value.tzinfo is None:
+            value = value.replace(tzinfo=timezone.utc)
+        return value.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.000Z")
+    return str(value)
+
+
+def _observed_window(results: list[dict]) -> tuple[str, str]:
+    firsts = [_fmt_ts(r.get("first_seen")) for r in results if r.get("first_seen")]
+    lasts = [_fmt_ts(r.get("last_seen")) for r in results if r.get("last_seen")]
+    return (min(firsts) if firsts else _ts(), max(lasts) if lasts else _ts())
+
+
 def _stix_id(prefix: str) -> str:
     return f"{prefix}--{uuid.uuid4()}"
 
@@ -105,13 +121,14 @@ def build_stix_bundle(response: dict) -> dict:
     })
 
     main_obs_id = _stix_id("observed-data")
+    window_first, window_last = _observed_window(results)
     objects.append({
         "type": "observed-data",
         "id": main_obs_id,
         "created": _ts(),
         "modified": _ts(),
-        "first_observed": _ts(),
-        "last_observed": _ts(),
+        "first_observed": window_first,
+        "last_observed": window_last,
         "number_observed": 1,
         "objects": {"0": _ioc_to_observable(ioc_value, ioc_type)},
     })
@@ -121,7 +138,7 @@ def build_stix_bundle(response: dict) -> dict:
         source_name = r.get("source", "Unknown")
         r_indicator_id = _stix_id("indicator")
         verdict_label = _verdict_to_labels(r.get("verdict", "unknown"))
-        indicator_types = ["malicious-activity"] + verdict_label if r.get("confidence") in ("high", "medium") else verdict_label
+        indicator_types = (["malicious-activity"] + verdict_label) if r.get("confidence") in ("high", "medium") else verdict_label
 
         objects.append({
             "type": "indicator",
@@ -145,8 +162,8 @@ def build_stix_bundle(response: dict) -> dict:
             "id": r_obs_id,
             "created": _ts(),
             "modified": _ts(),
-            "first_observed": _ts(),
-            "last_observed": _ts(),
+            "first_observed": _fmt_ts(r.get("first_seen")),
+            "last_observed": _fmt_ts(r.get("last_seen")),
             "number_observed": 1,
             "objects": {"0": _ioc_to_observable(ioc_value, ioc_type)},
         })

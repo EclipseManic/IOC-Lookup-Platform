@@ -5,7 +5,7 @@ from typing import Optional
 import httpx
 from httpx import Timeout
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 
 
 class RateLimitConfig(BaseModel):
@@ -20,6 +20,7 @@ class NormalizedResult(BaseModel):
     ioc_type: str
     source: str
     verdict: str
+    status: str = "found"  # found | not_found | error
     raw_score: Optional[float] = None
     confidence: str = "low"
     tags: list[str] = []
@@ -31,6 +32,8 @@ class NormalizedResult(BaseModel):
     related_iocs: list[tuple[str, str]] = []
     source_link: Optional[str] = None
     reports_count: Optional[int] = None
+    reports: list[dict] = []
+    raw_data: dict = {}
     samples: list[str] = []
     dropped_files: list[str] = []
     registry_keys: list[str] = []
@@ -38,6 +41,54 @@ class NormalizedResult(BaseModel):
     process_tree: Optional[str] = None
     ssdeep: Optional[str] = None
     tlsh: Optional[str] = None
+
+    @model_validator(mode="before")
+    @classmethod
+    def _coerce_none_lists(cls, data):
+        if isinstance(data, dict):
+            # Provider payloads are not a stable schema. Keep optional
+            # enrichment metadata from turning one malformed upstream field
+            # into a failed IOC analysis.
+            for field_name in ("tags", "categories", "mitre_attck", "samples", "dropped_files", "registry_keys"):
+                values = data.get(field_name)
+                if values is None:
+                    data[field_name] = []
+                elif isinstance(values, (list, tuple, set)):
+                    data[field_name] = [value.strip() for value in values if isinstance(value, str) and value.strip()]
+                elif isinstance(values, str) and values.strip():
+                    data[field_name] = [values.strip()]
+                else:
+                    data[field_name] = []
+
+            for field_name in ("related_iocs", "network_iocs"):
+                values = data.get(field_name)
+                if not isinstance(values, (list, tuple, set)):
+                    data[field_name] = []
+                    continue
+                data[field_name] = [
+                    (str(value[0]).strip(), str(value[1]).strip())
+                    for value in values
+                    if isinstance(value, (list, tuple)) and len(value) >= 2 and value[0] is not None and value[1] is not None
+                    and str(value[0]).strip() and str(value[1]).strip()
+                ]
+
+            for field_name in ("reports",):
+                if not isinstance(data.get(field_name), list):
+                    data[field_name] = []
+        return data
+
+    @model_validator(mode="after")
+    def _normalize_lists(self):
+        has_data = bool(
+            self.tags or self.categories or self.mitre_attck or self.related_iocs
+            or self.samples or self.source_link is not None or self.reports_count is not None
+            or self.malware_family or self.process_tree or self.raw_score is not None
+        )
+        if self.verdict == "error":
+            self.status = "error"
+        elif self.status == "found" and self.verdict == "unknown" and not has_data:
+            self.status = "not_found"
+        return self
 
 
 class GeoIPInfo(BaseModel):
@@ -150,6 +201,7 @@ class EnrichmentData(BaseModel):
     extra: dict = {}
     relationships: list[dict] = []
     completeness: dict[str, str] = {}
+    analysis_notes: list[str] = []
 
 
 class SourceWeight(BaseModel):
@@ -157,6 +209,7 @@ class SourceWeight(BaseModel):
     weight: float = 1.0
     verdict: str
     score: Optional[float] = None
+    confidence: Optional[str] = None
 
 
 class CompositeScore(BaseModel):
@@ -188,6 +241,7 @@ def is_valid_api_key(key: str) -> bool:
 class SourceAdapter(ABC):
     name: str = ""
     supported_types: list[str] = []
+    public_without_key: bool = False
     rate_limit: RateLimitConfig = RateLimitConfig()
     _client: httpx.AsyncClient | None = None
 

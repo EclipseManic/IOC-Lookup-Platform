@@ -1,129 +1,149 @@
-# IOC Universal — Threat Intelligence Lookup Platform
+# IOC Platform
 
-Universal IOC lookup, enrichment, and investigation platform. Query any indicator across 5 threat intelligence sources with real-time progress, composite scoring, deep enrichment, and investigation workflow.
+A local IOC investigation workstation. It classifies indicators, queries available threat-intelligence sources, enriches results, calculates a composite verdict, stores lookup history in SQLite, supports investigations and batch analysis, and exports results in common security formats.
 
-## Features
+The project is designed to run directly on one computer with Python, SQLite, and its bundled web interface.
 
-- **Multi-Source Lookups**: VirusTotal, AbuseIPDB, ThreatFox, MalwareBazaar, urlscan.io
-- **Real-Time Pipeline**: Live progress tracking per source during analysis
-- **Composite Scoring**: Weighted score from all sources with confidence bands
-- **Deep Enrichment**: GeoIP, ASN, WHOIS/RDAP, reverse DNS, DNS records, SSL certificates
-- **IOC Classification**: Auto-detects IPs, domains, URLs, hashes (MD5/SHA1/SHA256), emails, CVE, and more
-- **Refanging**: Defanged IOC support (`hxxp://`, `[.]`, `[:]`)
-- **Investigation Workbench**: Save IOCs to cases, add notes, browse history
-- **Batch Analysis**: Upload CSV/JSON with up to 500 IOCs for bulk processing
-- **STIX 2.1 Export**: Industry-standard threat intel format
-- **CSV/JSON Export**: Download results for SIEM ingestion
-- **58 Tests**: Comprehensive test suite with pytest
+## What it supports
 
-## Quick Start
+- IP addresses, domains, URLs, email addresses, CVEs, and common hashes
+- Refanging of values such as `hxxp://example[.]com`
+- Multiple threat-intelligence adapters with graceful skipping when a key is absent
+- DNS, WHOIS/RDAP, SSL, GeoIP, email-security, CVE, and relationship enrichment
+- Composite scoring with source confidence and false-positive feedback
+- Lookup history and investigation cases
+- CSV/JSON batch analysis
+- CSV, HTML, STIX 2.1, MISP, Splunk, ECS, and LEEF exports
+- A local React user interface served by FastAPI
 
-```bash
+## Intelligence sources and what “free” means
+
+The application never contains provider credentials. Adapter credentials are
+loaded from process environment variables and `.env` through `app/backend/config.py`.
+The `/api/sources` endpoint and the Source coverage panel show each provider's
+IOC coverage, whether it is public or key-backed, and whether its configured
+credential came from `.env` or the process environment. Secret values are never
+returned.
+
+The current source set is 19 providers:
+
+| Source | Free/public behavior | IOC coverage |
+|---|---|---|
+| OpenPhish | Public phishing feed | URL |
+| URLhaus | Public Abuse.ch API | URL, domain, MD5/SHA-1/SHA-256 |
+| Tor Exit | Public Tor exit list/DNSBL | IPv4 |
+| IPinfo | Public lite endpoint; optional token improves detail | IPv4, IPv6 |
+| GreyNoise | Public community endpoint with quota; optional key | IPv4 |
+| Shodan | Public InternetDB; optional key unlocks host API | IPv4 |
+| urlscan.io | Public search; key required only for active submissions | URL, domain |
+| StopForumSpam | Public email abuse reputation | Email |
+| CIRCL HashLookup | Public hash/package corpus enrichment | MD5, SHA-1, SHA-256 |
+| RDAP/DNS/CRT.sh/Cloudflare DNS | Public contextual enrichment | IPs, domains, URLs, email domains |
+| CISA KEV/EPSS/NVD | Public CVE intelligence; optional NVD key for quota | CVE |
+| RIPEstat | Public ASN enrichment | ASN |
+| MITRE ATT&CK | Public technique/tactic enrichment | ATT&CK IDs |
+| blockchain.info | Public Bitcoin address statistics | Bitcoin |
+| XposedOrNot | Public breach exposure lookup | Email |
+| MalwareBazaar | API key required by the current endpoint | MD5/SHA-1/SHA-256 |
+| ThreatFox | API key required by the current endpoint | IPs, domains, URLs, hashes |
+| VirusTotal, AbuseIPDB, OTX, Tria.ge, Hybrid Analysis, Censys, SecurityTrails, PhishTank, Spur.us | Optional API keys | Type-specific coverage shown in `/api/sources` |
+
+Public context is not a clean verdict. If no reputation provider covers an IOC,
+the result is explicitly marked as contextual/enrichment-only. Source errors,
+missing keys, rate limits, and not-found responses are kept separate from the
+malicious/clean score.
+
+## Run locally
+
+Requirements:
+
+- Python 3.11 or newer
+- Internet access for external intelligence sources
+- Optional API keys for the sources you want to use
+
+On Windows PowerShell:
+
+```powershell
+python -m venv .venv
+.\.venv\Scripts\Activate.ps1
 pip install -r requirements.txt
-
-# Configure API keys in .env or set as environment variables
-copy .env.example .env
-
+Copy-Item .env.example .env
 python run.py
 ```
 
-Opens at `http://localhost:8000/`
+The browser opens at `http://127.0.0.1:8000/`. Press `Ctrl+C` in the terminal to stop the tool.
 
-## API Keys
+The included UI build is ready to use. Node.js is needed only when changing frontend source code:
 
-Set these in `.env` or as system environment variables:
-
-| Variable | Source | Required |
-|----------|--------|----------|
-| `VT_API_KEY` | VirusTotal | Optional |
-| `AbuseDB_API_KEY` | AbuseIPDB | Optional |
-| `URL_SCAN_API_KEY` | urlscan.io | Optional |
-| `MB_AUTH_KEY` | MalwareBazaar / ThreatFox | Optional |
-
-All lookups work without API keys — sources without keys are gracefully skipped.
-
-## Architecture
-
-```
-├── run.py                          # Entry point — uvicorn + auto-browser
-├── .env                            # API key configuration
-├── requirements.txt                # Python dependencies
-├── pyproject.toml                  # pytest configuration
-├── app/backend/
-│   ├── main.py                     # FastAPI routes (lookup, investigations, batch, export)
-│   ├── pipeline.py                 # Async task orchestration with real-time progress
-│   ├── classifier.py               # IOC type detection + refanging
-│   ├── enrichment.py               # GeoIP, WHOIS, reverse DNS, DNS, SSL
-│   ├── scorer.py                   # Weighted composite scoring engine
-│   ├── models.py                   # SQLAlchemy models (IOC, Investigation, LookupResult)
-│   ├── database.py                 # SQLite async setup
-│   ├── batch.py                    # CSV/JSON batch processing
-│   ├── stix_export.py              # STIX 2.1 bundle generation + CSV export
-│   └── adapters/
-│       ├── base.py                 # Data models + abstract adapter
-│       ├── virus_total.py          # VirusTotal API v3
-│       ├── abuse_ipdb.py           # AbuseIPDB API v2
-│       ├── threatfox.py            # ThreatFox API v1
-│       ├── malware_bazaar.py       # MalwareBazaar API v1
-│       └── urlscan_io.py           # urlscan.io API v1
-├── ui/
-│   ├── templates/index.html        # SPA — single HTML shell
-│   └── static/
-│       ├── style.css               # Dark theme (300+ lines)
-│       └── app.js                  # Full app logic (600+ lines)
-├── data/                           # SQLite database directory
-└── tests/                          # 58 passing tests
-    ├── test_classifier.py          # IOC classification + refanging
-    ├── test_scorer.py              # Scoring engine
-    ├── test_enrichment.py          # Enrichment pipeline
-    ├── test_stix.py                # STIX/CSV export
-    └── test_batch.py               # Batch processing
+```powershell
+cd ui
+npm install
+npm run build
 ```
 
-## API Endpoints
+## Configure intelligence sources
 
-| Method | Path | Description |
-|--------|------|-------------|
-| `POST` | `/api/lookup` | Start IOC analysis (returns task_id) |
-| `GET` | `/api/tasks/{id}` | Poll task status + progress |
-| `GET` | `/api/tasks/{id}/result` | Get completed analysis results |
-| `GET` | `/api/health` | Health check |
-| `GET` | `/api/recent` | Recent lookups |
-| `GET` | `/api/investigations` | List all investigations |
-| `POST` | `/api/investigations` | Create investigation |
-| `GET` | `/api/investigations/{id}` | Get investigation with IOCs |
-| `PUT` | `/api/investigations/{id}` | Update investigation |
-| `DELETE` | `/api/investigations/{id}` | Delete investigation |
-| `POST` | `/api/investigations/{id}/iocs` | Add IOC to investigation |
-| `PUT` | `/api/investigations/{id}/iocs/{ii}` | Update IOC notes |
-| `DELETE` | `/api/investigations/{id}/iocs/{ii}` | Remove IOC from investigation |
-| `POST` | `/api/batch` | Start batch analysis |
-| `POST` | `/api/batch/upload` | Upload CSV/JSON file for batch |
-| `GET` | `/api/batch/{id}` | Poll batch status |
-| `GET` | `/api/batch/{id}/result` | Get batch results |
-| `POST` | `/api/export/stix` | Export STIX 2.1 bundle |
-| `POST` | `/api/export/csv` | Export CSV report |
-| `POST` | `/api/save` | Lookup + save to history |
+Edit `.env` and add only the keys you have. Missing keys do not prevent the application from starting; unavailable adapters are reported as skipped or unknown.
 
-## Test Suite
+Common variables include:
 
-```bash
-pytest tests/ -v
+| Variable | Source |
+|---|---|
+| `VT_API_KEY` | VirusTotal |
+| `ABUSEIPDB_API_KEY` | AbuseIPDB |
+| `URL_SCAN_API_KEY` | urlscan.io |
+| `MB_AUTH_KEY` | MalwareBazaar |
+| `THREATFOX_API_KEY` | ThreatFox |
+| `TRIAGE_API_KEY` | Tria.ge |
+| `HA_API_KEY` | Hybrid Analysis |
+| `GREYNOISE_API_KEY` | GreyNoise |
+| `OTX_API_KEY` | AlienVault OTX |
+| `SHODAN_API_KEY` | Shodan |
+| `SECURITYTRAILS_API_KEY` | SecurityTrails |
+| `CENSYS_API_KEY` | Censys (`ID:secret`) |
+| `IPINFO_API_KEY` | IPinfo |
+
+The local SQLite database is stored at `data/ioc_platform.db`. Cached task and adapter data is stored under `.cache/`.
+
+## Main local workflows
+
+1. Enter an IOC on the Lookup page.
+2. Watch source and enrichment stages complete.
+3. Review the score, verdict, source evidence, enrichment, and relationships.
+4. Mark false positives when needed.
+5. Save related IOCs in an investigation or process multiple values on the Batch page.
+6. Export the result from the Export tab.
+
+## Tests
+
+Backend:
+
+```powershell
+python -m pytest -q
 ```
 
-58 tests covering classifier, scorer, enrichment, STIX export, batch processing, and API.
+Frontend:
 
-## Comparison
+```powershell
+cd ui
+npm test
+npm run lint
+npm run build
+```
 
-| Feature | IOC Universal | Event-Analyzer | Malware Analyzer | Phishing Detector |
-|---------|:---:|:---:|:---:|:---:|
-| IOC Type Support | All | EVTX-based | File-based | Email-based |
-| Threat Intel Sources | 5 | 0 | 4 | 2 |
-| Real-Time Pipeline | Yes | No | WebSocket | Polling |
-| Composite Scoring | Yes | No | Category-aware | Floor-based |
-| Deep Enrichment | GeoIP/DNS/WHOIS/SSL | None | None | None |
-| Investigation Workflow | Yes | Yes | No | No |
-| Batch Analysis | Yes | No | No | No |
-| STIX 2.1 Export | Yes | No | No | No |
-| Test Suite | 58 | 59 | 75 | Limited |
-| No Docker Required | Yes | Yes | Yes | Yes |
+## Useful local endpoints
+
+| Method | Path | Purpose |
+|---|---|---|
+| `POST` | `/api/lookup` | Start analysis |
+| `GET` | `/api/tasks/{task_id}` | Read task progress |
+| `GET` | `/api/tasks/{task_id}/result` | Read completed results |
+| `GET` | `/api/recent` | Lookup history |
+| `GET/POST` | `/api/investigations` | Investigation cases |
+| `POST` | `/api/batch` | Batch analysis |
+| `POST` | `/api/export/stix` | STIX export |
+| `POST` | `/api/export/misp` | MISP export |
+| `POST` | `/api/export/siem` | SIEM export |
+| `GET` | `/api/health` | Local application health |
+
+Interactive API documentation is available at `http://127.0.0.1:8000/docs`.

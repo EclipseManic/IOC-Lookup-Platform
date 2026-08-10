@@ -1,3 +1,4 @@
+import base64
 import time
 
 import httpx
@@ -18,6 +19,14 @@ class CensysAdapter(SourceAdapter):
     def __init__(self):
         self.api_key = settings.censys_api_key
         self._has_credentials = is_valid_api_key(self.api_key)
+
+    def _auth_header(self) -> str:
+        if ":" in self.api_key:
+            api_id, api_secret = self.api_key.split(":", 1)
+            token = base64.b64encode(f"{api_id}:{api_secret}".encode()).decode()
+        else:
+            token = base64.b64encode(self.api_key.encode()).decode()
+        return f"Basic {token}"
 
     def _check_credits(self) -> bool:
         now = time.time()
@@ -42,7 +51,7 @@ class CensysAdapter(SourceAdapter):
         client = self._get_client()
         resp = await client.get(
             f"https://api.platform.censys.io/v3/global/asset/host/{ioc_value}",
-            headers={"Authorization": f"Bearer {self.api_key}"},
+            headers={"Authorization": self._auth_header()},
             timeout=15,
         )
 

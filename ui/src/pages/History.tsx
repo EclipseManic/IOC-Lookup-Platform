@@ -1,41 +1,35 @@
-import { useEffect, useState } from "react";
-
-interface HistoryItem {
-  id: number;
-  value: string;
-  ioc_type: string;
-  verdict: string | null;
-  score: number | null;
-  confidence: string | null;
-  created_at: string | null;
-}
+import { useCallback, useEffect, useState } from "react";
+import { deleteRecentIOC, getRecentIOCs, type RecentIOC } from "../services/api";
+import { showToast } from "../components/Toast";
+import type { NavigateEvent } from "../App";
 
 export default function History() {
-  const [items, setItems] = useState<HistoryItem[]>([]);
+  const [items, setItems] = useState<RecentIOC[]>([]);
   const [loading, setLoading] = useState(true);
   const [filter, setFilter] = useState("");
   const [typeFilter, setTypeFilter] = useState("");
 
-  function load() {
+  const load = useCallback(() => {
     setLoading(true);
-    fetch("/api/recent")
-      .then(r => r.json())
-      .then(data => setItems(data))
-      .catch(() => setItems([]))
+    getRecentIOCs()
+      .then((data) => setItems(data))
+      .catch((e: Error) => { setItems([]); showToast(e.message, "error"); })
       .finally(() => setLoading(false));
-  }
+  }, []);
 
-  useEffect(load, []);
+  useEffect(load, [load]);
 
   function clearAll() {
-    Promise.all(items.map(i =>
-      fetch(`/api/recent/${i.id}`, { method: "DELETE" })
-    )).finally(load);
+    Promise.all(items.map((i) => deleteRecentIOC(i.id)))
+      .then(load)
+      .catch((e: Error) => showToast(e.message, "error"));
   }
 
   function deleteItem(id: number, e: React.MouseEvent) {
     e.stopPropagation();
-    fetch(`/api/recent/${id}`, { method: "DELETE" }).finally(load);
+    deleteRecentIOC(id)
+      .then(load)
+      .catch((err: Error) => showToast(err.message, "error"));
   }
 
   const types = [...new Set(items.map(i => i.ioc_type))].sort();
@@ -96,7 +90,7 @@ export default function History() {
         {filtered.map(item => (
           <div
             key={item.id}
-            onClick={() => { window.dispatchEvent(new CustomEvent("navigate", { detail: { page: "home", ioc: item.value } })); }}
+            onClick={() => { window.dispatchEvent(new CustomEvent<NavigateEvent>("navigate", { detail: { page: "home", ioc: item.value } })); }}
             className="flex items-center gap-3 px-4 py-2.5 bg-bg-card border border-border rounded-lg hover:bg-bg-elevated transition-colors cursor-pointer"
           >
             <div className="flex-1 min-w-0">

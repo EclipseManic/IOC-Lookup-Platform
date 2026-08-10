@@ -1,6 +1,6 @@
 import { useCallback, useRef, useState } from "react";
 import type { LookupResponse, StageInfo, TaskResponse } from "../services/api";
-import { getTaskResult, getTaskStatus, lookupIOC } from "../services/api";
+import { ApiError, getTaskResult, getTaskStatus, lookupIOC } from "../services/api";
 
 export type LookupState =
   | { status: "idle" }
@@ -19,15 +19,15 @@ export function useLookup() {
     }
   }, []);
 
-  const submit = useCallback(async (value: string) => {
+  const submit = useCallback(async (value: string, iocType?: string) => {
     stopPolling();
     try {
-      const task: TaskResponse = await lookupIOC(value);
+      const task: TaskResponse = await lookupIOC(value, iocType);
       const taskId = task.task_id;
       setState({
         status: "loading",
-        progress: task.progress,
-        stages: task.stages,
+        progress: task.progress ?? 0,
+        stages: task.stages ?? [],
         taskId,
       });
 
@@ -36,13 +36,17 @@ export function useLookup() {
           const result = await getTaskResult(taskId);
           stopPolling();
           setState({ status: "done", result });
-        } catch (e: any) {
-          if (e.message === "not_ready") {
+        } catch (e: unknown) {
+          if (e instanceof ApiError && e.status === 425) {
             try {
               const status = await getTaskStatus(taskId);
               setState((prev) =>
                 prev.status === "loading"
-                  ? { ...prev, progress: status.progress, stages: status.stages }
+                  ? {
+                      ...prev,
+                      progress: status.progress ?? prev.progress,
+                      stages: status.stages ?? prev.stages,
+                    }
                   : prev
               );
             } catch {
@@ -50,13 +54,23 @@ export function useLookup() {
             }
           } else {
             stopPolling();
-            setState({ status: "error", error: e.message });
+            setState({
+              status: "error",
+              error: e instanceof ApiError && e.detail
+                ? e.detail
+                : e instanceof Error ? e.message : "Lookup failed",
+            });
           }
         }
       }, 1000);
       pollingRef.current = interval;
-    } catch (e: any) {
-      setState({ status: "error", error: e.message });
+    } catch (e: unknown) {
+      setState({
+        status: "error",
+        error: e instanceof ApiError && e.detail
+          ? e.detail
+          : e instanceof Error ? e.message : "Lookup failed",
+      });
     }
   }, [stopPolling]);
 

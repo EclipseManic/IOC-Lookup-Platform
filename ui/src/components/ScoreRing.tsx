@@ -1,7 +1,9 @@
+import { DISPLAY_MALICIOUS, DISPLAY_SUSPICIOUS, DISPLAY_CLEAN } from "../lib/thresholds";
+
 const SCORE_COLORS = [
-  { threshold: 70, color: "#ef4444", label: "malicious" },
-  { threshold: 40, color: "#f59e0b", label: "high" },
-  { threshold: 15, color: "#f59e0b", label: "suspicious" },
+  { threshold: DISPLAY_MALICIOUS, color: "#ef4444", label: "malicious" },
+  { threshold: DISPLAY_SUSPICIOUS, color: "#f59e0b", label: "high" },
+  { threshold: DISPLAY_CLEAN, color: "#f59e0b", label: "suspicious" },
   { threshold: 0, color: "#22c55e", label: "clean" },
 ] as const;
 
@@ -13,7 +15,7 @@ function getColor(score: number) {
 }
 
 export default function ScoreRing({ score, size = 80 }: { score: number; size?: number }) {
-  const colorLabel = getColor(score) === "#ef4444" ? "malicious" : getColor(score) === "#f59e0b" ? score >= 40 ? "high risk" : "suspicious" : "clean";
+  const colorLabel = getColor(score) === "#ef4444" ? "malicious" : getColor(score) === "#f59e0b" ? score >= DISPLAY_SUSPICIOUS ? "high risk" : "suspicious" : "clean";
   const radius = 15.5;
   const circumference = 2 * Math.PI * radius;
   const offset = circumference - (score / 100) * circumference;

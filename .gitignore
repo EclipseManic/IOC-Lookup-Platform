@@ -2,7 +2,7 @@
 __pycache__/
 *.py[cod]
 *.egg-info/
-dist/
+/dist/
 build/
 .eggs/
 
@@ -12,7 +12,6 @@ build/
 # Node
 node_modules/
 ui/node_modules/
-ui/dist/
 
 # IDE
 .vscode/
@@ -24,7 +23,12 @@ Thumbs.db
 
 # Project specific
 data/ioc_platform.db
+.cache/
+.coverage
+data-test
+.mimocode/
 ui/tsconfig.tsbuildinfo
+.playwright-mcp/
 
 # OpenCode config
 .opencode/

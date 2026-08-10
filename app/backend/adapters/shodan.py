@@ -1,3 +1,4 @@
+import calendar
 import time
 
 import httpx
@@ -9,6 +10,7 @@ from app.backend.config import settings
 class ShodanAdapter(SourceAdapter):
     name = "Shodan"
     supported_types = ["ipv4"]
+    public_without_key = True
     rate_limit = RateLimitConfig(requests_per_minute=60)
 
     SHODAN_MONTHLY_LIMIT = 100
@@ -22,7 +24,9 @@ class ShodanAdapter(SourceAdapter):
         now = time.time()
         if now > self._credit_reset_time:
             self._monthly_credits_used = 0
-            self._credit_reset_time = now + 2592000
+            now_dt = time.gmtime(now)
+            days_in_month = calendar.monthrange(now_dt.tm_year, now_dt.tm_mon)[1]
+            self._credit_reset_time = now + days_in_month * 86400
         return self._monthly_credits_used < self.SHODAN_MONTHLY_LIMIT
 
     async def _internetdb_lookup(self, ioc_value: str) -> NormalizedResult | None:
@@ -78,7 +82,7 @@ class ShodanAdapter(SourceAdapter):
         client = self._get_client()
         resp = await client.get(
                 "https://api.shodan.io/shodan/host/{0}".format(ioc_value),
-                params={"key": self.api_key},
+                headers={"Authorization": self.api_key},
                 timeout=15,
             )
 
@@ -169,5 +173,5 @@ class ShodanAdapter(SourceAdapter):
         return NormalizedResult(
             ioc=ioc_value, ioc_type=ioc_type, source=self.name,
             verdict="unknown", raw_score=None, tags=tags,
-            categories=categories if categories else None,
+            categories=categories or [],
         )

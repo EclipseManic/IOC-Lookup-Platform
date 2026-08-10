@@ -6,7 +6,9 @@ import httpx
 
 from app.backend.adapters.base import NormalizedResult, RateLimitConfig, SourceAdapter, is_valid_api_key
 from app.backend.config import settings
+from app.backend.logger import get_logger
 
+logger = get_logger("adapter.openphish")
 
 OPENPHISH_FEED_URL = "https://raw.githubusercontent.com/openphish/public_feed/refs/heads/main/feed.txt"
 
@@ -14,6 +16,7 @@ OPENPHISH_FEED_URL = "https://raw.githubusercontent.com/openphish/public_feed/re
 class OpenPhishAdapter(SourceAdapter):
     name = "OpenPhish"
     supported_types = ["url"]
+    public_without_key = True
     rate_limit = RateLimitConfig(requests_per_minute=60)
 
     _feed: list[str] = []
@@ -69,8 +72,10 @@ class OpenPhishAdapter(SourceAdapter):
                     self._feed_updated = time.time()
                     self._etag = r.headers.get("ETag", "")
                     self._last_modified = r.headers.get("Last-Modified", "")
-            except Exception:
-                pass
+                else:
+                    logger.warning("OpenPhish feed download failed with status %d", r.status_code)
+            except Exception as e:
+                logger.warning("OpenPhish feed download error: %s", e)
 
     async def lookup(self, ioc_value: str, ioc_type: str) -> NormalizedResult:
         await self._ensure_feed()
@@ -94,6 +99,6 @@ class OpenPhishAdapter(SourceAdapter):
 
         return NormalizedResult(
             ioc=ioc_value, ioc_type=ioc_type, source=self.name,
-            verdict="clean", confidence="medium",
-            raw_score=0.0, tags=["not_in_feed"],
+            verdict="unknown", confidence="low",
+            raw_score=0.0, tags=["not_in_feed"], status="not_found",
         )

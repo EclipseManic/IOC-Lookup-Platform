@@ -10,7 +10,9 @@ from app.backend.config import settings
 
 class ThreatFoxAdapter(SourceAdapter):
     name = "ThreatFox"
-    supported_types = ["md5", "sha1", "sha256", "ipv4", "domain", "url"]
+    supported_types = ["md5", "sha1", "sha256", "ipv4", "ipv6", "domain", "url"]
+    # ThreatFox currently returns HTTP 401 without an Auth-Key.
+    public_without_key = False
     rate_limit = RateLimitConfig(requests_per_minute=60)
 
     def __init__(self):
@@ -45,13 +47,13 @@ class ThreatFoxAdapter(SourceAdapter):
         if qs == "no_result":
             return NormalizedResult(
                 ioc=ioc_value, ioc_type=ioc_type, source=self.name,
-                verdict="unknown", raw_score=0.0,
+                verdict="unknown", raw_score=0.0, status="not_found",
             )
 
         if qs != "ok" or not data.get("data"):
             return NormalizedResult(
                 ioc=ioc_value, ioc_type=ioc_type, source=self.name,
-                verdict="unknown", raw_score=0.0,
+                verdict="unknown", raw_score=0.0, status="not_found",
             )
 
         entries = data["data"]

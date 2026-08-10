@@ -1,6 +1,26 @@
 import json
 from datetime import datetime, timezone
 
+from jsonschema import Draft202012Validator
+
+_ECS_EVENT_SCHEMA = {
+    "type": "object",
+    "required": ["@timestamp", "event", "threat"],
+    "properties": {
+        "@timestamp": {"type": "string"},
+        "event": {"type": "object"},
+        "threat": {"type": "object"},
+    },
+}
+
+
+def _validate_ecs_events(events: list[dict]) -> None:
+    validator = Draft202012Validator(_ECS_EVENT_SCHEMA)
+    for event in events:
+        errors = sorted(validator.iter_errors(event), key=lambda e: list(e.path))
+        if errors:
+            raise ValueError(f"Invalid ECS event: {errors[0].message}")
+
 
 def _ts() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.000Z")
@@ -101,6 +121,7 @@ def export_ecs(response: dict) -> str:
             event["malware"] = {"family": r["malware_family"]}
         events.append(event)
 
+    _validate_ecs_events(events)
     return "\n".join(json.dumps(e, default=str) for e in events)
 
 

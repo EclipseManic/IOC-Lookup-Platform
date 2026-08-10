@@ -2,10 +2,15 @@ import httpx
 
 from app.backend.adapters.base import NormalizedResult, RateLimitConfig, SourceAdapter, is_valid_api_key
 from app.backend.config import settings
+from app.backend.logger import get_logger
+
+
+logger = get_logger("adapter.alienvault_otx")
 
 
 _TYPE_TO_SEGMENT = {
     "ipv4": "IPv4",
+    "ipv6": "IPv6",
     "domain": "domain",
     "url": "url",
     "md5": "file",
@@ -16,11 +21,28 @@ _TYPE_TO_SEGMENT = {
 
 class AlienVaultOTXAdapter(SourceAdapter):
     name = "AlienVault OTX"
-    supported_types = ["ipv4", "domain", "url", "md5", "sha1", "sha256"]
+    supported_types = ["ipv4", "ipv6", "domain", "url", "md5", "sha1", "sha256"]
     rate_limit = RateLimitConfig(requests_per_minute=16, requests_per_day=1000)
 
     def __init__(self):
         self.api_key = settings.alienvault_otx_api_key
+
+    async def _sub_request(self, url: str) -> dict | None:
+        if not self._check_circuit():
+            return None
+        try:
+            resp = await self._get_client().get(
+                url, headers={"X-OTX-API-KEY": self.api_key}, timeout=15,
+            )
+            if resp.status_code == 200:
+                self._record_success()
+                return resp.json()
+            if resp.status_code == 429:
+                self._record_failure()
+            return None
+        except Exception:
+            self._record_failure()
+            return None
 
     async def lookup(self, ioc_value: str, ioc_type: str) -> NormalizedResult:
         if not is_valid_api_key(self.api_key):
@@ -37,10 +59,24 @@ class AlienVaultOTXAdapter(SourceAdapter):
             )
 
         client = self._get_client()
-        resp = await client.get(
-                f"https://otx.alienvault.com/api/v1/indicators/{segment}/{ioc_value}/reputation",
-                headers={"X-OTX-API-KEY": self.api_key},
-                timeout=15,
+        try:
+            resp = await client.get(
+                    f"https://otx.alienvault.com/api/v1/indicators/{segment}/{ioc_value}/reputation",
+                    headers={"X-OTX-API-KEY": self.api_key},
+                    timeout=15,
+                )
+        except httpx.TimeoutException:
+            self._record_failure()
+            return NormalizedResult(
+                ioc=ioc_value, ioc_type=ioc_type, source=self.name,
+                verdict="error", tags=["timeout"],
+            )
+        except httpx.HTTPError as exc:
+            self._record_failure()
+            logger.warning("OTX reputation request failed: %s", exc.__class__.__name__)
+            return NormalizedResult(
+                ioc=ioc_value, ioc_type=ioc_type, source=self.name,
+                verdict="error", tags=["request_error"],
             )
 
         if resp.status_code == 401:
@@ -51,7 +87,7 @@ class AlienVaultOTXAdapter(SourceAdapter):
         if resp.status_code == 404:
             return NormalizedResult(
                 ioc=ioc_value, ioc_type=ioc_type, source=self.name,
-                verdict="unknown", raw_score=0.0,
+                verdict="unknown", raw_score=0.0, status="not_found",
             )
         if resp.status_code == 429:
             return NormalizedResult(
@@ -84,13 +120,10 @@ class AlienVaultOTXAdapter(SourceAdapter):
         all_families = set()
         all_mitre = set()
         try:
-            gen_resp = await client.get(
-                f"https://otx.alienvault.com/api/v1/indicators/{segment}/{ioc_value}/general",
-                headers={"X-OTX-API-KEY": self.api_key},
-                timeout=15,
+            general_data = await self._sub_request(
+                f"https://otx.alienvault.com/api/v1/indicators/{segment}/{ioc_value}/general"
             )
-            if gen_resp.status_code == 200:
-                general_data = gen_resp.json()
+            if general_data:
                 base_indicator = general_data.get("base_indicator", {})
                 if isinstance(base_indicator, dict):
                     itype = base_indicator.get("type", "")
@@ -115,41 +148,53 @@ class AlienVaultOTXAdapter(SourceAdapter):
                             if aid: all_mitre.add(aid)
                 pc = pulse_info.get("count", 0)
                 if pc > pulse_count: pulse_count = pc
-        except Exception:
-            pass
+        except Exception as exc:
+            logger.debug("AlienVault OTX pulse parsing failed: %s", exc)
 
         related = []
         if ioc_type in ("domain", "ipv4"):
-            try:
-                pd_resp = await client.get(
-                    f"https://otx.alienvault.com/api/v1/indicators/{segment}/{ioc_value}/passive_dns",
-                    headers={"X-OTX-API-KEY": self.api_key}, timeout=15,
-                )
-                if pd_resp.status_code == 200:
-                    pd_data = pd_resp.json()
-                    for entry in (pd_data.get("passive_dns", []) or [])[:10]:
-                        if isinstance(entry, dict):
-                            hostname = entry.get("hostname", "")
-                            address = entry.get("address", "")
-                            if hostname and address:
-                                related.append((f"{hostname}:{address}", "passive_dns"))
-            except Exception:
-                pass
+            pd_data = await self._sub_request(
+                f"https://otx.alienvault.com/api/v1/indicators/{segment}/{ioc_value}/passive_dns"
+            )
+            if pd_data:
+                for entry in (pd_data.get("passive_dns", []) or [])[:10]:
+                    if isinstance(entry, dict):
+                        hostname = entry.get("hostname", "")
+                        address = entry.get("address", "")
+                        if hostname and address:
+                            related.append((f"{hostname}:{address}", "passive_dns"))
 
         if ioc_type == "domain":
-            try:
-                whois_resp = await client.get(
-                    f"https://otx.alienvault.com/api/v1/indicators/{segment}/{ioc_value}/whois",
-                    headers={"X-OTX-API-KEY": self.api_key}, timeout=15,
-                )
-                if whois_resp.status_code == 200:
-                    whois_data = whois_resp.json()
-                    for key in ("registrant_name", "registrar", "created"):
-                        val = whois_data.get(key, "")
-                        if val:
-                            tags.append(f"whois_{key}:{str(val)[:80]}")
-            except Exception:
-                pass
+            whois_data = await self._sub_request(
+                f"https://otx.alienvault.com/api/v1/indicators/{segment}/{ioc_value}/whois"
+            )
+            if whois_data:
+                for key in ("registrant_name", "registrar", "created"):
+                    val = whois_data.get(key, "")
+                    if val:
+                        tags.append(f"whois_{key}:{str(val)[:80]}")
+
+        extra_data = {}
+        if ioc_type == "ipv4":
+            geo_data = await self._sub_request(
+                f"https://otx.alienvault.com/api/v1/indicators/{segment}/{ioc_value}/geo"
+            )
+            if geo_data and isinstance(geo_data, dict):
+                for key in ("country_code", "country_name", "city", "latitude", "longitude", "asn"):
+                    val = geo_data.get(key)
+                    if val:
+                        extra_data[key] = val
+                if extra_data.get("country_name") or extra_data.get("city"):
+                    extra_data["geoip"] = True
+            analysis_data = await self._sub_request(
+                f"https://otx.alienvault.com/api/v1/indicators/{segment}/{ioc_value}/analysis"
+            )
+            if analysis_data and isinstance(analysis_data, dict):
+                analysis = analysis_data.get("analysis", {})
+                if isinstance(analysis, dict):
+                    plugin_results = analysis.get("plugin_output", "") or analysis.get("plugins", "")
+                    if plugin_results:
+                        extra_data["analysis"] = plugin_results
 
         if pulse_count > 0 and threat_score >= 5:
             verdict = "malicious"
@@ -171,4 +216,5 @@ class AlienVaultOTXAdapter(SourceAdapter):
             malware_family=", ".join(sorted(all_families)) or None,
             mitre_attck=sorted(all_mitre),
             related_iocs=related,
+            raw_data=extra_data,
         )

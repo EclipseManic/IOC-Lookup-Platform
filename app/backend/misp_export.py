@@ -18,6 +18,22 @@ def _ts() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.000Z")
 
 
+def _fmt_ts(value) -> str | None:
+    if value is None:
+        return None
+    if isinstance(value, datetime):
+        if value.tzinfo is None:
+            value = value.replace(tzinfo=timezone.utc)
+        return value.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    return str(value)
+
+
+def _observed_window(results: list[dict]) -> tuple[str | None, str | None]:
+    firsts = [_fmt_ts(r.get("first_seen")) for r in results if r.get("first_seen")]
+    lasts = [_fmt_ts(r.get("last_seen")) for r in results if r.get("last_seen")]
+    return (min(firsts) if firsts else None, max(lasts) if lasts else None)
+
+
 def _misp_id(prefix: str = "") -> str:
     return f"{prefix or 'MISP'}--{uuid.uuid4()}"
 
@@ -36,9 +52,10 @@ def build_misp_event(response: dict) -> dict:
     results = response.get("results", [])
     enrichment = response.get("enrichment", {})
 
-    event_id = _misp_id("Event")
+    event_id = uuid.uuid4().hex
     attributes: list[dict] = []
     objects: list[dict] = []
+    window_first, window_last = _observed_window(results)
 
     attr_id = _misp_id("Attribute")
     attributes.append({
@@ -49,6 +66,8 @@ def build_misp_event(response: dict) -> dict:
         "comment": f"IOC Platform lookup — {verdict} (score: {score})",
         "to_ids": True,
         "timestamp": _ts(),
+        "first_seen": window_first,
+        "last_seen": window_last,
     })
 
     for r in results:
@@ -69,6 +88,8 @@ def build_misp_event(response: dict) -> dict:
             "comment": f"{source}: {r_verdict}" + (f" (score: {r_score})" if r_score else ""),
             "to_ids": True,
             "timestamp": _ts(),
+            "first_seen": _fmt_ts(r.get("first_seen")),
+            "last_seen": _fmt_ts(r.get("last_seen")),
         })
 
     geoip = enrichment.get("geoip", {})
@@ -128,7 +149,7 @@ def build_misp_event(response: dict) -> dict:
     event = {
         "Event": {
             "id": event_id,
-            "uuid": uuid.uuid4().hex,
+            "uuid": event_id,
             "info": f"IOC Platform lookup: {ioc_value} ({ioc_type})",
             "published": False,
             "analysis": 2,

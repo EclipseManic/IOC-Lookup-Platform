@@ -1,18 +1,19 @@
 import asyncio
-import logging
 import time
 
 import httpx
 
 from app.backend.adapters.base import NormalizedResult, RateLimitConfig, SourceAdapter, is_valid_api_key
-
-logger = logging.getLogger("ioc-platform")
 from app.backend.config import settings
+from app.backend.logger import get_logger
+
+logger = get_logger("adapter.urlscan_io")
 
 
 class UrlScanIOAdapter(SourceAdapter):
     name = "urlscan.io"
     supported_types = ["domain", "url"]
+    public_without_key = True
     rate_limit = RateLimitConfig(requests_per_minute=10)
     SCAN_POLL_ATTEMPTS = 7
     SCAN_POLL_DELAY = 2.0
@@ -48,24 +49,19 @@ class UrlScanIOAdapter(SourceAdapter):
                 )
                 if resp.status_code == 200:
                     return resp.json()
-            except Exception:
-                pass
+            except Exception as exc:
+                logger.debug("urlscan.io scan poll attempt failed: %s", exc)
             if time.time() < deadline:
                 await asyncio.sleep(self.SCAN_POLL_DELAY)
         return None
 
     async def lookup(self, ioc_value: str, ioc_type: str) -> NormalizedResult:
-        if not is_valid_api_key(self.api_key):
-            return NormalizedResult(
-                ioc=ioc_value, ioc_type=ioc_type, source=self.name,
-                verdict="unknown", tags=["no_api_key_configured"],
-            )
-
         client = self._get_client()
+        headers = {"API-Key": self.api_key} if is_valid_api_key(self.api_key) else {}
         resp = await client.get(
                 "https://urlscan.io/api/v1/search/",
                 params={"q": f'page.{ioc_type}:"{ioc_value}"', "size": 5},
-                headers={"API-Key": self.api_key},
+                headers=headers or None,
                 timeout=15,
             )
 
@@ -93,11 +89,10 @@ class UrlScanIOAdapter(SourceAdapter):
             )
 
         results = data.get("results", [])
-        if not isinstance(results, list) or not results:
-            return NormalizedResult(
-                ioc=ioc_value, ioc_type=ioc_type, source=self.name,
-                verdict="unknown", raw_score=0.0,
-            )
+        if not isinstance(results, list):
+            results = []
+
+        has_cached_results = bool(results)
 
         malicious = 0
         all_tags = set()
@@ -189,8 +184,8 @@ class UrlScanIOAdapter(SourceAdapter):
                         first = dt
                     if last is None or dt > last:
                         last = dt
-                except Exception:
-                    pass
+                except Exception as exc:
+                    logger.debug("urlscan.io date parse failed: %s", exc)
 
         for d in page_domains:
             all_tags.add(f"domain: {d}")
@@ -206,17 +201,22 @@ class UrlScanIOAdapter(SourceAdapter):
         confidence = "high" if malicious >= 3 else "medium" if malicious > 0 else "low"
 
         report_url = ""
-        task = results[0].get("task", {})
-        if isinstance(task, dict):
-            report_url = task.get("reportURL", "") or task.get("screenshotURL", "") or ""
+        if results and isinstance(results[0], dict):
+            task = results[0].get("task", {})
+            if isinstance(task, dict):
+                report_url = task.get("reportURL", "") or task.get("screenshotURL", "") or ""
         if screenshot_url and not report_url:
             report_url = screenshot_url
 
-        scan_uuid = await self._submit_scan(ioc_value)
+        scan_uuid = None
+        scan_completed = False
+        if not has_cached_results and is_valid_api_key(self.api_key):
+            scan_uuid = await self._submit_scan(ioc_value)
         if scan_uuid:
             all_tags.add("active_scan_submitted")
             active = await self._poll_scan(scan_uuid)
             if active:
+                scan_completed = True
                 all_tags.add("active_scan_completed")
                 verdicts = active.get("verdicts", {})
                 if isinstance(verdicts, dict):
@@ -240,6 +240,12 @@ class UrlScanIOAdapter(SourceAdapter):
                     screenshot_url = active.get("screenshot") or active.get("page", {}).get("screenshot", "")
                 if screenshot_url:
                     report_url = f"https://urlscan.io/result/{scan_uuid}/"
+
+        if not is_malicious and not has_cached_results and not scan_completed:
+            return NormalizedResult(
+                ioc=ioc_value, ioc_type=ioc_type, source=self.name,
+                verdict="unknown", raw_score=0.0,
+            )
 
         return NormalizedResult(
             ioc=ioc_value,

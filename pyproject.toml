@@ -1,3 +1,26 @@
+[build-system]
+requires = ["setuptools>=75.0", "wheel>=0.45"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "ioc-platform"
+version = "0.2.0"
+description = "Universal IOC (Indicator of Compromise) Lookup Platform"
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "MIT" }
+keywords = ["security", "threat-intelligence", "ioc", "lookup"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Information Technology",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Security",
+]
+
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "function"
 testpaths = ["tests"]

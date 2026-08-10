@@ -3,14 +3,17 @@ import type { LookupResponse } from "../services/api";
 import ConsensusBar from "../components/ConsensusBar";
 import EnrichmentPanel from "../components/EnrichmentPanel";
 import ExportMenu, { ExportTab } from "../components/ExportMenu";
+import FeedbackWidget from "../components/FeedbackWidget";
 import RelationshipGraph from "../components/RelationshipGraph";
 import SearchBar from "../components/SearchBar";
 import SourceCard from "../components/SourceCard";
 import TabBar from "../components/TabBar";
 import type { TabName } from "../components/TabBar";
 import ThreatHeader from "../components/ThreatHeader";
+import CoverageNotice from "../components/CoverageNotice";
+import EvidencePanel from "../components/EvidencePanel";
 
-export default function ResultView({ result, onNewSearch }: { result: LookupResponse; onNewSearch: (v: string) => void }) {
+export default function ResultView({ result, onNewSearch }: { result: LookupResponse; onNewSearch: (v: string, type?: string) => void }) {
   const [tab, setTab] = useState<TabName>("Overview");
 
   const handleNodeClick = useCallback((value: string) => {
@@ -27,7 +30,9 @@ export default function ResultView({ result, onNewSearch }: { result: LookupResp
       </div>
 
       <ThreatHeader result={result} />
+      <FeedbackWidget ioc={result.normalized} />
       <ConsensusBar results={result.results} />
+      <CoverageNotice result={result} />
       <TabBar active={tab} onChange={setTab} />
 
       {tab === "Overview" && (
@@ -43,16 +48,24 @@ export default function ResultView({ result, onNewSearch }: { result: LookupResp
               <SourceCard key={r.source} result={r} />
             ))}
           </div>
+          {result.enrichment && <EnrichmentPanel enrichment={result.enrichment} />}
         </div>
       )}
 
       {tab === "Sources" && (
         <div className="space-y-2">
-          {result.results.map((r) => (
+          {result.results.length > 0 ? result.results.map((r) => (
             <SourceCard key={r.source} result={r} />
-          ))}
+          )) : (
+            <div className="bg-bg-card border border-border rounded-lg p-6 text-sm text-text-secondary">
+              No reputation source returned a result for this IOC type. Review the public enrichment and collection status below.
+            </div>
+          )}
+          {result.enrichment && <EnrichmentPanel enrichment={result.enrichment} />}
         </div>
       )}
+
+      {tab === "Evidence" && <EvidencePanel result={result} />}
 
       {tab === "Enrichment" && result.enrichment && (
         <EnrichmentPanel enrichment={result.enrichment} />

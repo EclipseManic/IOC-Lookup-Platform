@@ -1,14 +1,16 @@
 import asyncio
 import time
 
-from app.backend.logger import logger
+from app.backend.logger import get_logger
+
+logger = get_logger("rate_limiter")
 
 
 class RateLimiter:
-    def __init__(self, redis_url: str = "redis://localhost:6379/0"):
-        self.redis_url = redis_url
+    def __init__(self, redis_url: str | None = None):
+        self.redis_url = redis_url or ""
         self._redis = None
-        self._enabled = True
+        self._enabled = bool(self.redis_url)
         self._local_counters: dict[str, list[float]] = {}
         self._local_lock = asyncio.Lock()
 
@@ -24,7 +26,9 @@ class RateLimiter:
         await self._redis.ping()
 
     async def _get_redis(self):
-        if not self._enabled:
+        if self._redis is not None:
+            return self._redis
+        if not self._enabled or not self.redis_url:
             return None
         if self._redis is None:
             try:

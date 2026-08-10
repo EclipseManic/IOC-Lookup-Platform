@@ -96,17 +96,19 @@ class SecurityTrailsAdapter(SourceAdapter):
                 if dns_resp.status_code == 200:
                     SecurityTrailsAdapter._monthly_requests_used += 1
                     dns_data = dns_resp.json()
-                    for rtype in ("a", "aaaa", "mx", "ns"):
-                        recs = dns_data.get("records", {}).get(rtype, []) if isinstance(dns_data.get("records"), dict) else dns_data.get(rtype, [])
-                        if recs:
-                            tags.append(f"dns_{rtype}_count: {len(recs)}")
-                            for rec in recs[:3]:
-                                if isinstance(rec, dict):
-                                    val = rec.get("value", rec.get("hostname", ""))
-                                    if val:
-                                        related.append((val, f"dns_{rtype}"))
-            except Exception:
-                pass
+                    records = dns_data.get("records") if isinstance(dns_data, dict) else None
+                    if isinstance(records, dict):
+                        for rtype in ("a", "aaaa", "mx", "ns"):
+                            recs = records.get(rtype, [])
+                            if recs:
+                                tags.append(f"dns_{rtype}_count: {len(recs)}")
+                                for rec in recs[:3]:
+                                    if isinstance(rec, dict):
+                                        val = rec.get("value", rec.get("hostname", ""))
+                                        if val:
+                                            related.append((val, f"dns_{rtype}"))
+            except Exception as exc:
+                logger.debug("SecurityTrails DNS enrichment failed: %s", exc)
 
         if ioc_type == "ipv4":
             try:
@@ -121,8 +123,8 @@ class SecurityTrailsAdapter(SourceAdapter):
                     tags.append(f"ip_subdomains: {len(ip_subs)}")
                     for sub in ip_subs[:10]:
                         related.append((sub, "ip_subdomain"))
-            except Exception:
-                pass
+            except Exception as exc:
+                logger.debug("SecurityTrails subdomain lookup failed: %s", exc)
 
         return NormalizedResult(
             ioc=ioc_value, ioc_type=ioc_type, source=self.name,

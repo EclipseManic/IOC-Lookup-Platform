@@ -1,6 +1,5 @@
 import type { StageInfo } from "../services/api";
 
-const STATUS_ORDER = ["pending", "running", "done", "skipped", "error"] as const;
 const STATUS_COLORS: Record<string, string> = {
   pending: "bg-border",
   running: "bg-accent animate-pulse",
@@ -9,7 +8,13 @@ const STATUS_COLORS: Record<string, string> = {
   error: "bg-red-500",
 };
 
-export default function PipelineProgress({ stages, progress }: { stages: StageInfo[]; progress: number }) {
+export default function PipelineProgress({
+  stages = [],
+  progress = 0,
+}: {
+  stages?: StageInfo[];
+  progress?: number;
+}) {
   const active = stages.find((s) => s.status === "running");
   const done = stages.filter((s) => s.status === "done").length;
   const total = stages.length;
@@ -20,7 +25,14 @@ export default function PipelineProgress({ stages, progress }: { stages: StageIn
         <span className="text-sm font-semibold text-text-secondary">Pipeline Progress</span>
         <span className="text-xs text-text-secondary">{done}/{total} stages · {progress.toFixed(0)}%</span>
       </div>
-      <div className="w-full bg-bg-elevated rounded-full h-1.5 mb-3">
+      <div
+        role="progressbar"
+        aria-label="Pipeline progress"
+        aria-valuemin={0}
+        aria-valuemax={100}
+        aria-valuenow={Math.round(progress)}
+        className="w-full bg-bg-elevated rounded-full h-1.5 mb-3"
+      >
         <div
           className="h-1.5 rounded-full bg-gradient-to-r from-accent to-accent-secondary transition-all duration-500"
           style={{ width: `${progress}%` }}

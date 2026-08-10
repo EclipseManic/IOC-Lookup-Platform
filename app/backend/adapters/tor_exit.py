@@ -1,13 +1,13 @@
 import asyncio
-import logging
 import socket
 import time
 
 import httpx
 
 from app.backend.adapters.base import NormalizedResult, RateLimitConfig, SourceAdapter
+from app.backend.logger import get_logger
 
-logger = logging.getLogger("ioc-platform")
+logger = get_logger("adapter.tor_exit")
 
 
 _TOR_LIST_URL = "https://check.torproject.org/torbulkexitlist"
@@ -20,6 +20,7 @@ _cache_lock = asyncio.Lock()
 class TorExitAdapter(SourceAdapter):
     name = "Tor Exit"
     supported_types = ["ipv4"]
+    public_without_key = True
     rate_limit = RateLimitConfig(requests_per_minute=60)
 
     async def _check_dnsel(self, ioc_value: str) -> bool:
@@ -27,8 +28,11 @@ class TorExitAdapter(SourceAdapter):
             rev_parts = ioc_value.split(".")
             rev_parts.reverse()
             dnsel_host = ".".join(rev_parts) + ".dnsel.torproject.org"
-            addrinfo = await asyncio.to_thread(
-                socket.getaddrinfo, dnsel_host, 0, type=socket.SOCK_STREAM
+            addrinfo = await asyncio.wait_for(
+                asyncio.to_thread(
+                    socket.getaddrinfo, dnsel_host, 0, type=socket.SOCK_STREAM
+                ),
+                timeout=5,
             )
             for family, stype, proto, canonname, sockaddr in addrinfo:
                 if sockaddr[0] == "127.0.0.2":
@@ -68,5 +72,5 @@ class TorExitAdapter(SourceAdapter):
 
         return NormalizedResult(
             ioc=ioc_value, ioc_type=ioc_type, source=self.name,
-            verdict="unknown", raw_score=0.0,
+            verdict="unknown", raw_score=0.0, status="not_found",
         )

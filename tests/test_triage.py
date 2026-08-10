@@ -135,6 +135,47 @@ class TestTriageAdapter:
         assert "status_running" in r.tags
 
     @pytest.mark.asyncio
+    async def test_overview_block_no_nameerror(self):
+        """P0-5: overview enrichment must not raise NameError (tags/mitre initialized first)."""
+        sample = {
+            "status": "complete",
+            "verdict": "malicious",
+            "score": 9,
+            "tags": ["emotet"],
+            "signatures": [],
+            "mitre_attck": [],
+            "target": {"file": {"name": "malware.exe"}},
+            "network": {},
+            "extracted": {},
+        }
+        overview = {
+            "signatures": ["agenttesla"],
+            "mitre_attck": ["T1055", "T1047"],
+        }
+        sample_resp = AsyncMock(spec=httpx.Response)
+        sample_resp.status_code = 200
+        sample_resp.json.return_value = sample
+        sample_resp.text = json.dumps(sample)
+        overview_resp = AsyncMock(spec=httpx.Response)
+        overview_resp.status_code = 200
+        overview_resp.json.return_value = overview
+        overview_resp.text = json.dumps(overview)
+
+        mock_instance = AsyncMock()
+        mock_instance.get.side_effect = [sample_resp, overview_resp]
+        mock_instance.__aenter__.return_value = mock_instance
+        mock_instance.__aexit__.return_value = None
+
+        a = TriageAdapter()
+        a.api_key = "valid_key"
+        with patch("httpx.AsyncClient", MagicMock(return_value=mock_instance)):
+            r = await a.lookup("d41d8cd98f00b204e9800998ecf8427e", "md5")
+        assert r.verdict == "malicious"
+        assert "sig:agenttesla" in r.tags
+        assert "T1055" in r.mitre_attck
+        assert "T1047" in r.mitre_attck
+
+    @pytest.mark.asyncio
     async def test_adapter_name(self):
         a = TriageAdapter()
         assert a.name == "Tria.ge"

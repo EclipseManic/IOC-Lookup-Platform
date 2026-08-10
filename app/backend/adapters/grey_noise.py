@@ -9,37 +9,65 @@ from app.backend.config import settings
 class GreyNoiseAdapter(SourceAdapter):
     name = "GreyNoise"
     supported_types = ["ipv4"]
+    public_without_key = True
     rate_limit = RateLimitConfig(requests_per_minute=10)
 
     WEEKLY_LIMIT = 50
     _weekly_requests_used = 0
     _quota_reset_time = 0.0
+    _quota_remaining: int | None = None
 
-    def _check_weekly_quota(self) -> bool:
+    def __init__(self):
+        self.api_key = settings.greynoise_api_key
+
+    async def _check_weekly_quota(self) -> tuple[bool, str | None]:
+        if is_valid_api_key(self.api_key):
+            return True, None
+
         now = time.time()
-        if now > self._quota_reset_time:
-            self._weekly_requests_used = 0
-            self._quota_reset_time = now + 604800
-        return True
+        if now > GreyNoiseAdapter._quota_reset_time:
+            GreyNoiseAdapter._weekly_requests_used = 0
+            GreyNoiseAdapter._quota_remaining = None
+            GreyNoiseAdapter._quota_reset_time = now + 604800
+
+        if GreyNoiseAdapter._quota_remaining is not None:
+            if GreyNoiseAdapter._quota_remaining <= 0:
+                return False, "weekly_quota_exhausted"
+            return True, None
+
+        # The anonymous community endpoint has a small local budget. API-key
+        # requests are governed by GreyNoise's server-side quota instead; a
+        # process-wide anonymous counter must not throttle authenticated users.
+        if GreyNoiseAdapter._weekly_requests_used >= self.WEEKLY_LIMIT:
+            return False, "weekly_quota_exhausted"
+        return True, None
 
     async def lookup(self, ioc_value: str, ioc_type: str) -> NormalizedResult:
-        if not self._check_weekly_quota():
+        allowed, quota_tag = await self._check_weekly_quota()
+        if not allowed:
             return NormalizedResult(
                 ioc=ioc_value, ioc_type=ioc_type, source=self.name,
-                verdict="unknown", tags=["weekly_quota_exhausted"],
+                verdict="unknown", tags=[quota_tag or "weekly_quota_exhausted"],
             )
 
         client = self._get_client()
         headers = {"accept": "application/json"}
+        if is_valid_api_key(self.api_key):
+            headers["key"] = self.api_key
         resp = await client.get(
                 f"https://api.greynoise.io/v3/community/{ioc_value}",
                 headers=headers,
                 timeout=10,
             )
 
-        GreyNoiseAdapter._weekly_requests_used += 1
+        if not is_valid_api_key(self.api_key):
+            GreyNoiseAdapter._weekly_requests_used += 1
+        if GreyNoiseAdapter._quota_remaining is not None:
+            GreyNoiseAdapter._quota_remaining = max(GreyNoiseAdapter._quota_remaining - 1, 0)
 
         if resp.status_code == 429:
+            if not is_valid_api_key(self.api_key):
+                GreyNoiseAdapter._quota_remaining = 0
             return NormalizedResult(
                 ioc=ioc_value, ioc_type=ioc_type, source=self.name,
                 verdict="unknown", tags=["rate_limited"],
@@ -52,7 +80,7 @@ class GreyNoiseAdapter(SourceAdapter):
         if resp.status_code == 404:
             return NormalizedResult(
                 ioc=ioc_value, ioc_type=ioc_type, source=self.name,
-                verdict="unknown", raw_score=0.0,
+                verdict="unknown", raw_score=0.0, status="not_found",
             )
         if resp.status_code != 200:
             return NormalizedResult(

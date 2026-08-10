@@ -1,21 +1,20 @@
 import type { NormalizedResult } from "../services/api";
 
-const VERDICT_ORDER = ["malicious", "suspicious", "clean", "unknown", "error"] as const;
+const VERDICT_ORDER = ["malicious", "suspicious", "clean", "unknown"] as const;
 const VERDICT_COLORS: Record<string, string> = {
   malicious: "bg-red-500",
   suspicious: "bg-amber-500",
   clean: "bg-green-500",
   unknown: "bg-gray-500",
-  error: "bg-red-500/50",
 };
 
 export default function ConsensusBar({ results }: { results: NormalizedResult[] }) {
   const counts: Record<string, number> = {};
   let total = 0;
   for (const r of results) {
-    const v = r.verdict || "unknown";
+    const v = r.verdict === "error" || r.status === "error" ? "error" : (r.verdict || "unknown");
     counts[v] = (counts[v] || 0) + 1;
-    total++;
+    if (v !== "error") total++;
   }
   if (total === 0) return null;
 
@@ -48,6 +47,11 @@ export default function ConsensusBar({ results }: { results: NormalizedResult[] 
           );
         })}
       </div>
+      {(counts.error || 0) > 0 && (
+        <p className="mt-2 text-xs text-text-secondary">
+          {(counts.error || 0)} source{counts.error === 1 ? "" : "s"} unavailable; unavailable sources do not participate in the verdict.
+        </p>
+      )}
     </div>
   );
 }

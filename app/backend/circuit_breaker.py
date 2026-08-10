@@ -1,3 +1,4 @@
+import threading
 import time
 from typing import Optional
 
@@ -19,63 +20,73 @@ class CircuitBreaker:
         self.total_requests = 0
         self.total_failures = 0
         self.last_success_time: Optional[float] = None
+        self._lock = threading.Lock()
 
     def _now(self) -> float:
         return time.time()
 
     def allow_request(self) -> bool:
-        self.total_requests += 1
-        if self.state == CircuitBreakerState.CLOSED:
-            return True
-
-        if self.state == CircuitBreakerState.OPEN:
-            if self.last_failure_time and (self._now() - self.last_failure_time) >= self.recovery_timeout:
-                self.state = CircuitBreakerState.HALF_OPEN
+        with self._lock:
+            self.total_requests += 1
+            if self.state == CircuitBreakerState.CLOSED:
                 return True
-            return False
 
-        return True  # HALF_OPEN allows probe
+            if self.state == CircuitBreakerState.OPEN:
+                if self.last_failure_time and (self._now() - self.last_failure_time) >= self.recovery_timeout:
+                    self.state = CircuitBreakerState.HALF_OPEN
+                    return True
+                return False
+
+            return True  # HALF_OPEN allows probe
 
     def record_success(self):
-        self.failure_count = 0
-        self.state = CircuitBreakerState.CLOSED
-        self.last_success_time = self._now()
+        with self._lock:
+            self.failure_count = 0
+            self.state = CircuitBreakerState.CLOSED
+            self.last_success_time = self._now()
 
     def record_failure(self):
-        self.total_failures += 1
-        self.failure_count += 1
-        self.last_failure_time = self._now()
+        with self._lock:
+            self.total_failures += 1
+            self.failure_count += 1
+            self.last_failure_time = self._now()
 
-        if self.failure_count >= self.failure_threshold:
-            self.state = CircuitBreakerState.OPEN
+            if self.failure_count >= self.failure_threshold:
+                self.state = CircuitBreakerState.OPEN
 
     def reset(self):
-        self.state = CircuitBreakerState.CLOSED
-        self.failure_count = 0
-        self.last_failure_time = None
+        with self._lock:
+            self.state = CircuitBreakerState.CLOSED
+            self.failure_count = 0
+            self.last_failure_time = None
 
     def to_dict(self) -> dict:
-        return {
-            "name": self.name,
-            "state": self.state,
-            "failure_count": self.failure_count,
-            "failure_threshold": self.failure_threshold,
-            "recovery_timeout": self.recovery_timeout,
-            "total_requests": self.total_requests,
-            "total_failures": self.total_failures,
-            "last_failure_time": self.last_failure_time,
-            "last_success_time": self.last_success_time,
-        }
+        with self._lock:
+            return {
+                "name": self.name,
+                "state": self.state,
+                "failure_count": self.failure_count,
+                "failure_threshold": self.failure_threshold,
+                "recovery_timeout": self.recovery_timeout,
+                "total_requests": self.total_requests,
+                "total_failures": self.total_failures,
+                "last_failure_time": self.last_failure_time,
+                "last_success_time": self.last_success_time,
+            }
 
 
 _breakers: dict[str, CircuitBreaker] = {}
+_breakers_lock = threading.Lock()
 
 
 def get_breaker(name: str, failure_threshold: int = 3, recovery_timeout: float = 30.0) -> CircuitBreaker:
-    if name not in _breakers:
-        _breakers[name] = CircuitBreaker(name, failure_threshold, recovery_timeout)
-    return _breakers[name]
+    with _breakers_lock:
+        if name not in _breakers:
+            _breakers[name] = CircuitBreaker(name, failure_threshold, recovery_timeout)
+        return _breakers[name]
 
 
 def all_breaker_states() -> list[dict]:
-    return [b.to_dict() for b in _breakers.values()]
+    with _breakers_lock:
+        breakers = list(_breakers.values())
+    return [b.to_dict() for b in breakers]

@@ -1,5 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import * as d3 from "d3";
+import { List, type ListProps } from "react-window";
+import type { Relationship } from "../services/api";
 
 const NODE_COLORS: Record<string, string> = {
   ipv4: "#3b82f6",
@@ -14,6 +16,8 @@ const NODE_COLORS: Record<string, string> = {
   default: "#6b7280",
 };
 
+const MAX_GRAPH_NODES = 400;
+
 function inferType(label: string): string {
   if (/^\d+\.\d+\.\d+\.\d+$/.test(label)) return "ipv4";
   if (/^[0-9a-f]{32}$/i.test(label)) return "md5";
@@ -22,7 +26,7 @@ function inferType(label: string): string {
   if (/^CVE-\d{4}-\d{4,}$/i.test(label)) return "cve";
   if (/^[\w.+-]+@[\w.-]+\.\w{2,}$/.test(label)) return "email";
   if (/^https?:\/\//i.test(label)) return "url";
-  if (/^[\w.-]+\.[a-z]{2,}$/i.test(label)) return "domain";
+  if (/^[\w.-]+\.[a-z]{2,}$/.test(label)) return "domain";
   return "default";
 }
 
@@ -43,31 +47,54 @@ interface LinkData {
 
 interface Props {
   mainIoc: string;
-  relationships: Array<{
-    source_ioc: string;
-    relationship: string;
-    target_ioc: string;
-    via_source: string;
-  }>;
+  relationships: Relationship[];
   onNodeClick?: (value: string) => void;
 }
+
+const ROW_HEIGHT = 40;
+
+interface RelationshipRowData {
+  data: Relationship[];
+}
+
+function RelationshipRow({ index, style, data }: { index: number; style: React.CSSProperties } & RelationshipRowData) {
+  const rel = data[index];
+  return (
+    <div style={style} className="border-b border-border/50 hover:bg-bg-elevated/50 transition-colors flex items-center">
+      <div className="flex-1 min-w-0 px-3 py-2">
+        <span className="font-mono text-xs truncate block" title={rel.source_ioc}>{rel.source_ioc}</span>
+      </div>
+      <div className="w-28 shrink-0 px-3">
+        <span className="text-[10px] px-1.5 py-0.5 bg-accent/10 text-accent rounded" title={rel.relationship}>{rel.relationship}</span>
+      </div>
+      <div className="flex-1 min-w-0 px-3 py-2">
+        <span className="font-mono text-xs truncate block" title={rel.target_ioc}>{rel.target_ioc}</span>
+      </div>
+      <div className="w-28 shrink-0 px-3">
+        <span className="text-xs text-text-secondary truncate block" title={rel.via_source}>{rel.via_source}</span>
+      </div>
+    </div>
+  );
+}
+
+const relationshipRowComponent: ListProps<RelationshipRowData>["rowComponent"] = RelationshipRow;
 
 export default function RelationshipGraph({ mainIoc, relationships, onNodeClick }: Props) {
   const svgRef = useRef<SVGSVGElement>(null);
   const [tooltip, setTooltip] = useState<{ x: number; y: number; content: React.ReactNode } | null>(null);
   const [viewMode, setViewMode] = useState<"graph" | "table">("graph");
-  const activeTypesRef = useRef<Set<string>>(new Set());
+  const [activeTypes, setActiveTypes] = useState<Set<string>>(new Set());
 
   const buildGraph = useCallback(() => {
     if (!svgRef.current || relationships.length === 0) return;
 
     const nodesMap = new Map<string, NodeData>();
-    activeTypesRef.current = new Set();
+    const seenTypes = new Set<string>();
 
     const addNode = (label: string, isMain: boolean) => {
       if (nodesMap.has(label)) return;
       const type = inferType(label);
-      activeTypesRef.current.add(type);
+      seenTypes.add(type);
       nodesMap.set(label, {
         id: label, label, type,
         score: isMain ? 100 : 50,
@@ -79,9 +106,16 @@ export default function RelationshipGraph({ mainIoc, relationships, onNodeClick 
 
     const links: LinkData[] = [];
     for (const rel of relationships) {
+      if (!rel.source_ioc || !rel.target_ioc) continue;
+      if (nodesMap.size >= MAX_GRAPH_NODES) break;
       addNode(rel.source_ioc, false);
       addNode(rel.target_ioc, false);
-      links.push({ source: rel.source_ioc, target: rel.target_ioc, relationship: rel.relationship, via_source: rel.via_source });
+      links.push({
+        source: rel.source_ioc,
+        target: rel.target_ioc,
+        relationship: rel.relationship ?? "",
+        via_source: rel.via_source ?? "",
+      });
     }
 
     const nodes = Array.from(nodesMap.values());
@@ -91,6 +125,7 @@ export default function RelationshipGraph({ mainIoc, relationships, onNodeClick 
     const svg = d3.select(svgRef.current);
     svg.selectAll("*").remove();
     svg.attr("viewBox", `0 0 ${width} ${height}`);
+    svg.attr("role", "img").attr("aria-label", `Relationship graph for ${mainIoc}`);
 
     const g = svg.append("g");
 
@@ -129,8 +164,11 @@ export default function RelationshipGraph({ mainIoc, relationships, onNodeClick 
       .data(nodes)
       .join("g")
       .attr("cursor", "grab")
+      .attr("tabindex", (d) => (d.isMain ? -1 : 0))
+      .attr("role", "button")
+      .attr("aria-label", (d) => `${d.label} (${d.type})`)
       .call(d3.drag<any, NodeData>()
-        .on("start", (event, d) => {
+        .on("start", (event) => {
           if (!event.active) simulation.alphaTarget(0.3).restart();
         })
         .on("drag", (event, d) => { d.x = event.x; d.y = event.y; })
@@ -151,7 +189,9 @@ export default function RelationshipGraph({ mainIoc, relationships, onNodeClick 
       .attr("fill", "#f1f5f9")
       .attr("font-size", (d) => d.isMain ? 10 : 8)
       .attr("font-family", "monospace")
-      .text((d) => d.label.length > 20 ? d.label.slice(0, 18) + "…" : d.label);
+      .text((d) => d.label.length > 20 ? d.label.slice(0, 18) + "…" : d.label)
+      .append("title")
+      .text((d) => d.label);
 
     nodeGroup.on("mouseenter", (event, d) => {
       const rect = svgRef.current!.getBoundingClientRect();
@@ -170,6 +210,12 @@ export default function RelationshipGraph({ mainIoc, relationships, onNodeClick 
     .on("mouseleave", () => setTooltip(null))
     .on("click", (_event, d) => {
       if (!d.isMain && onNodeClick) onNodeClick(d.label);
+    })
+    .on("keydown", (event, d) => {
+      if ((event.key === "Enter" || event.key === " ") && !d.isMain && onNodeClick) {
+        event.preventDefault();
+        onNodeClick(d.label);
+      }
     });
 
     link.on("mouseenter", (event, d: any) => {
@@ -199,6 +245,8 @@ export default function RelationshipGraph({ mainIoc, relationships, onNodeClick 
       nodeGroup.attr("transform", (d: any) => `translate(${d.x},${d.y})`);
     });
 
+    setActiveTypes(seenTypes);
+
     return () => { simulation.stop(); };
   }, [mainIoc, relationships, onNodeClick]);
 
@@ -210,11 +258,11 @@ export default function RelationshipGraph({ mainIoc, relationships, onNodeClick 
     <div>
       <div className="flex items-center justify-between mb-3">
         <h3 className="text-sm font-semibold text-text-secondary uppercase tracking-wider">Relationships</h3>
-        <div className="flex gap-1 bg-bg-elevated rounded-lg p-0.5">
-          <button onClick={() => setViewMode("graph")}
+        <div className="flex gap-1 bg-bg-elevated rounded-lg p-0.5" role="tablist" aria-label="Relationship view mode">
+          <button onClick={() => setViewMode("graph")} role="tab" aria-selected={viewMode === "graph"}
             className={`px-3 py-1 text-xs rounded-md transition-colors ${viewMode === "graph" ? "bg-accent text-white" : "text-text-secondary hover:text-text-primary"}`}
           >Graph</button>
-          <button onClick={() => setViewMode("table")}
+          <button onClick={() => setViewMode("table")} role="tab" aria-selected={viewMode === "table"}
             className={`px-3 py-1 text-xs rounded-md transition-colors ${viewMode === "table" ? "bg-accent text-white" : "text-text-secondary hover:text-text-primary"}`}
           >Table</button>
         </div>
@@ -223,6 +271,11 @@ export default function RelationshipGraph({ mainIoc, relationships, onNodeClick 
       {viewMode === "graph" ? (
         <div className="relative bg-bg-card border border-border rounded-lg overflow-hidden">
           <svg ref={svgRef} className="w-full" style={{ height: 500 }} />
+          {nodesCountExceedsMax(relationships) && (
+            <p className="absolute top-2 left-2 text-[10px] text-text-secondary bg-bg-card/80 rounded px-2 py-1">
+              Graph limited to {MAX_GRAPH_NODES} nodes; table view shows all.
+            </p>
+          )}
           {tooltip && (
             <div
               className="absolute z-10 bg-bg-elevated border border-border rounded-lg px-3 py-2 text-xs shadow-xl pointer-events-none"
@@ -230,7 +283,7 @@ export default function RelationshipGraph({ mainIoc, relationships, onNodeClick 
             >{tooltip.content}</div>
           )}
           <div className="absolute bottom-3 left-3 flex flex-wrap gap-2">
-            {Array.from(activeTypesRef.current).filter(t => t !== "default").map((type) => (
+            {Array.from(activeTypes).filter(t => t !== "default").map((type) => (
               <div key={type} className="flex items-center gap-1 text-[10px]">
                 <span className="w-2 h-2 rounded-full" style={{ backgroundColor: NODE_COLORS[type] || NODE_COLORS.default }} />
                 <span className="text-text-secondary">{type}</span>
@@ -239,31 +292,34 @@ export default function RelationshipGraph({ mainIoc, relationships, onNodeClick 
           </div>
         </div>
       ) : (
-        <div className="bg-bg-card border border-border rounded-lg overflow-x-auto">
-          <table className="w-full text-sm">
-            <thead>
-              <tr className="border-b border-border text-text-secondary">
-                <th className="text-left py-2 px-3 font-medium">Source</th>
-                <th className="text-left py-2 px-3 font-medium">Relationship</th>
-                <th className="text-left py-2 px-3 font-medium">Target</th>
-                <th className="text-left py-2 px-3 font-medium">Via</th>
-              </tr>
-            </thead>
-            <tbody>
-              {relationships.map((rel, i) => (
-                <tr key={i} className="border-b border-border/50 hover:bg-bg-elevated/50 transition-colors">
-                  <td className="py-2 px-3 font-mono text-xs">{rel.source_ioc}</td>
-                  <td className="py-2 px-3">
-                    <span className="text-[10px] px-1.5 py-0.5 bg-accent/10 text-accent rounded">{rel.relationship}</span>
-                  </td>
-                  <td className="py-2 px-3 font-mono text-xs">{rel.target_ioc}</td>
-                  <td className="py-2 px-3 text-xs text-text-secondary">{rel.via_source}</td>
-                </tr>
-              ))}
-            </tbody>
-          </table>
+        <div className="bg-bg-card border border-border rounded-lg overflow-hidden">
+          <div className="flex items-center border-b border-border text-text-secondary text-sm px-3">
+            <div className="flex-1 py-2 font-medium">Source</div>
+            <div className="w-28 shrink-0 py-2 font-medium">Relationship</div>
+            <div className="flex-1 py-2 font-medium">Target</div>
+            <div className="w-28 shrink-0 py-2 font-medium">Via</div>
+          </div>
+          <List
+            className="w-full"
+            rowCount={relationships.length}
+            rowHeight={ROW_HEIGHT}
+            rowProps={{ data: relationships }}
+            rowComponent={relationshipRowComponent}
+            style={{ height: Math.min(500, relationships.length * ROW_HEIGHT), maxHeight: 500 }}
+          />
         </div>
       )}
     </div>
   );
+}
+
+function nodesCountExceedsMax(relationships: Relationship[]): boolean {
+  const seen = new Set<string>();
+  for (const rel of relationships) {
+    if (!rel.source_ioc || !rel.target_ioc) continue;
+    seen.add(rel.source_ioc);
+    seen.add(rel.target_ioc);
+    if (seen.size >= MAX_GRAPH_NODES) return true;
+  }
+  return false;
 }

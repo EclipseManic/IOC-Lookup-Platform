@@ -1,3 +1,4 @@
+import ipaddress
 import re
 
 
@@ -19,14 +20,9 @@ def defang(text: str) -> str:
 
 PATTERNS: list[tuple[str, str]] = [
     ("cve", r"^CVE-\d{4}-\d{4,}$", re.IGNORECASE),
-    ("ipv4", r"^\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}$"),
-    ("ipv6", r"^([0-9a-fA-F]{0,4}:){1,7}[0-9a-fA-F]{0,4}$"),
     ("domain", r"^([a-zA-Z0-9-]+\.)+[a-zA-Z]{2,}$"),
     ("url", r"^https?://[^\s]+$", re.IGNORECASE),
     ("email", r"^[\w.+-]+@[\w-]+\.[\w.-]+$"),
-    ("imphash", r"^[a-f0-9]{32}$", re.IGNORECASE),
-    ("ja3", r"^[a-f0-9]{32}$", re.IGNORECASE),
-    ("ja3s", r"^[a-f0-9]{32}$", re.IGNORECASE),
     ("md5", r"^[a-f0-9]{32}$", re.IGNORECASE),
     ("sha1", r"^[a-f0-9]{40}$", re.IGNORECASE),
     ("sha256", r"^[a-f0-9]{64}$", re.IGNORECASE),
@@ -35,26 +31,32 @@ PATTERNS: list[tuple[str, str]] = [
     ("btc", r"^bc1[a-zA-Z0-9]{38,58}$"),
     ("mitre_attack", r"^(TA\d{4}|T\d{4}(\.\d{3})?)$"),
     ("asn", r"^AS\d+$", re.IGNORECASE),
-    ("mutex", r"^[a-zA-Z0-9_\\-]+$"),
     ("named_pipe", r"^\\\\[^\\]+\\pipe\\"),
     ("registry_key", r"^[A-Za-z_][A-Za-z0-9_]*\\[A-Za-z0-9_\\]+$"),
+    ("mutex", r"^[a-zA-Z0-9_\\-]+$"),
     ("service_name", r"^[a-zA-Z0-9_]+$"),
 ]
 
 _SEARCH_BASED_TYPES = {"mutex", "registry_key", "named_pipe", "service_name"}
+SUPPORTED_IOC_TYPES = {
+    "cve", "ipv4", "ipv6", "domain", "url", "email", "md5", "sha1", "sha256",
+    "ssdeep", "btc", "mitre_attack", "asn", "mutex", "named_pipe", "registry_key", "service_name",
+}
 
 
 def classify_ioc(value: str) -> str:
+    try:
+        address = ipaddress.ip_address(value)
+        return "ipv4" if address.version == 4 else "ipv6"
+    except ValueError:
+        pass
+
     for type_name, pattern, *flags in PATTERNS:
         flag = flags[0] if flags else 0
         if re.match(pattern, value, flag):
-            if type_name in ("md5", "imphash", "ja3", "ja3s"):
+            if type_name == "md5":
                 return type_name
             if type_name == "domain" and value.startswith("http"):
-                continue
-            if type_name == "ipv4":
-                if all(0 <= int(o) <= 255 for o in value.split(".")):
-                    return "ipv4"
                 continue
             return type_name
     return "unknown"

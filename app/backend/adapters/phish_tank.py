@@ -1,15 +1,15 @@
 import asyncio
 import csv
 import io
-import logging
 import time
 
 import httpx
 
 from app.backend.adapters.base import NormalizedResult, RateLimitConfig, SourceAdapter, is_valid_api_key
 from app.backend.config import settings
+from app.backend.logger import get_logger
 
-logger = logging.getLogger("ioc-platform")
+logger = get_logger("adapter.phish_tank")
 
 PHISHTANK_DB_URL = "http://data.phishtank.com/data/online-valid.csv"
 _db_cache: set[str] = set()
@@ -44,8 +44,8 @@ class PhishTankAdapter(SourceAdapter):
                     self._reset_time = int(reset)
                 except ValueError:
                     pass
-        except Exception:
-            pass
+        except Exception as exc:
+            logger.debug("PhishTank rate-limit header parse failed: %s", exc)
 
     async def _ensure_db_cache(self):
         global _db_cache, _db_cache_time
@@ -55,17 +55,24 @@ class PhishTankAdapter(SourceAdapter):
             try:
                 client = self._get_client()
                 resp = await client.get(PHISHTANK_DB_URL, timeout=30)
-                if resp.status_code == 200:
-                    text = resp.text
-                    # CSV format: phish_id,url,phish_detail_url,submission_time,verified,verification_time,online,target
-                    reader = csv.reader(io.StringIO(text))
-                    urls = set()
-                    next(reader, None)
-                    for row in reader:
-                        if len(row) >= 2:
-                            url = row[1].strip().rstrip("/")
-                            if url:
-                                urls.add(url)
+                if resp.status_code != 200:
+                    logger.warning("PhishTank DB download failed with status %d", resp.status_code)
+                    return
+                text = resp.text
+                if not text or not text.strip():
+                    logger.warning("PhishTank DB download returned empty body")
+                    return
+                reader = csv.reader(io.StringIO(text))
+                urls = set()
+                header = next(reader, None)
+                for row in reader:
+                    if len(row) < 2:
+                        continue
+                    url = (row[1] or "").strip().rstrip("/")
+                    if not url or not url.startswith(("http://", "https://")):
+                        continue
+                    urls.add(url)
+                if urls:
                     _db_cache = urls
                     _db_cache_time = time.time()
                     logger.info("PhishTank DB cache loaded with %d URLs", len(urls))
@@ -107,6 +114,11 @@ class PhishTankAdapter(SourceAdapter):
             return NormalizedResult(
                 ioc=ioc_value, ioc_type=ioc_type, source=self.name,
                 verdict="unknown", tags=["rate_limited"],
+            )
+        if resp.status_code == 403:
+            return NormalizedResult(
+                ioc=ioc_value, ioc_type=ioc_type, source=self.name,
+                verdict="error", tags=["invalid_api_key"],
             )
         if resp.status_code != 200:
             return NormalizedResult(

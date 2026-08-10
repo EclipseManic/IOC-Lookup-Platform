@@ -1,7 +1,7 @@
 from datetime import datetime
 from typing import Optional
 
-from sqlalchemy import DateTime, Float, ForeignKey, Integer, String, Text, UniqueConstraint, func
+from sqlalchemy import DateTime, Float, ForeignKey, Index, Integer, String, Text, UniqueConstraint, func
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
 
 
@@ -22,7 +22,7 @@ class IOC(Base):
     updated_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now(), onupdate=func.now())
 
     lookup_results: Mapped[list["LookupResult"]] = relationship("LookupResult", back_populates="ioc", lazy="selectin", cascade="all, delete-orphan")
-    investigation_iocs: Mapped[list["InvestigationIOC"]] = relationship("InvestigationIOC", back_populates="ioc", lazy="selectin")
+    investigation_iocs: Mapped[list["InvestigationIOC"]] = relationship("InvestigationIOC", back_populates="ioc", lazy="selectin", cascade="all, delete-orphan")
 
 
 class Investigation(Base):
@@ -39,10 +39,13 @@ class Investigation(Base):
 
 class InvestigationIOC(Base):
     __tablename__ = "investigation_iocs"
+    __table_args__ = (
+        UniqueConstraint("investigation_id", "ioc_id", name="uq_investigation_ioc"),
+    )
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
-    investigation_id: Mapped[int] = mapped_column(ForeignKey("investigations.id"), nullable=False)
-    ioc_id: Mapped[int] = mapped_column(ForeignKey("iocs.id"), nullable=False)
+    investigation_id: Mapped[int] = mapped_column(ForeignKey("investigations.id"), nullable=False, index=True)
+    ioc_id: Mapped[int] = mapped_column(ForeignKey("iocs.id"), nullable=False, index=True)
     notes: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())
 
@@ -50,11 +53,36 @@ class InvestigationIOC(Base):
     ioc: Mapped["IOC"] = relationship("IOC", back_populates="investigation_iocs")
 
 
-class LookupResult(Base):
-    __tablename__ = "lookup_results"
+class Webhook(Base):
+    __tablename__ = "webhooks"
+
+    id: Mapped[str] = mapped_column(String(32), primary_key=True)
+    url: Mapped[str] = mapped_column(String(2048), nullable=False)
+    events: Mapped[str] = mapped_column(Text, nullable=False)
+    secret: Mapped[Optional[str]] = mapped_column(String(256), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())
+
+
+class IOCFeedback(Base):
+    __tablename__ = "ioc_feedback"
+    __table_args__ = (UniqueConstraint("ioc_value", name="uq_ioc_feedback_value"),)
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
-    ioc_id: Mapped[int] = mapped_column(ForeignKey("iocs.id"), nullable=False)
+    ioc_value: Mapped[str] = mapped_column(String(512), nullable=False, index=True)
+    feedback: Mapped[str] = mapped_column(String(20), nullable=False, default="false_positive")
+    note: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())
+    updated_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now(), onupdate=func.now())
+
+
+class LookupResult(Base):
+    __tablename__ = "lookup_results"
+    __table_args__ = (
+        Index("ix_lookup_results_ioc_task", "ioc_id", "task_id"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    ioc_id: Mapped[int] = mapped_column(ForeignKey("iocs.id"), nullable=False, index=True)
     task_id: Mapped[str] = mapped_column(String(32), nullable=False, index=True)
     composite_score: Mapped[float] = mapped_column(Float, default=0.0)
     composite_verdict: Mapped[str] = mapped_column(String(20), default="unknown")

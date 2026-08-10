@@ -5,7 +5,8 @@ from app.backend.adapters.base import NormalizedResult, RateLimitConfig, SourceA
 
 class URLHausAdapter(SourceAdapter):
     name = "URLhaus"
-    supported_types = ["url", "domain"]
+    supported_types = ["url", "domain", "md5", "sha1", "sha256"]
+    public_without_key = True
     rate_limit = RateLimitConfig(requests_per_minute=60)
 
     async def _query_host(self, ioc_value: str) -> dict:
@@ -67,13 +68,15 @@ class URLHausAdapter(SourceAdapter):
     async def lookup(self, ioc_value: str, ioc_type: str) -> NormalizedResult:
         if ioc_type == "domain":
             data = await self._query_host(ioc_value)
+        elif ioc_type in ("md5", "sha1", "sha256"):
+            data = await self._query_payload(ioc_value)
         else:
             data = await self._query_url(ioc_value)
 
         if not data:
             return NormalizedResult(
                 ioc=ioc_value, ioc_type=ioc_type, source=self.name,
-                verdict="unknown", raw_score=0.0,
+                verdict="unknown", raw_score=0.0, status="not_found",
             )
 
         if data.get("query_status") == "rate_limited":
@@ -103,8 +106,8 @@ class URLHausAdapter(SourceAdapter):
                         tag_urls = tag_data.get("urls", [])
                         if isinstance(tag_urls, list):
                             tags.append(f"tag_urls:{len(tag_urls)}")
-                except Exception:
-                    pass
+                except Exception as exc:
+                    logger.debug("URLhaus tag lookup failed: %s", exc)
 
             url_status = data.get("url_status", "")
             if url_status == "online":
@@ -131,5 +134,5 @@ class URLHausAdapter(SourceAdapter):
 
         return NormalizedResult(
             ioc=ioc_value, ioc_type=ioc_type, source=self.name,
-            verdict="unknown", raw_score=0.0,
+            verdict="unknown", raw_score=0.0, status="not_found",
         )

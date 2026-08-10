@@ -15,6 +15,20 @@ from app.backend.enrichment import (
 )
 
 
+def _mock_shared_client(get=None, post=None, get_side_effect=None, post_side_effect=None):
+    """Build a mock for the shared HTTP client returned by _get_http_client()."""
+    client = AsyncMock()
+    if get_side_effect is not None:
+        client.get = AsyncMock(side_effect=get_side_effect)
+    else:
+        client.get = AsyncMock(return_value=get)
+    if post_side_effect is not None:
+        client.post = AsyncMock(side_effect=post_side_effect)
+    else:
+        client.post = AsyncMock(return_value=post)
+    return client
+
+
 LC_OK = {
     "success": True,
     "found": 3,
@@ -43,10 +57,7 @@ class TestLeakCheckLookup:
 
     @pytest.mark.asyncio
     async def test_success(self):
-        with patch("httpx.AsyncClient") as mc:
-            mc.return_value = mc
-            mc.return_value.__aenter__.return_value = mc
-            mc.get = AsyncMock(return_value=httpx.Response(200, json=LC_OK))
+        with patch("app.backend.enrichment._get_http_client", return_value=_mock_shared_client(get=httpx.Response(200, json=LC_OK))):
             result = await _leakcheck_lookup("a@b.com")
         assert result is not None
         assert result.breach_count == 3
@@ -64,10 +75,7 @@ class TestLeakCheckLookup:
 
     @pytest.mark.asyncio
     async def test_no_breaches(self):
-        with patch("httpx.AsyncClient") as mc:
-            mc.return_value = mc
-            mc.return_value.__aenter__.return_value = mc
-            mc.get = AsyncMock(return_value=httpx.Response(404))
+        with patch("app.backend.enrichment._get_http_client", return_value=_mock_shared_client(get=httpx.Response(404))):
             result = await _leakcheck_lookup("a@b.com")
         assert result is not None
         assert result.breach_count == 0
@@ -76,10 +84,7 @@ class TestLeakCheckLookup:
 
     @pytest.mark.asyncio
     async def test_rate_limited(self):
-        with patch("httpx.AsyncClient") as mc:
-            mc.return_value = mc
-            mc.return_value.__aenter__.return_value = mc
-            mc.get = AsyncMock(return_value=httpx.Response(429))
+        with patch("app.backend.enrichment._get_http_client", return_value=_mock_shared_client(get=httpx.Response(429))):
             result = await _leakcheck_lookup("a@b.com")
         assert result is None
 
@@ -87,10 +92,7 @@ class TestLeakCheckLookup:
 class TestXposedOrNotLookup:
     @pytest.mark.asyncio
     async def test_success(self):
-        with patch("httpx.AsyncClient") as mc:
-            mc.return_value = mc
-            mc.return_value.__aenter__.return_value = mc
-            mc.get = AsyncMock(return_value=httpx.Response(200, json=XON_OK))
+        with patch("app.backend.enrichment._get_http_client", return_value=_mock_shared_client(get=httpx.Response(200, json=XON_OK))):
             result = await _xposedornot_lookup("a@b.com")
         assert result is not None
         assert result.breach_count == 2
@@ -101,24 +103,18 @@ class TestXposedOrNotLookup:
 
     @pytest.mark.asyncio
     async def test_no_breaches(self):
-        with patch("httpx.AsyncClient") as mc:
-            mc.return_value = mc
-            mc.return_value.__aenter__.return_value = mc
-            mc.get = AsyncMock(return_value=httpx.Response(404))
+        with patch("app.backend.enrichment._get_http_client", return_value=_mock_shared_client(get=httpx.Response(404))):
             result = await _xposedornot_lookup("a@b.com")
         assert result is not None
         assert result.breach_count == 0
 
     @pytest.mark.asyncio
     async def test_rate_limited(self):
-        with patch("httpx.AsyncClient") as mc:
-            mc.return_value = mc
-            mc.return_value.__aenter__.return_value = mc
-            mc.get = AsyncMock(side_effect=[
-                httpx.Response(429),
-                httpx.Response(429),
-                httpx.Response(429),
-            ])
+        with patch("app.backend.enrichment._get_http_client", return_value=_mock_shared_client(get_side_effect=[
+            httpx.Response(429),
+            httpx.Response(429),
+            httpx.Response(429),
+        ])):
             result = await _xposedornot_lookup("a@b.com")
         assert result is None
 
@@ -126,10 +122,7 @@ class TestXposedOrNotLookup:
 class TestProxyNovaCombLookup:
     @pytest.mark.asyncio
     async def test_success(self):
-        with patch("httpx.AsyncClient") as mc:
-            mc.return_value = mc
-            mc.return_value.__aenter__.return_value = mc
-            mc.post = AsyncMock(return_value=httpx.Response(200, json=PN_OK))
+        with patch("app.backend.enrichment._get_http_client", return_value=_mock_shared_client(post=httpx.Response(200, json=PN_OK))):
             result = await _proxynova_comb_lookup("a@b.com")
         assert result is not None
         assert result.breach_count == 2
@@ -138,19 +131,13 @@ class TestProxyNovaCombLookup:
 
     @pytest.mark.asyncio
     async def test_timeout(self):
-        with patch("httpx.AsyncClient") as mc:
-            mc.return_value = mc
-            mc.return_value.__aenter__.return_value = mc
-            mc.post = AsyncMock(side_effect=httpx.TimeoutException("timeout"))
+        with patch("app.backend.enrichment._get_http_client", return_value=_mock_shared_client(post_side_effect=httpx.TimeoutException("timeout"))):
             result = await _proxynova_comb_lookup("a@b.com")
         assert result is None
 
     @pytest.mark.asyncio
     async def test_bad_json(self):
-        with patch("httpx.AsyncClient") as mc:
-            mc.return_value = mc
-            mc.return_value.__aenter__.return_value = mc
-            mc.post = AsyncMock(return_value=httpx.Response(200, text="not json"))
+        with patch("app.backend.enrichment._get_http_client", return_value=_mock_shared_client(post=httpx.Response(200, text="not json"))):
             result = await _proxynova_comb_lookup("a@b.com")
         assert result is None
 
@@ -211,7 +198,7 @@ class TestEnrichEmailMerge:
         ):
             result = await _enrich_email_direct("a@b.com")
         assert result.breach is not None
-        assert result.completeness["leakcheck"] == "error"
+        assert result.completeness["leakcheck"] == "not_configured"
         assert result.completeness["xposedornot"] == "ok"
         assert result.breach.breach_count == 3  # A, C + proxynova_comb_1
         assert "BreachA" in result.breach.breach_names
@@ -228,7 +215,7 @@ class TestEnrichEmailMerge:
         assert result.breach is not None
         assert result.breach.breach_count is None
         assert result.breach.source == "none"
-        assert result.completeness["leakcheck"] == "error"
+        assert result.completeness["leakcheck"] == "not_configured"
         assert result.completeness["xposedornot"] == "error"
         assert result.completeness["proxynova_comb"] == "unavailable"
 

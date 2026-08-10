@@ -1,3 +1,5 @@
+from datetime import datetime
+
 import httpx
 
 from app.backend.adapters.base import NormalizedResult, RateLimitConfig, SourceAdapter, is_valid_api_key
@@ -29,7 +31,7 @@ class TriageAdapter(SourceAdapter):
         if resp.status_code == 404:
             return NormalizedResult(
                 ioc=ioc_value, ioc_type=ioc_type, source=self.name,
-                verdict="unknown", raw_score=0.0,
+                verdict="unknown", raw_score=0.0, status="not_found",
             )
         if resp.status_code == 429:
             return NormalizedResult(
@@ -44,6 +46,18 @@ class TriageAdapter(SourceAdapter):
 
         data = resp.json()
         status = data.get("status", "")
+
+        raw_tags = data.get("tags", [])
+        tags = list(raw_tags) if isinstance(raw_tags, list) else []
+        signatures = data.get("signatures", [])
+        if isinstance(signatures, list):
+            tags.extend(f"sig:{s}" for s in signatures if isinstance(s, str))
+
+        mitre = data.get("mitre_attck", [])
+        if isinstance(mitre, list):
+            mitre = [str(m) for m in mitre]
+        else:
+            mitre = []
 
         if status == "complete":
             try:
@@ -61,13 +75,14 @@ class TriageAdapter(SourceAdapter):
                         for mitre_id in overview.get("mitre_attck", []):
                             if isinstance(mitre_id, str) and mitre_id not in mitre:
                                 mitre.append(mitre_id)
-            except Exception:
-                pass
+            except Exception as exc:
+                logger.debug("Triage overview enrichment failed: %s", exc)
 
         if status != "complete":
             return NormalizedResult(
                 ioc=ioc_value, ioc_type=ioc_type, source=self.name,
                 verdict="unknown", raw_score=0.0, tags=[f"status_{status}"],
+                status="not_found",
             )
 
         sample_verdict = data.get("verdict", "unknown")
@@ -89,14 +104,6 @@ class TriageAdapter(SourceAdapter):
             verdict = "unknown"
             confidence = "low"
             raw_score = 0.0
-
-        tags = list(data.get("tags", []))
-        signatures = data.get("signatures", [])
-        tags.extend(f"sig:{s}" for s in signatures if isinstance(s, str))
-
-        mitre = data.get("mitre_attck", [])
-        if isinstance(mitre, list):
-            mitre = [str(m) for m in mitre]
 
         target = data.get("target", {}) or {}
         file_info = target.get("file", {}) or {}
@@ -161,17 +168,16 @@ class TriageAdapter(SourceAdapter):
             tlsh=tlsh or None,
         )
 
-    def _parse_dt(self, val: str) -> str | None:
+    def _parse_dt(self, val: str) -> datetime | None:
         if not val:
             return None
         try:
-            from datetime import datetime
             for fmt in ("%Y-%m-%dT%H:%M:%S", "%Y-%m-%dT%H:%M:%S.%f", "%Y-%m-%d %H:%M:%S"):
                 try:
                     dt = datetime.strptime(val[:19], fmt)
-                    return dt.isoformat()
+                    return dt
                 except ValueError:
                     continue
-            return val[:19]
+            return None
         except Exception:
             return None

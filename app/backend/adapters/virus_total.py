@@ -10,11 +10,14 @@ from app.backend.config import settings
 
 class VirusTotalAdapter(SourceAdapter):
     name = "VirusTotal"
-    supported_types = ["md5", "sha1", "sha256", "ipv4", "domain", "url"]
-    rate_limit = RateLimitConfig(requests_per_minute=30, requests_per_day=500)
+    supported_types = ["md5", "sha1", "sha256", "ipv4", "ipv6", "domain", "url"]
+    rate_limit = RateLimitConfig(requests_per_minute=4, requests_per_day=500)
 
     def __init__(self):
         self.api_key = settings.virustotal_api_key
+        rpm = getattr(settings, "vt_rate_per_minute", None)
+        if rpm and rpm > 0:
+            self.rate_limit = RateLimitConfig(requests_per_minute=rpm, requests_per_day=500)
 
     async def lookup(self, ioc_value: str, ioc_type: str) -> NormalizedResult:
         if not is_valid_api_key(self.api_key):
@@ -45,7 +48,7 @@ class VirusTotalAdapter(SourceAdapter):
         if resp.status_code in (400, 404):
             return NormalizedResult(
                 ioc=ioc_value, ioc_type=ioc_type, source=self.name,
-                verdict="unknown", raw_score=0.0,
+                verdict="unknown", raw_score=0.0, status="not_found",
             )
         if resp.status_code == 429:
             return NormalizedResult(
@@ -67,27 +70,44 @@ class VirusTotalAdapter(SourceAdapter):
         undetected = stats.get("undetected", 0)
         total = malicious + suspicious + harmless + undetected
 
-        if malicious > 0:
+        ratio = malicious / total if total > 0 else 0.0
+        if ratio >= 0.1:
             verdict = "malicious"
-        elif suspicious > 0:
+        elif malicious > 0 or suspicious > 0:
             verdict = "suspicious"
         else:
             verdict = "clean"
 
-        score = malicious / total if total > 0 else 0.0
+        score = ratio
         confidence = "high" if malicious >= 5 else "medium" if malicious > 0 else "low"
+        raw_data = {
+            "detection_ratio": f"{malicious}/{total}",
+            "malicious": malicious,
+            "suspicious": suspicious,
+            "harmless": harmless,
+            "undetected": undetected,
+        }
 
-        threat_label = attrs.get("popular_threat_classification", {}).get("suggested_threat_label", "")
+        threat_classification = attrs.get("popular_threat_classification")
+        if not isinstance(threat_classification, dict):
+            threat_classification = {}
+        threat_label = threat_classification.get("suggested_threat_label", "")
         family = ""
         if threat_label:
             parts = threat_label.split(".")
             family = parts[-1] if len(parts) > 1 else threat_label
 
         tags = attrs.get("tags", [])
-        categories = list(attrs.get("categories", {}).values()) or []
+        categories_data = attrs.get("categories")
+        if not isinstance(categories_data, dict):
+            categories_data = {}
+        categories = list(categories_data.values()) or []
 
         mitre = []
-        for v in attrs.get("sandbox_verdicts", {}).values():
+        sandbox_verdicts = attrs.get("sandbox_verdicts")
+        if not isinstance(sandbox_verdicts, dict):
+            sandbox_verdicts = {}
+        for v in sandbox_verdicts.values():
             if isinstance(v, dict):
                 for m in v.get("mitre_attack_ids", []):
                     if m not in mitre:
@@ -122,22 +142,26 @@ class VirusTotalAdapter(SourceAdapter):
                     tags.append(f"{k}: {v}")
 
         first_sub = attrs.get("first_submission_date")
+        first_seen = None
         if first_sub:
-            ts = first_sub
-            if ts > 1e10:
-                ts = ts / 1000
-            first_seen = datetime.fromtimestamp(ts)
-        else:
-            first_seen = None
+            try:
+                ts = int(first_sub)
+                if ts > 1e10:
+                    ts = ts / 1000
+                first_seen = datetime.fromtimestamp(ts)
+            except (TypeError, ValueError, OSError, OverflowError):
+                first_seen = None
 
         last_sub = attrs.get("last_submission_date")
+        last_seen = None
         if last_sub:
-            ts = last_sub
-            if ts > 1e10:
-                ts = ts / 1000
-            last_seen = datetime.fromtimestamp(ts)
-        else:
-            last_seen = None
+            try:
+                ts = int(last_sub)
+                if ts > 1e10:
+                    ts = ts / 1000
+                last_seen = datetime.fromtimestamp(ts)
+            except (TypeError, ValueError, OSError, OverflowError):
+                last_seen = None
 
         total_votes = attrs.get("total_votes", {})
         if total_votes:
@@ -165,6 +189,7 @@ class VirusTotalAdapter(SourceAdapter):
             first_seen=first_seen,
             last_seen=last_seen,
             samples=samples,
+            raw_data=raw_data,
         )
 
     def _endpoint(self, value: str, ioc_type: str) -> str:
@@ -174,10 +199,17 @@ class VirusTotalAdapter(SourceAdapter):
             "sha1": f"{base}/files/{value}",
             "sha256": f"{base}/files/{value}",
             "ipv4": f"{base}/ip_addresses/{value}",
+            "ipv6": f"{base}/ip_addresses/{value}",
             "domain": f"{base}/domains/{value}",
             "url": f"{base}/urls/{base64.urlsafe_b64encode(hashlib.sha256(value.encode()).digest()).decode().rstrip('=')}",
         }
         return mapping.get(ioc_type, "")
 
     def _url_type(self, ioc_type: str) -> str:
-        return {"md5": "file", "sha1": "file", "sha256": "file"}.get(ioc_type, ioc_type)
+        return {
+            "md5": "file",
+            "sha1": "file",
+            "sha256": "file",
+            "ipv4": "ip-address",
+            "ipv6": "ip-address",
+        }.get(ioc_type, ioc_type)

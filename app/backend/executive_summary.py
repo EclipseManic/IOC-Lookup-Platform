@@ -1,4 +1,11 @@
 from app.backend.adapters.base import LookupResponse
+from app.backend.thresholds import (
+    EPSS_HIGH,
+    MALICIOUS_SOURCE_SCORE,
+    SUMMARY_CAUTION,
+    SUMMARY_NO_THREAT,
+    SUMMARY_SIGNIFICANT,
+)
 
 
 def generate_executive_summary(response: LookupResponse) -> str:
@@ -15,7 +22,7 @@ def generate_executive_summary(response: LookupResponse) -> str:
         f"The indicator {response.normalized} ({response.ioc_type}) received a composite score of {ss_label}, resulting in a verdict of {verdict} with {confidence} confidence."
     )
 
-    malicious = [sw for sw in c.source_breakdown if sw.verdict == "malicious" and sw.score and sw.score >= 0.7]
+    malicious = [sw for sw in c.source_breakdown if sw.verdict == "malicious" and sw.score and sw.score >= MALICIOUS_SOURCE_SCORE]
     suspicious = [sw for sw in c.source_breakdown if sw.verdict == "suspicious"]
     clean = [sw for sw in c.source_breakdown if sw.verdict == "clean"]
 
@@ -38,7 +45,7 @@ def generate_executive_summary(response: LookupResponse) -> str:
         sentences.append(
             "This CVE is listed in the CISA Known Exploited Vulnerabilities catalog, indicating active exploitation in the wild."
         )
-    elif cve_info and cve_info.epss_score and cve_info.epss_score >= 0.5:
+    elif cve_info and cve_info.epss_score and cve_info.epss_score >= EPSS_HIGH:
         sentences.append(
             f"The CVE has a high EPSS exploit probability of {cve_info.epss_score*100:.1f}%, suggesting active exploitation is likely."
         )
@@ -49,11 +56,16 @@ def generate_executive_summary(response: LookupResponse) -> str:
             f"Associated with {breach_info.breach_count} known data {'breaches' if breach_info.breach_count > 1 else 'breach'}, indicating prior compromise exposure."
         )
 
-    if score >= 70 and verdict == "malicious":
+    if not response.results and response.enrichment and response.enrichment.extra:
+        sentences.append(
+            "No reputation provider currently covers this IOC type; the result contains contextual enrichment and should not be interpreted as clean."
+        )
+
+    if score >= SUMMARY_SIGNIFICANT and verdict == "malicious":
         sentences.append("This indicator presents a significant threat and should be blocked or monitored closely.")
-    elif score >= 40 and verdict in ("malicious", "suspicious"):
+    elif score >= SUMMARY_CAUTION and verdict in ("malicious", "suspicious"):
         sentences.append("This indicator warrants further investigation and caution.")
-    elif score < 15 and verdict == "clean":
+    elif score < SUMMARY_NO_THREAT and verdict == "clean":
         sentences.append("No threat indicators were identified for this indicator at this time.")
 
     if len(sentences) > 4:

@@ -1,5 +1,8 @@
 import asyncio
 import base64
+import ipaddress
+import os
+import re
 import socket
 import ssl
 import time
@@ -9,7 +12,9 @@ import httpx
 import mmh3
 
 from app.backend.http_client import get_client as _get_http_client
-from app.backend.logger import logger
+from app.backend.logger import get_logger
+
+logger = get_logger("enrichment")
 from app.backend.adapters.base import (
     BreachInfo,
     CVEInfo,
@@ -30,6 +35,7 @@ from app.backend.adapters.base import (
 async def enrich(value: str, ioc_type: str) -> EnrichmentData:
     dispatch = {
         "ipv4": enrich_ip,
+        "ipv6": enrich_ip,
         "domain": enrich_domain,
         "url": enrich_url,
         "md5": enrich_hash,
@@ -37,29 +43,54 @@ async def enrich(value: str, ioc_type: str) -> EnrichmentData:
         "sha256": enrich_hash,
         "email": enrich_email,
         "cve": enrich_cve,
+        "ssdeep": enrich_ssdeep,
+        "btc": enrich_btc,
+        "mitre_attack": enrich_mitre_attack,
+        "asn": enrich_asn,
+        "mutex": lambda value: enrich_host_artifact(value, "mutex"),
+        "named_pipe": lambda value: enrich_host_artifact(value, "named_pipe"),
+        "registry_key": lambda value: enrich_host_artifact(value, "registry_key"),
+        "service_name": lambda value: enrich_host_artifact(value, "service_name"),
     }
     fn = dispatch.get(ioc_type, enrich_unknown)
     return await fn(value)
 
 
-async def _quick_port_scan(ip: str) -> list[int]:
-    import socket as _socket
-    COMMON_PORTS = [21, 22, 25, 80, 110, 143, 443, 993, 995, 3306, 3389, 5432, 8080, 8443]
-    open_ports = []
-    loop = asyncio.get_event_loop()
-    for port in COMMON_PORTS:
+async def _probe_port(loop, semaphore, ip: str, p: int) -> int | None:
+    def _check(p: int) -> bool:
+        import socket as _socket
+        from contextlib import closing
+
+        with closing(_socket.socket(_socket.AF_INET, _socket.SOCK_STREAM)) as s:
+            s.settimeout(1.5)
+            try:
+                return s.connect_ex((ip, p)) == 0
+            except OSError:
+                return False
+
+    async with semaphore:
         try:
-            def _check(p):
-                s = _socket.socket(_socket.AF_INET, _socket.SOCK_STREAM)
-                s.settimeout(1.5)
-                result = s.connect_ex((ip, p))
-                s.close()
-                return result == 0
-            if await loop.run_in_executor(None, _check, port):
-                open_ports.append(port)
-        except Exception:
-            continue
-    return open_ports
+            ok = await asyncio.wait_for(
+                loop.run_in_executor(None, _check, p), timeout=2.0
+            )
+            return p if ok else None
+        except (asyncio.TimeoutError, OSError):
+            return None
+
+
+async def _quick_port_scan(ip: str) -> list[int]:
+    COMMON_PORTS = [21, 22, 25, 80, 110, 143, 443, 993, 995, 3306, 3389, 5432, 8080, 8443]
+    loop = asyncio.get_running_loop()
+    semaphore = asyncio.Semaphore(4)
+
+    try:
+        async with asyncio.timeout(8):
+            results = await asyncio.gather(
+                *(_probe_port(loop, semaphore, ip, p) for p in COMMON_PORTS)
+            )
+    except asyncio.TimeoutError:
+        return []
+    return [p for p in results if p is not None]
 
 
 async def _passive_dns(domain: str) -> PassiveDNSInfo | None:
@@ -124,7 +155,8 @@ async def enrich_ip(value: str) -> EnrichmentData:
 
     open_ports_result = None
     shodan_key = settings.shodan_api_key
-    if is_valid_api_key(shodan_key):
+    ip_version = ipaddress.ip_address(value).version
+    if is_valid_api_key(shodan_key) and ip_version == 4:
         from app.backend.adapters.shodan import ShodanAdapter
         try:
             shodan = ShodanAdapter()
@@ -136,10 +168,15 @@ async def enrich_ip(value: str) -> EnrichmentData:
                     port_str = port_tag.replace("ports:", "")
                     open_ports_result = [int(p) for p in port_str.split(",") if p.strip().isdigit()]
                     completeness["port_scan"] = "ok"
-        except Exception:
-            pass
+        except Exception as exc:
+            logger.debug("Shodan port scan enrichment failed for %s: %s", value, exc)
     if open_ports_result is None:
-        open_ports_result = await _quick_port_scan(value)
+        if ip_version == 4 and settings.enable_active_port_scan:
+            open_ports_result = await _quick_port_scan(value)
+            completeness["port_scan"] = "ok"
+        else:
+            open_ports_result = []
+            completeness["port_scan"] = "disabled" if not settings.enable_active_port_scan else "not_available"
 
     geoip_val = geoip if not isinstance(geoip, Exception) else None
     rdns_val = rdns if not isinstance(rdns, Exception) else None
@@ -192,6 +229,31 @@ async def enrich_domain(value: str) -> EnrichmentData:
     )
 
 
+async def _is_public_fetch_target(url: str) -> bool:
+    """Reject URL fetches that resolve to non-public addresses.
+
+    This is a defence-in-depth control for the explicitly opt-in URL content
+    fetch feature. Normal operation leaves that feature disabled altogether.
+    """
+    from urllib.parse import urlparse
+
+    parsed = urlparse(url)
+    if parsed.scheme not in {"http", "https"} or not parsed.hostname:
+        return False
+    try:
+        addresses = await asyncio.get_running_loop().run_in_executor(
+            None, lambda: socket.getaddrinfo(parsed.hostname, parsed.port or 443)
+        )
+    except socket.gaierror:
+        return False
+
+    try:
+        resolved = {ipaddress.ip_address(item[4][0]) for item in addresses}
+    except ValueError:
+        return False
+    return bool(resolved) and all(address.is_global for address in resolved)
+
+
 async def _url_redirect_chain(url: str) -> list[dict]:
     import re
     try:
@@ -200,6 +262,9 @@ async def _url_redirect_chain(url: str) -> list[dict]:
         seen = set()
         current = url
         for _ in range(6):
+            if not await _is_public_fetch_target(current):
+                logger.warning("Blocked unsafe URL enrichment target: %s", current)
+                break
             seen.add(current)
             r = await client.get(current, follow_redirects=False, timeout=10)
             status = r.status_code
@@ -220,6 +285,9 @@ async def _url_redirect_chain(url: str) -> list[dict]:
 async def _url_content_preview(url: str) -> dict:
     import re
     try:
+        if not await _is_public_fetch_target(url):
+            logger.warning("Blocked unsafe URL enrichment target: %s", url)
+            return {}
         client = _get_http_client()
         r = await client.get(url, timeout=10, follow_redirects=True)
         if r.status_code != 200:
@@ -254,6 +322,20 @@ async def enrich_url(value: str) -> EnrichmentData:
     result.completeness["domain_extraction"] = "ok" if domain != value else "error"
     result.relationships = [{"source_ioc": value, "target_ioc": domain, "relationship": "extracted_host", "via_source": "url_parse"}]
 
+    from app.backend.config import settings
+
+    # Fetching an analyst-supplied URL makes the IOC workstation an SSRF
+    # primitive. Keep that active behavior opt-in; reputation adapters and
+    # passive domain enrichment remain available by default.
+    if not settings.enable_url_content_fetch:
+        result.completeness["redirect_chain"] = "disabled"
+        result.completeness["url_preview"] = "disabled"
+        result.analysis_notes.append(
+            "Active URL retrieval is disabled to protect the analyst workstation. "
+            "Enable ENABLE_URL_CONTENT_FETCH only in an isolated environment."
+        )
+        return result
+
     redirect_chain, url_preview = await asyncio.gather(
         _url_redirect_chain(value),
         _url_content_preview(value),
@@ -269,12 +351,31 @@ async def enrich_url(value: str) -> EnrichmentData:
 async def enrich_hash(value: str) -> EnrichmentData:
     completeness: dict[str, str] = {}
     results = []
+    from app.backend.config import settings
+
+    if not settings.hashlookup_enabled:
+        completeness["hash_lookup"] = "not_applicable"
+        return EnrichmentData(completeness=completeness, extra={"hash_results": results})
     c = _get_http_client()
     try:
-        r = await c.get(f"https://hashlookup-oblivious.circl.lu/lookup/{value}")
+        hash_type = {32: "md5", 40: "sha1", 64: "sha256"}.get(len(value), "sha256")
+        r = await c.get(f"https://hashlookup.circl.lu/lookup/{hash_type}/{value}")
         if r.status_code == 200:
             data = r.json()
-            results.append(data.get("message", ""))
+            if isinstance(data, dict):
+                results.append({
+                    "filename": data.get("FileName", ""),
+                    "size": data.get("FileSize", ""),
+                    "mime": data.get("mimetype", ""),
+                    "source": data.get("source", ""),
+                    "database": data.get("db", ""),
+                    "trust": data.get("hashlookup:trust"),
+                    "md5": data.get("MD5", ""),
+                    "sha1": data.get("SHA-1", ""),
+                    "sha256": data.get("SHA-256", ""),
+                    "ssdeep": data.get("SSDEEP", ""),
+                    "tlsh": data.get("TLSH", ""),
+                })
             completeness["hash_lookup"] = "ok"
         else:
             completeness["hash_lookup"] = "not_found"
@@ -325,11 +426,8 @@ async def enrich_email(value: str) -> EnrichmentData:
 
     completeness["domain_extraction"] = "ok" if domain != value else "error"
 
-    for key, src_val in [("leakcheck", leakcheck), ("xposedornot", xposed)]:
-        if isinstance(src_val, Exception) or src_val is None:
-            completeness[key] = "error"
-        else:
-            completeness[key] = "ok"
+    completeness["leakcheck"] = "ok" if not isinstance(leakcheck, Exception) and leakcheck is not None else "not_configured"
+    completeness["xposedornot"] = "ok" if not isinstance(xposed, Exception) and xposed is not None else "error"
 
     if isinstance(proxynova, Exception) or proxynova is None:
         completeness["proxynova_comb"] = "unavailable"
@@ -337,7 +435,9 @@ async def enrich_email(value: str) -> EnrichmentData:
         completeness["proxynova_comb"] = "ok"
 
     completeness["email_security"] = "ok" if not isinstance(email_sec, Exception) and email_sec is not None else "error"
-    completeness["dnsbl"] = "ok" if not isinstance(dnsbl, Exception) and dnsbl else "error"
+    # An empty DNSBL result is a successful negative lookup, not a provider
+    # outage.  The UI must not present it as an error.
+    completeness["dnsbl"] = "ok" if isinstance(dnsbl, list) and dnsbl else "not_found"
 
     # Merge breach results
     all_sources = [leakcheck, xposed, proxynova]
@@ -479,6 +579,166 @@ async def enrich_cve(value: str) -> EnrichmentData:
     )
 
 
+async def enrich_ssdeep(value: str) -> EnrichmentData:
+    """Parse fuzzy-hash structure; threat matching requires a corpus/search API."""
+    parts = value.split(":", 2)
+    block_size = int(parts[0]) if parts and parts[0].isdigit() else None
+    first_chunk = parts[1] if len(parts) > 1 else ""
+    second_chunk = parts[2] if len(parts) > 2 else ""
+    return EnrichmentData(
+        completeness={"structural_analysis": "ok", "fuzzy_match_corpus": "unavailable"},
+        extra={
+            "ssdeep": {
+                "block_size": block_size,
+                "first_chunk_length": len(first_chunk),
+                "second_chunk_length": len(second_chunk),
+                "alphabet": "".join(sorted(set(first_chunk + second_chunk))),
+            }
+        },
+    )
+
+
+async def enrich_btc(value: str) -> EnrichmentData:
+    """Fetch public Bitcoin address statistics from blockchain.info."""
+    try:
+        client = _get_http_client()
+        response = await client.get(
+            f"https://blockchain.info/rawaddr/{value}",
+            params={"limit": 5},
+            timeout=15,
+        )
+        if response.status_code == 404:
+            return EnrichmentData(completeness={"blockchain_address": "not_found"})
+        if response.status_code != 200:
+            return EnrichmentData(completeness={"blockchain_address": f"http_{response.status_code}"})
+        data = response.json()
+        transactions = data.get("txs", []) if isinstance(data, dict) else []
+        return EnrichmentData(
+            completeness={"blockchain_address": "ok"},
+            extra={
+                "bitcoin": {
+                    "address": value,
+                    "hash160": data.get("hash160", ""),
+                    "n_tx": data.get("n_tx", 0),
+                    "total_received_btc": (data.get("total_received", 0) or 0) / 100_000_000,
+                    "total_sent_btc": (data.get("total_sent", 0) or 0) / 100_000_000,
+                    "final_balance_btc": (data.get("final_balance", 0) or 0) / 100_000_000,
+                    "recent_transactions": [
+                        {
+                            "hash": tx.get("hash", ""),
+                            "time": tx.get("time"),
+                            "result_btc": (tx.get("result", 0) or 0) / 100_000_000,
+                        }
+                        for tx in transactions[:5]
+                        if isinstance(tx, dict)
+                    ],
+                }
+            },
+        )
+    except Exception as exc:
+        logger.debug("Bitcoin enrichment failed for %s: %s", value, exc)
+        return EnrichmentData(completeness={"blockchain_address": "error"})
+
+
+async def enrich_asn(value: str) -> EnrichmentData:
+    """Enrich an ASN with holder and announced-prefix data from RIPEstat."""
+    try:
+        client = _get_http_client()
+        overview, prefixes = await asyncio.gather(
+            client.get(
+                "https://stat.ripe.net/data/as-overview/data.json",
+                params={"resource": value}, timeout=15,
+            ),
+            client.get(
+                "https://stat.ripe.net/data/announced-prefixes/data.json",
+                params={"resource": value}, timeout=15,
+            ),
+            return_exceptions=True,
+        )
+        data = overview.json() if not isinstance(overview, Exception) and overview.status_code == 200 else {}
+        prefix_data = prefixes.json() if not isinstance(prefixes, Exception) and prefixes.status_code == 200 else {}
+        overview_data = data.get("data", {}) if isinstance(data, dict) else {}
+        announced = prefix_data.get("data", {}).get("prefixes", []) if isinstance(prefix_data, dict) else []
+        announced = [p for p in announced if isinstance(p, dict)][:100]
+        if not overview_data and not announced:
+            return EnrichmentData(completeness={"ripestat": "not_found"})
+        return EnrichmentData(
+            completeness={"ripestat": "ok"},
+            extra={"asn": {
+                "resource": value,
+                "holder": overview_data.get("holder", ""),
+                "announced_prefix_count": len(announced),
+                "announced_prefixes": announced,
+                "block": overview_data.get("block", {}),
+            }},
+        )
+    except Exception as exc:
+        logger.debug("ASN enrichment failed for %s: %s", value, exc)
+        return EnrichmentData(completeness={"ripestat": "error"})
+
+
+async def enrich_mitre_attack(value: str) -> EnrichmentData:
+    """Fetch the public ATT&CK page metadata for a tactic or technique ID."""
+    try:
+        is_tactic = value.upper().startswith("TA")
+        path = "tactics" if is_tactic else "techniques"
+        client = _get_http_client()
+        response = await client.get(f"https://attack.mitre.org/{path}/{value.upper()}/", timeout=15)
+        if response.status_code != 200:
+            return EnrichmentData(completeness={"mitre_attack": f"http_{response.status_code}"})
+        html = response.text
+        title_match = re.search(r"<title[^>]*>(.*?)</title>", html, re.IGNORECASE | re.DOTALL)
+        desc_match = re.search(
+            r'<meta[^>]+name=["\']description["\'][^>]+content=["\']([^"\']+)',
+            html, re.IGNORECASE,
+        )
+        title = re.sub(r"\s+", " ", title_match.group(1)).strip() if title_match else value
+        description = re.sub(r"\s+", " ", desc_match.group(1)).strip() if desc_match else ""
+        return EnrichmentData(
+            completeness={"mitre_attack": "ok"},
+            extra={"mitre_attack": {
+                "id": value.upper(),
+                "kind": "tactic" if is_tactic else "technique",
+                "title": title,
+                "description": description,
+                "url": f"https://attack.mitre.org/{path}/{value.upper()}/",
+            }},
+        )
+    except Exception as exc:
+        logger.debug("MITRE enrichment failed for %s: %s", value, exc)
+        return EnrichmentData(completeness={"mitre_attack": "error"})
+
+
+async def enrich_host_artifact(value: str, ioc_type: str = "") -> EnrichmentData:
+    """Return useful structural context for host artifacts without a sandbox corpus."""
+    artifact_type = ioc_type
+    if not artifact_type:
+        if value.lower().startswith("\\\\") and "\\pipe\\" in value.lower():
+            artifact_type = "named_pipe"
+        elif "\\" in value and re.match(r"^[A-Za-z_][A-Za-z0-9_]*\\", value):
+            artifact_type = "registry_key"
+        else:
+            artifact_type = "mutex"
+
+    details: dict[str, object] = {"value": value, "type": artifact_type}
+    if artifact_type == "named_pipe":
+        match = re.match(r"^\\\\([^\\]+)\\pipe\\(.+)$", value, re.IGNORECASE)
+        if match:
+            details.update({"server": match.group(1), "pipe_name": match.group(2)})
+    elif artifact_type == "registry_key":
+        hive, _, key = value.partition("\\")
+        details.update({"hive": hive, "key_path": key, "depth": len([p for p in key.split("\\") if p])})
+    elif artifact_type == "mutex":
+        details.update({"namespace": value.split("\\", 1)[0] if "\\" in value else "global", "name": value.rsplit("\\", 1)[-1]})
+    else:
+        details["name"] = value
+
+    return EnrichmentData(
+        completeness={"structural_analysis": "ok", "threat_corpus": "unavailable"},
+        extra={"host_artifact": details},
+    )
+
+
 async def enrich_unknown(value: str) -> EnrichmentData:
     return EnrichmentData(completeness={"enrichment": "skipped"})
 
@@ -541,8 +801,8 @@ async def _get_rdap_url(domain: str) -> str | None:
                         if isinstance(urls, list) and urls:
                             base = urls[0].rstrip("/")
                             return f"{base}/domain/{domain}"
-    except Exception:
-        pass
+    except Exception as exc:
+        logger.debug("RDAP bootstrap lookup failed for %s: %s", domain, exc)
     fallbacks = {
         "com": "https://rdap.verisign.com/com/v1/domain",
         "net": "https://rdap.verisign.com/net/v1/domain",
@@ -558,23 +818,45 @@ async def _get_rdap_url(domain: str) -> str | None:
     return None
 
 
+def _rdap_registrar(data: dict) -> str:
+    """Extract the registrar name from RDAP entities (role 'registrar' vCard fn)."""
+    try:
+        for ent in data.get("entities") or []:
+            roles = ent.get("roles") or []
+            if "registrar" not in roles:
+                continue
+            vcard = ent.get("vcardArray")
+            if isinstance(vcard, list) and len(vcard) >= 2:
+                for field in vcard[1] or []:
+                    if isinstance(field, list) and len(field) >= 4 and field[0] == "fn":
+                        return str(field[3]).strip()[:100]
+    except Exception:
+        pass
+    return ""
+
+
 async def _rdap_lookup(target: str) -> WhoisInfo | None:
     try:
         if _is_ip(target):
             url = f"https://rdap.arin.net/registry/ip/{target}"
         else:
-            url = await _get_rdap_url(target) or f"https://rdap.verisign.com/com/v1/domain/{target}"
+            url = await _get_rdap_url(target)
+        if not url:
+            return await _whois_fallback(target)
         c = _get_http_client()
         r = await c.get(url, timeout=8)
         if r.status_code != 200:
             return await _whois_fallback(target)
         d = r.json()
-        abuse = _extract_abuse_email(d)
+        port43 = d.get("port43") or ""
+        registrar = _rdap_registrar(d)
+        if not registrar and port43:
+            return await _whois_fallback(target, server=port43)
         return WhoisInfo(
-            registrar=d.get("port43") or "",
+            registrar=registrar,
             creation_date=_rdap_date(d, "registrationDate") or "",
             expiration_date=_rdap_date(d, "expirationDate") or "",
-            abuse_email=abuse,
+            abuse_email=_extract_abuse_email(d),
             org=d.get("name", d.get("handle", "")),
         )
     except Exception:
@@ -614,10 +896,11 @@ async def _whois_tld_servers() -> dict[str, str]:
     return _WHOIS_SERVERS
 
 
-async def _whois_raw_query(domain: str) -> str | None:
+async def _whois_raw_query(domain: str, server: str | None = None) -> str | None:
     tld = domain.rsplit(".", 1)[-1].lower()
-    servers = await _whois_tld_servers()
-    server = servers.get(tld)
+    if not server:
+        servers = await _whois_tld_servers()
+        server = servers.get(tld)
     if not server:
         return None
     try:
@@ -628,6 +911,7 @@ async def _whois_raw_query(domain: str) -> str | None:
         await writer.drain()
         data = await asyncio.wait_for(reader.read(-1), timeout=10)
         writer.close()
+        await writer.wait_closed()
         return data.decode("utf-8", errors="replace")
     except Exception:
         return None
@@ -656,15 +940,48 @@ async def _parse_whois_text(text: str) -> WhoisInfo | None:
     return None
 
 
-async def _whois_fallback(target: str) -> WhoisInfo | None:
+async def _whois_discover_server(tld: str) -> str | None:
+    try:
+        reader, writer = await asyncio.wait_for(
+            asyncio.open_connection("whois.iana.org", 43), timeout=5
+        )
+        writer.write(f"{tld}\r\n".encode())
+        await writer.drain()
+        data = await asyncio.wait_for(reader.read(-1), timeout=10)
+        writer.close()
+        await writer.wait_closed()
+        for line in data.decode("utf-8", errors="replace").splitlines():
+            low = line.lower().strip()
+            if low.startswith("whois:"):
+                server = line.split(":", 1)[1].strip()
+                if server:
+                    return server
+    except Exception:
+        return None
+    return None
+
+
+async def _whois_fallback(target: str, server: str | None = None) -> WhoisInfo | None:
     import re
     if not re.match(r'^[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}$', target):
         return None
-    raw = await _whois_raw_query(target)
+    raw = await _whois_raw_query(target, server=server)
     if raw:
         parsed = await _parse_whois_text(raw)
         if parsed:
             return parsed
+    if server:
+        return None
+    tld = target.rsplit(".", 1)[-1].lower()
+    discovered = await _whois_discover_server(tld)
+    if discovered:
+        raw = await _whois_raw_query(target, server=discovered)
+        if raw:
+            parsed = await _parse_whois_text(raw)
+            if parsed:
+                return parsed
+    if os.name == "nt":
+        return None
     try:
         proc = await asyncio.create_subprocess_exec(
             "whois", target,
@@ -682,27 +999,66 @@ async def _dns_lookup(domain: str) -> DNSInfo | None:
         result = DNSInfo()
         loop = asyncio.get_event_loop()
 
-        try:
-            info = await loop.run_in_executor(None, socket.getaddrinfo, domain, 80)
-            for entry in info:
-                addr = entry[4][0]
-                if entry[0] == socket.AF_INET and addr not in result.a:
-                    result.a.append(addr)
-                elif entry[0] == socket.AF_INET6 and addr not in result.aaaa:
-                    result.aaaa.append(addr)
-        except Exception:
-            pass
+        async def doh(record_type: str) -> list[str]:
+            client = _get_http_client()
+            response = await client.get(
+                "https://cloudflare-dns.com/dns-query",
+                params={"name": domain, "type": record_type},
+                headers={"Accept": "application/dns-json"},
+                timeout=10,
+            )
+            if response.status_code != 200:
+                return []
+            answers = response.json().get("Answer", [])
+            values = []
+            for answer in answers:
+                if not isinstance(answer, dict):
+                    continue
+                value = str(answer.get("data", "")).strip().strip('"')
+                if record_type == "MX":
+                    value = value.split(maxsplit=1)[-1] if value else ""
+                if value:
+                    values.append(value.rstrip("."))
+            return list(dict.fromkeys(values))
 
-        try:
-            hostname, aliases, _ = await loop.run_in_executor(None, socket.gethostbyname_ex, domain)
-            if aliases:
-                result.cname = [a for a in aliases if a.lower() != domain.lower()]
-        except Exception:
-            pass
+        records = await asyncio.gather(
+            *(doh(record_type) for record_type in ("A", "AAAA", "MX", "NS", "TXT", "CNAME")),
+            return_exceptions=True,
+        )
+        for record_type, values in zip(("a", "aaaa", "mx", "ns", "txt", "cname"), records):
+            if isinstance(values, list):
+                setattr(result, record_type, values)
+
+        if not result.a and not result.aaaa:
+            try:
+                info = await loop.run_in_executor(None, socket.getaddrinfo, domain, 80)
+                for entry in info:
+                    addr = entry[4][0]
+                    if entry[0] == socket.AF_INET and addr not in result.a:
+                        result.a.append(addr)
+                    elif entry[0] == socket.AF_INET6 and addr not in result.aaaa:
+                        result.aaaa.append(addr)
+            except Exception:
+                pass
+
+        if not result.cname:
+            try:
+                hostname, aliases, _ = await loop.run_in_executor(None, socket.gethostbyname_ex, domain)
+                if aliases:
+                    result.cname = [a for a in aliases if a.lower() != domain.lower()]
+            except Exception:
+                pass
 
         return result
     except Exception:
         return None
+
+
+def _san_is_wildcard(san: str) -> bool:
+    value = str(san)
+    if value.lower().startswith("dns:"):
+        value = value[4:]
+    return value.startswith("*.")
 
 
 async def _ssl_cert(hostname: str) -> SSLInfo | None:
@@ -748,7 +1104,7 @@ async def _ssl_cert(hostname: str) -> SSLInfo | None:
 
                     common_name = subject.get("commonName", "")
                     is_wildcard = str(common_name).startswith("*.") or any(
-                        str(san).startswith("*.") for san in sans
+                        _san_is_wildcard(san) for san in sans
                     )
                     issuer_cn = str(issuer.get("commonName", ""))
                     is_self_signed = str(subject.get("commonName", "")) == issuer_cn
@@ -838,22 +1194,66 @@ async def _crt_sh_subdomains(domain: str) -> SubdomainInfo | None:
 
 _cisa_cache: dict | None = None
 _cisa_cache_time: float = 0
+_CISA_TTL: float = 3600
+_cisa_lock: asyncio.Lock | None = None
+_cisa_refresh_task: asyncio.Task | None = None
+
+
+async def _fetch_cisa_feed() -> dict | None:
+    c = _get_http_client()
+    r = await c.get("https://www.cisa.gov/sites/default/files/feeds/known_exploited_vulnerabilities.json")
+    if r.status_code == 200:
+        return r.json()
+    return None
+
+
+async def _refresh_cisa_cache(force: bool = False) -> None:
+    global _cisa_cache, _cisa_cache_time
+    if not force and _cisa_cache is not None and time.time() - _cisa_cache_time < _CISA_TTL:
+        return
+    data = await _fetch_cisa_feed()
+    if data:
+        _cisa_cache = data
+        _cisa_cache_time = time.time()
+
+
+async def start_cisa_background_refresh() -> None:
+    global _cisa_lock, _cisa_refresh_task
+    if _cisa_lock is None:
+        _cisa_lock = asyncio.Lock()
+    if _cisa_refresh_task is None or _cisa_refresh_task.done():
+        async def _loop():
+            while True:
+                async with _cisa_lock:
+                    await _refresh_cisa_cache(force=True)
+                await asyncio.sleep(_CISA_TTL)
+        _cisa_refresh_task = asyncio.create_task(_loop())
+
+
+async def stop_cisa_background_refresh() -> None:
+    global _cisa_refresh_task
+    task = _cisa_refresh_task
+    _cisa_refresh_task = None
+    if task is not None and not task.done():
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
 
 
 async def _cisa_kev(cve_id: str) -> tuple[bool, str]:
-    global _cisa_cache, _cisa_cache_time
+    global _cisa_lock
     try:
-        if _cisa_cache is None or time.time() - _cisa_cache_time > 86400:
-            c = _get_http_client()
-            r = await c.get("https://www.cisa.gov/sites/default/files/feeds/known_exploited_vulnerabilities.json")
-            if r.status_code == 200:
-                _cisa_cache = r.json()
-                _cisa_cache_time = time.time()
-        if _cisa_cache and "vulnerabilities" in _cisa_cache:
-            for vuln in _cisa_cache["vulnerabilities"]:
-                if isinstance(vuln, dict) and vuln.get("cveID", "").upper() == cve_id.upper():
-                    return True, vuln.get("dateAdded", "")
-        return False, ""
+        if _cisa_lock is None:
+            _cisa_lock = asyncio.Lock()
+        async with _cisa_lock:
+            await _refresh_cisa_cache()
+            if _cisa_cache and "vulnerabilities" in _cisa_cache:
+                for vuln in _cisa_cache["vulnerabilities"]:
+                    if isinstance(vuln, dict) and vuln.get("cveID", "").upper() == cve_id.upper():
+                        return True, vuln.get("dateAdded", "")
+            return False, ""
     except Exception:
         return False, ""
 
@@ -1023,6 +1423,16 @@ async def _xposedornot_lookup(email: str) -> BreachInfo | None:
                 all_dates: list[str] = []
                 all_exposed: list[str] = []
                 for b in breaches:
+                    # XposedOrNot has returned both object records and a
+                    # compact nested list of breach names over time.
+                    if isinstance(b, list):
+                        names.extend(str(name) for name in b if name)
+                        continue
+                    if isinstance(b, str):
+                        names.append(b)
+                        continue
+                    if not isinstance(b, dict):
+                        continue
                     name = b.get("name", "")
                     if name:
                         names.append(name)

@@ -6,23 +6,22 @@ import webbrowser
 
 import uvicorn
 
+from app.backend.config import settings
+
 
 def main() -> None:
     os.chdir(os.path.dirname(os.path.abspath(__file__)))
 
-    port = int(os.getenv("PORT", "8000"))
-    host = os.getenv("HOST", "0.0.0.0")
-    debug = os.getenv("DEBUG", "").lower() == "true"
-    url = f"http://localhost:{port}/"
+    url = f"http://localhost:{settings.port}/"
 
-    if os.getenv("DISABLE_AUTO_OPEN") != "1":
+    if not settings.disable_auto_open:
         threading.Timer(1.5, lambda: webbrowser.open(url)).start()
 
     print(f"IOC Lookup Platform running at {url}")
     print("Press Ctrl+C to stop")
 
     try:
-        uvicorn.run("app.backend.main:app", host=host, port=port, reload=debug)
+        uvicorn.run("app.backend.main:app", host=settings.host, port=settings.port, reload=settings.debug)
     except (KeyboardInterrupt, SystemExit, asyncio.CancelledError):
         pass
 

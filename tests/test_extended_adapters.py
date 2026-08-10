@@ -170,6 +170,29 @@ class TestGreyNoiseAdapter:
         assert r.verdict == "unknown"
         assert "rate_limited" in r.tags
 
+    @pytest.mark.asyncio
+    async def test_api_key_bypasses_anonymous_weekly_counter(self):
+        original_used = GreyNoiseAdapter._weekly_requests_used
+        original_reset = GreyNoiseAdapter._quota_reset_time
+        original_remaining = GreyNoiseAdapter._quota_remaining
+        try:
+            GreyNoiseAdapter._weekly_requests_used = GreyNoiseAdapter.WEEKLY_LIMIT
+            GreyNoiseAdapter._quota_reset_time = time.time() + 3600
+            GreyNoiseAdapter._quota_remaining = None
+
+            a = GreyNoiseAdapter()
+            a.api_key = "valid_key"
+            mock_class, _ = _mock_async_client(json_data={"classification": "riot"})
+            with patch("httpx.AsyncClient", mock_class):
+                r = await a.lookup("8.8.8.8", "ipv4")
+
+            assert r.verdict == "clean"
+            assert "weekly_quota_exhausted" not in r.tags
+        finally:
+            GreyNoiseAdapter._weekly_requests_used = original_used
+            GreyNoiseAdapter._quota_reset_time = original_reset
+            GreyNoiseAdapter._quota_remaining = original_remaining
+
 
 # ============================================================
 # AlienVault OTX
@@ -178,7 +201,7 @@ class TestGreyNoiseAdapter:
 class TestAlienVaultOTXAdapter:
     def test_supported_types(self):
         a = AlienVaultOTXAdapter()
-        for t in ("ipv4", "domain", "url", "md5", "sha1", "sha256"):
+        for t in ("ipv4", "ipv6", "domain", "url", "md5", "sha1", "sha256"):
             assert t in a.supported_types
 
     @pytest.mark.asyncio
@@ -208,6 +231,20 @@ class TestAlienVaultOTXAdapter:
             r = await a.lookup("8.8.8.8", "ipv4")
         assert r.verdict == "unknown"
         assert r.raw_score == 0.0
+
+    @pytest.mark.asyncio
+    async def test_timeout_returns_normalized_error(self):
+        a = AlienVaultOTXAdapter()
+        a.api_key = "valid"
+
+        class TimeoutClient:
+            async def get(self, *args, **kwargs):
+                raise httpx.ReadTimeout("")
+
+        a.set_client(TimeoutClient())
+        result = await a.lookup("8.8.8.8", "ipv4")
+        assert result.status == "error"
+        assert "timeout" in result.tags
 
     @pytest.mark.asyncio
     async def test_malicious_response(self):
@@ -479,7 +516,7 @@ class TestOpenPhishAdapter:
 
     @pytest.mark.asyncio
     async def test_clean_response(self):
-        """URL NOT present in the downloaded feed → clean."""
+        """URL NOT present in the downloaded feed → unknown / low (not in feed)."""
         _openphish_mod._feed = []
         _openphish_mod._feed_updated = 0.0
 
@@ -490,9 +527,9 @@ class TestOpenPhishAdapter:
         a = OpenPhishAdapter()
         with patch("httpx.AsyncClient", mock_class):
             r = await a.lookup("https://safe.example.com", "url")
-        assert r.verdict == "clean"
+        assert r.verdict == "unknown"
         assert r.raw_score == 0.0
-        assert r.confidence == "medium"
+        assert r.confidence == "low"
         assert "not_in_feed" in r.tags
 
     @pytest.mark.asyncio
@@ -698,7 +735,7 @@ class TestSpurUsAdapter:
 
     @pytest.mark.asyncio
     async def test_normal_response(self):
-        """Returns usage_type and risk_score as tags."""
+        """Returns usage_type and risk_score as tags + normalized raw_score."""
         data = {"usage_type": "hosting", "risk_score": 85}
         a = SpurUsAdapter()
         a.api_key = "valid"
@@ -706,7 +743,7 @@ class TestSpurUsAdapter:
         with patch("httpx.AsyncClient", mock_class):
             r = await a.lookup("1.2.3.4", "ipv4")
         assert r.verdict == "unknown"
-        assert r.raw_score is None
+        assert r.raw_score == 0.85
         assert "usage:hosting" in r.tags
         assert "risk:85" in r.tags
 
@@ -814,8 +851,7 @@ class TestCensysAdapter:
     async def test_no_key(self):
         """Both API ID and secret required."""
         a = CensysAdapter()
-        a.api_id = ""
-        a.api_secret = ""
+        a.api_key = ""
         a._has_credentials = False
         r = await a.lookup("8.8.8.8", "ipv4")
         assert r.verdict == "unknown"
@@ -825,8 +861,7 @@ class TestCensysAdapter:
     async def test_no_key_partial(self):
         """Only one of API ID/secret → no_api_key_configured."""
         a = CensysAdapter()
-        a.api_id = "valid_id"
-        a.api_secret = ""
+        a.api_key = "valid_id:"
         a._has_credentials = False
         r = await a.lookup("8.8.8.8", "ipv4")
         assert r.verdict == "unknown"
@@ -835,8 +870,8 @@ class TestCensysAdapter:
     @pytest.mark.asyncio
     async def test_401_unauthorized(self):
         a = CensysAdapter()
-        a.api_id = "invalid_key"
-        a.api_secret = "invalid_secret"
+        a.api_key = "invalid_key:invalid_secret"
+        a._has_credentials = True
         mock_class, _ = _mock_async_client(status_code=401)
         with patch("httpx.AsyncClient", mock_class):
             r = await a.lookup("8.8.8.8", "ipv4")
@@ -846,8 +881,8 @@ class TestCensysAdapter:
     @pytest.mark.asyncio
     async def test_404_not_found(self):
         a = CensysAdapter()
-        a.api_id = "valid_key"
-        a.api_secret = "valid_sec"
+        a.api_key = "valid_key:valid_sec"
+        a._has_credentials = True
         mock_class, _ = _mock_async_client(status_code=404)
         with patch("httpx.AsyncClient", mock_class):
             r = await a.lookup("10.0.0.1", "ipv4")
@@ -871,8 +906,8 @@ class TestCensysAdapter:
             }
         }
         a = CensysAdapter()
-        a.api_id = "valid_key"
-        a.api_secret = "valid_sec"
+        a.api_key = "valid_key:valid_sec"
+        a._has_credentials = True
         mock_class, _ = _mock_async_client(json_data=data)
         with patch("httpx.AsyncClient", mock_class):
             r = await a.lookup("1.2.3.4", "ipv4")
@@ -886,8 +921,8 @@ class TestCensysAdapter:
         """No services in response → minimal tags."""
         data = {"result": {"services": []}}
         a = CensysAdapter()
-        a.api_id = "valid_key"
-        a.api_secret = "valid_sec"
+        a.api_key = "valid_key:valid_sec"
+        a._has_credentials = True
         mock_class, _ = _mock_async_client(json_data=data)
         with patch("httpx.AsyncClient", mock_class):
             r = await a.lookup("1.2.3.4", "ipv4")
@@ -902,7 +937,7 @@ class TestCensysAdapter:
 class TestIPinfoAdapter:
     def test_supported_types(self):
         a = IPinfoAdapter()
-        assert a.supported_types == ["ipv4"]
+        assert a.supported_types == ["ipv4", "ipv6"]
 
     @pytest.mark.asyncio
     async def test_no_key(self):
@@ -968,16 +1003,16 @@ class TestExtendedAdapterConsistency:
 
     ADAPTERS = [
         ("GreyNoise", GreyNoiseAdapter, ["ipv4"]),
-        ("AlienVault OTX", AlienVaultOTXAdapter, ["ipv4", "domain", "url", "md5", "sha1", "sha256"]),
+        ("AlienVault OTX", AlienVaultOTXAdapter, ["ipv4", "ipv6", "domain", "url", "md5", "sha1", "sha256"]),
         ("Shodan", ShodanAdapter, ["ipv4"]),
         ("SecurityTrails", SecurityTrailsAdapter, ["domain", "ipv4"]),
         ("OpenPhish", OpenPhishAdapter, ["url"]),
         ("PhishTank", PhishTankAdapter, ["url"]),
-        ("URLhaus", URLHausAdapter, ["url", "domain"]),
+        ("URLhaus", URLHausAdapter, ["url", "domain", "md5", "sha1", "sha256"]),
         ("Spur.us", SpurUsAdapter, ["ipv4"]),
         ("Tor Exit", TorExitAdapter, ["ipv4"]),
         ("Censys", CensysAdapter, ["ipv4"]),
-        ("IPinfo", IPinfoAdapter, ["ipv4"]),
+        ("IPinfo", IPinfoAdapter, ["ipv4", "ipv6"]),
     ]
 
     def test_all_have_name(self):
@@ -1019,7 +1054,7 @@ class TestExtendedAdapterConsistency:
             except Exception:
                 pass
             # Set required attributes to avoid AttributeError
-            for attr, val in [("api_key", "test"), ("api_id", "test"), ("api_secret", "test")]:
+            for attr, val in [("api_key", "test")]:
                 if not hasattr(a, attr):
                     setattr(a, attr, val)
             # Ensure supported_types is set

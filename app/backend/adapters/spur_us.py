@@ -86,12 +86,15 @@ class SpurUsAdapter(SourceAdapter):
 
         verdict = "unknown"
         raw_score = None
+        risk_score = data.get("risk_score")
+        if isinstance(risk_score, (int, float)):
+            raw_score = max(0.0, min(risk_score / 100.0, 1.0))
         if data.get("is_abuser") or data.get("is_proxy"):
             verdict = "suspicious"
-            raw_score = 0.4
+            raw_score = raw_score if raw_score is not None else 0.4
         if data.get("is_tor"):
             verdict = "suspicious"
-            raw_score = 0.3
+            raw_score = raw_score if raw_score is not None else 0.3
 
         return NormalizedResult(
             ioc=ioc_value, ioc_type=ioc_type, source=self.name,

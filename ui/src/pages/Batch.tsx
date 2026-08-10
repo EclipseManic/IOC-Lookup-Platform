@@ -144,7 +144,7 @@ export default function Batch() {
   async function handleSubmit() {
     const list = iocs.split("\n").map((s) => s.trim()).filter(Boolean);
     if (list.length === 0) { showToast("Enter at least one IOC", "error"); return; }
-    if (list.length > 500) { showToast("Maximum 500 IOCs", "error"); return; }
+    if (list.length > 100) { showToast("Maximum 100 IOCs", "error"); return; }
     setLoading(true);
     setBatchId(null);
     setStatus(null);
@@ -177,13 +177,13 @@ export default function Batch() {
   }
 
   const list = iocs.split("\n").map((s) => s.trim()).filter(Boolean);
-  const overLimit = list.length > 500;
+  const overLimit = list.length > 100;
 
   return (
     <div>
       <div className="mb-6">
         <h2 className="text-lg font-bold">Batch Processing</h2>
-        <p className="text-sm text-text-secondary">Analyze up to 500 IOCs at once. Paste IOCs or upload a CSV/JSON file.</p>
+        <p className="text-sm text-text-secondary">Analyze up to 100 IOCs at once. Paste IOCs or upload a CSV/JSON file.</p>
       </div>
 
       {!batchId && (
@@ -228,7 +228,7 @@ export default function Batch() {
             />
             <div className="flex items-center justify-between mt-2">
               <span className={`text-xs font-mono ${overLimit ? "text-verdict-malicious" : "text-text-secondary"}`}>
-                {list.length} IOC{list.length !== 1 ? "s" : ""}{overLimit ? " (max 500)" : ""}
+                {list.length} IOC{list.length !== 1 ? "s" : ""}{overLimit ? " (max 100)" : ""}
               </span>
               <button
                 onClick={handleSubmit}
@@ -244,7 +244,14 @@ export default function Batch() {
 
       {status && !result && (
         <div className="bg-bg-card border border-border rounded-lg p-6 text-center">
-          <div className="w-full bg-bg-elevated rounded-full h-2 mb-4">
+          <div
+            role="progressbar"
+            aria-label="Batch progress"
+            aria-valuemin={0}
+            aria-valuemax={100}
+            aria-valuenow={Math.round(status.progress)}
+            className="w-full bg-bg-elevated rounded-full h-2 mb-4"
+          >
             <div className="h-2 rounded-full bg-gradient-to-r from-accent to-accent-secondary transition-all duration-500" style={{ width: `${status.progress}%` }} />
           </div>
           <p className="text-sm text-text-secondary">

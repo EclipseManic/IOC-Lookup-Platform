@@ -108,3 +108,47 @@ def test_csv_empty():
     csv = results_to_csv([])
     assert csv.strip() != ""
     assert "Source" in csv
+
+
+def test_stix_uses_actual_first_last_seen():
+    resp = _make_response(results=[
+        {"source": "VT", "ioc_type": "ipv4", "verdict": "malicious",
+         "confidence": "high", "first_seen": "2024-01-01T00:00:00.000Z",
+         "last_seen": "2024-06-01T00:00:00.000Z"},
+        {"source": "OTX", "ioc_type": "ipv4", "verdict": "suspicious",
+         "confidence": "medium", "first_seen": "2024-03-15T00:00:00.000Z",
+         "last_seen": "2024-04-01T00:00:00.000Z"},
+    ])
+    bundle = build_stix_bundle(resp)
+    obs = [o for o in bundle["objects"] if o["type"] == "observed-data"]
+    assert obs[0]["first_observed"] == "2024-01-01T00:00:00.000Z"
+    assert obs[0]["last_observed"] == "2024-06-01T00:00:00.000Z"
+    assert obs[1]["first_observed"] == "2024-01-01T00:00:00.000Z"
+    assert obs[1]["last_observed"] == "2024-06-01T00:00:00.000Z"
+    assert obs[2]["first_observed"] == "2024-03-15T00:00:00.000Z"
+    assert obs[2]["last_observed"] == "2024-04-01T00:00:00.000Z"
+
+
+def test_stix_per_result_uses_own_first_last_seen():
+    resp = _make_response(results=[
+        {"source": "VT", "ioc_type": "ipv4", "verdict": "clean",
+         "confidence": "high", "first_seen": "2025-05-05T00:00:00.000Z",
+         "last_seen": "2025-05-05T00:00:00.000Z"},
+    ])
+    bundle = build_stix_bundle(resp)
+    obs = [o for o in bundle["objects"] if o["type"] == "observed-data"]
+    assert obs[1]["first_observed"] == "2025-05-05T00:00:00.000Z"
+
+
+def test_stix_indicator_types_precedence():
+    resp = _make_response(results=[
+        {"source": "VT", "ioc_type": "ipv4", "verdict": "malicious",
+         "confidence": "high"},
+        {"source": "OTX", "ioc_type": "ipv4", "verdict": "suspicious",
+         "confidence": "low"},
+    ])
+    bundle = build_stix_bundle(resp)
+    indicators = [o for o in bundle["objects"] if o["type"] == "indicator"]
+    per_source = {o["name"].split(" — ")[-1]: o for o in indicators if " — " in o["name"]}
+    assert "malicious-activity" in per_source["VT"]["indicator_types"]
+    assert "malicious-activity" not in per_source["OTX"]["indicator_types"]

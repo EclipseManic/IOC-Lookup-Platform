@@ -5,6 +5,8 @@ import SearchBar from "../components/SearchBar";
 import { SkeletonHeader, SkeletonSourceGrid } from "../components/LoadingSkeleton";
 import type { LookupResponse } from "../services/api";
 import ResultView from "./ResultView";
+import SourceCoveragePanel from "../components/SourceCoveragePanel";
+import PrivacyNotice from "../components/PrivacyNotice";
 
 export default function HomePage({ initialValue = "" }: { initialValue?: string }) {
   const { state, submit, reset } = useLookup();
@@ -17,8 +19,8 @@ export default function HomePage({ initialValue = "" }: { initialValue?: string 
     }
   }, [initialValue, submit]);
 
-  const handleSearch = useCallback((value: string) => {
-    submit(value);
+  const handleSearch = useCallback((value: string, iocType?: string) => {
+    submit(value, iocType);
   }, [submit]);
 
   return (
@@ -29,8 +31,10 @@ export default function HomePage({ initialValue = "" }: { initialValue?: string 
       </div>
 
       <div className="max-w-2xl mx-auto mb-8">
-        <SearchBar onSearch={handleSearch} initialValue={initialValue} />
+        <SearchBar onSearch={handleSearch} initialValue={initialValue} disabled={state.status === "loading"} />
       </div>
+      <PrivacyNotice />
+      <SourceCoveragePanel />
 
       <div className="max-w-4xl mx-auto" aria-live="polite" aria-label="Lookup results">
         {state.status === "loading" && (
@@ -52,7 +56,7 @@ export default function HomePage({ initialValue = "" }: { initialValue?: string 
         )}
 
         {state.status === "done" && (
-          <ResultView result={state.result as LookupResponse} onNewSearch={(v) => { submit(v); }} />
+          <ResultView result={state.result as LookupResponse} onNewSearch={(v, type) => { submit(v, type); }} />
         )}
       </div>
     </div>

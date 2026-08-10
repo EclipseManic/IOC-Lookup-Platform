@@ -56,6 +56,19 @@ class TestNormalizedResult:
         assert len(r.mitre_attck) == 2
         assert r.reports_count == 23
 
+    def test_sanitizes_malformed_optional_provider_lists(self):
+        r = NormalizedResult(
+            ioc="example.com", ioc_type="domain", source="test", verdict="unknown",
+            tags=["valid", None, "  "], categories=[None, "phishing"], samples="sample.exe",
+            related_iocs=[("1.2.3.4", "resolves_to"), (None, "bad")],
+            network_iocs=[("example.com", "domain"), ("", "bad")],
+        )
+        assert r.tags == ["valid"]
+        assert r.categories == ["phishing"]
+        assert r.samples == ["sample.exe"]
+        assert r.related_iocs == [("1.2.3.4", "resolves_to")]
+        assert r.network_iocs == [("example.com", "domain")]
+
     def test_verdict_error(self):
         r = NormalizedResult(ioc="x", ioc_type="ipv4", source="T", verdict="error", tags=["timeout"])
         assert r.verdict == "error"
@@ -344,6 +357,21 @@ class TestVirusTotalAdapter:
             r = await a.lookup("8.8.8.8", "ipv4")
         assert r.verdict == "suspicious"
 
+    @pytest.mark.asyncio
+    async def test_low_detection_ratio_is_suspicious(self):
+        vt_json = {
+            "data": {"attributes": {"last_analysis_stats": {
+                "malicious": 1, "suspicious": 0, "harmless": 49, "undetected": 50,
+            }}}
+        }
+        a = VirusTotalAdapter()
+        a.api_key = "valid"
+        mock_class, _ = _mock_async_client(json_data=vt_json)
+        with patch("httpx.AsyncClient", mock_class):
+            r = await a.lookup("a" * 64, "sha256")
+        assert r.verdict == "suspicious"
+        assert r.raw_score == 0.01
+
     def test_supported_types(self):
         a = VirusTotalAdapter()
         assert "ipv4" in a.supported_types
@@ -417,7 +445,9 @@ class TestAbuseIPDBAdapter:
         assert r.raw_score == 0.85
         assert r.confidence == "high"
         assert r.reports_count == 12
-        assert len(r.samples) >= 2
+        assert len(r.reports) >= 2
+        assert r.reports[0]["categories"] == [1, 2]
+        assert r.reports[0]["comment"] == "C2 traffic observed"
 
     @pytest.mark.asyncio
     async def test_clean_response(self):
@@ -432,7 +462,7 @@ class TestAbuseIPDBAdapter:
 
     def test_supported_types(self):
         a = AbuseIPDBAdapter()
-        assert a.supported_types == ["ipv4"]
+        assert a.supported_types == ["ipv4", "ipv6"]
 
 
 # ── ThreatFox ──
@@ -551,6 +581,19 @@ class TestMalwareBazaarAdapter:
         assert "exe" in tags_str
         assert "Emotet" in tags_str
 
+    @pytest.mark.asyncio
+    async def test_null_optional_metadata_is_filtered(self):
+        data = {
+            "query_status": "ok",
+            "data": [{"file_type": None, "signature": None, "first_seen": None, "last_seen": None}],
+        }
+        a = MalwareBazaarAdapter()
+        a.api_key = "valid"
+        mock_class, _ = _mock_async_client(json_data=data)
+        with patch("httpx.AsyncClient", mock_class):
+            result = await a.lookup("abc123", "sha256")
+        assert result.categories == []
+
     def test_supported_types(self):
         a = MalwareBazaarAdapter()
         assert "md5" in a.supported_types
@@ -562,12 +605,14 @@ class TestMalwareBazaarAdapter:
 
 class TestUrlScanIOAdapter:
     @pytest.mark.asyncio
-    async def test_no_key(self):
+    async def test_public_search_without_key(self):
         a = UrlScanIOAdapter()
         a.api_key = ""
-        r = await a.lookup("evil.com", "domain")
+        mock_class, _ = _mock_async_client(json_data={"results": []})
+        with patch("httpx.AsyncClient", mock_class):
+            r = await a.lookup("evil.com", "domain")
         assert r.verdict == "unknown"
-        assert "no_api_key_configured" in r.tags
+        assert "no_api_key_configured" not in r.tags
 
     @pytest.mark.asyncio
     async def test_401(self):
@@ -624,7 +669,7 @@ class TestAdapterConsistency:
 
     ADAPTERS = [
         ("VirusTotal", VirusTotalAdapter, ["ipv4", "domain", "md5", "sha256", "url"]),
-        ("AbuseIPDB", AbuseIPDBAdapter, ["ipv4"]),
+        ("AbuseIPDB", AbuseIPDBAdapter, ["ipv4", "ipv6"]),
         ("ThreatFox", ThreatFoxAdapter, ["ipv4", "domain", "md5", "sha256"]),
         ("MalwareBazaar", MalwareBazaarAdapter, ["md5", "sha1", "sha256"]),
         ("urlscan.io", UrlScanIOAdapter, ["domain", "url"]),
@@ -702,7 +747,7 @@ class TestScoringEngine:
         assert c.verdict == "unknown"
 
     def test_source_weights_defined(self):
-        expected = {"VirusTotal", "AbuseIPDB", "ThreatFox", "MalwareBazaar", "urlscan.io", "CVE", "Tria.ge", "Hybrid Analysis", "AlienVault OTX", "GreyNoise", "PhishTank", "OpenPhish", "URLhaus"}
+        expected = {"VirusTotal", "AbuseIPDB", "ThreatFox", "MalwareBazaar", "urlscan.io", "CVE", "Tria.ge", "Hybrid Analysis", "AlienVault OTX", "GreyNoise", "PhishTank", "OpenPhish", "URLhaus", "StopForumSpam"}
         assert set(SOURCE_WEIGHTS.keys()) == expected
 
     def test_verdict_scores_defined(self):
@@ -874,7 +919,7 @@ class TestPipeline:
         assert task.progress == 100.0
         assert task.ioc_type == "ipv4"
         assert task.normalized == "8.8.8.8"
-        assert len(task.stages) == 21
+        assert len(task.stages) == 22
 
     @pytest.mark.asyncio
     async def test_run_analysis_domain(self):
@@ -914,7 +959,7 @@ class TestPipeline:
     @pytest.mark.asyncio
     async def test_task_has_stages(self):
         task = await run_analysis("8.8.8.8")
-        assert len(task.stages) == 21
+        assert len(task.stages) == 22
         for stage in task.stages:
             assert stage.status in ("done", "skipped", "pending", "error")
 
@@ -954,7 +999,7 @@ class TestPipeline:
         assert d["task_id"] == task.task_id
         assert d["status"] == "done"
         assert d["ioc_value"] == "8.8.8.8"
-        assert len(d["stages"]) == 21
+        assert len(d["stages"]) == 22
 
 
 # ─────────────────────────────────────────────
@@ -1074,6 +1119,7 @@ class TestConfig:
         s = Settings(**{"VT_API_KEY": "vtkey"})
         assert s.virustotal_api_key == "vtkey"
 
+    @patch.dict(os.environ, {}, clear=True)
     def test_threatfox_fallback(self):
         """ThreatFox key falls back to MalwareBazaar key."""
         s = Settings(malwarebazaar_api_key="shared_key", threatfox_api_key="")
