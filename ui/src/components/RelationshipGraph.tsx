@@ -13,6 +13,8 @@ const NODE_COLORS: Record<string, string> = {
   sha256: "#eab308",
   email: "#ec4899",
   cve: "#ef4444",
+  btc: "#f59e0b",
+  eth: "#6366f1",
   default: "#6b7280",
 };
 
@@ -27,6 +29,8 @@ function inferType(label: string): string {
   if (/^[\w.+-]+@[\w.-]+\.\w{2,}$/.test(label)) return "email";
   if (/^https?:\/\//i.test(label)) return "url";
   if (/^[\w.-]+\.[a-z]{2,}$/.test(label)) return "domain";
+  if (/^(?:[13][a-km-zA-HJ-NP-Z1-9]{25,34}|bc1[a-z\d]{38,58})$/i.test(label)) return "btc";
+  if (/^0x[a-f\d]{40}$/i.test(label)) return "eth";
   return "default";
 }
 
@@ -164,6 +168,8 @@ export default function RelationshipGraph({ mainIoc, relationships, onNodeClick 
       .data(nodes)
       .join("g")
       .attr("cursor", "grab")
+      .on("mouseenter", function () { d3.select(this).attr("cursor", "grabbing"); })
+      .on("mouseleave", function () { d3.select(this).attr("cursor", "grab"); })
       .attr("tabindex", (d) => (d.isMain ? -1 : 0))
       .attr("role", "button")
       .attr("aria-label", (d) => `${d.label} (${d.type})`)
@@ -180,7 +186,7 @@ export default function RelationshipGraph({ mainIoc, relationships, onNodeClick 
     nodeGroup.append("circle")
       .attr("r", (d) => d.isMain ? 12 : 6 + (d.score / 100) * 8)
       .attr("fill", (d) => NODE_COLORS[d.type] || NODE_COLORS.default)
-      .attr("stroke", (d) => d.isMain ? "#818cf8" : "none")
+      .attr("stroke", (d) => d.isMain ? "#facc15" : "none")
       .attr("stroke-width", 2);
 
     nodeGroup.append("text")
@@ -250,7 +256,7 @@ export default function RelationshipGraph({ mainIoc, relationships, onNodeClick 
     return () => { simulation.stop(); };
   }, [mainIoc, relationships, onNodeClick]);
 
-  useEffect(() => { buildGraph(); }, [buildGraph]);
+  useEffect(() => { return buildGraph(); }, [buildGraph]);
 
   if (relationships.length === 0) return null;
 
@@ -260,10 +266,10 @@ export default function RelationshipGraph({ mainIoc, relationships, onNodeClick 
         <h3 className="text-sm font-semibold text-text-secondary uppercase tracking-wider">Relationships</h3>
         <div className="flex gap-1 bg-bg-elevated rounded-lg p-0.5" role="tablist" aria-label="Relationship view mode">
           <button onClick={() => setViewMode("graph")} role="tab" aria-selected={viewMode === "graph"}
-            className={`px-3 py-1 text-xs rounded-md transition-colors ${viewMode === "graph" ? "bg-accent text-white" : "text-text-secondary hover:text-text-primary"}`}
+            className={`px-3 py-1 text-xs rounded-md transition-colors ${viewMode === "graph" ? "bg-accent text-[#06070d]" : "text-text-secondary hover:text-text-primary"}`}
           >Graph</button>
           <button onClick={() => setViewMode("table")} role="tab" aria-selected={viewMode === "table"}
-            className={`px-3 py-1 text-xs rounded-md transition-colors ${viewMode === "table" ? "bg-accent text-white" : "text-text-secondary hover:text-text-primary"}`}
+            className={`px-3 py-1 text-xs rounded-md transition-colors ${viewMode === "table" ? "bg-accent text-[#06070d]" : "text-text-secondary hover:text-text-primary"}`}
           >Table</button>
         </div>
       </div>

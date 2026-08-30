@@ -59,13 +59,15 @@ export default function FeedbackWidget({ ioc }: { ioc: string }) {
         value={note}
         onChange={(e) => setNote(e.target.value)}
         placeholder="Optional note"
+        aria-label="Optional feedback note"
         className="flex-1 min-w-40 px-3 py-1.5 text-xs rounded-lg bg-bg-elevated border border-border text-text-primary placeholder-text-secondary/60 focus:outline-none focus:border-accent/50"
       />
       <button
         type="button"
         onClick={handleSubmit}
         disabled={!selected || saving}
-        className="px-3 py-1.5 bg-accent text-white text-xs rounded-lg hover:bg-accent/90 disabled:opacity-50 transition-colors"
+        aria-label="Save feedback"
+        className="px-3 py-1.5 bg-accent text-[#06070d] text-xs rounded-lg hover:bg-accent/90 disabled:opacity-50 transition-colors"
       >
         {saving ? "Saving..." : "Save Feedback"}
       </button>

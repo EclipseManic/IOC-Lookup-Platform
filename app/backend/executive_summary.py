@@ -13,6 +13,34 @@ def generate_executive_summary(response: LookupResponse) -> str:
     score = c.score
     verdict = c.verdict
     confidence = c.confidence
+    assessment = response.final_assessment
+    if assessment is not None and assessment.assessment_domain == "vulnerability":
+        cve_info = response.enrichment.cve if response.enrichment else None
+        sentences = [
+            f"{response.normalized} is assessed as a {assessment.final_verdict} vulnerability with {assessment.confidence} confidence.",
+            assessment.reason,
+        ]
+        if cve_info and cve_info.is_in_kev:
+            sentences.append("It is listed in the CISA Known Exploited Vulnerabilities catalog.")
+        elif cve_info and cve_info.epss_score is not None:
+            sentences.append(f"The estimated exploit probability is {cve_info.epss_score * 100:.1f}%.")
+        if assessment.analyst_review_recommended:
+            sentences.append("Analyst review is recommended because the available vulnerability evidence is incomplete or conflicting.")
+        return " ".join(sentence for sentence in sentences if sentence)[:1800]
+    if assessment is not None and assessment.assessment_domain == "attack_technique":
+        technique = assessment.techniques[0] if assessment.techniques else {}
+        technique_id = technique.get("technique_id") or technique.get("id") or response.normalized
+        technique_name = technique.get("name")
+        label = f"{technique_id} ({technique_name})" if technique_name else str(technique_id)
+        return f"ATT&CK technique {label} is classified as {assessment.final_verdict} with {assessment.confidence} confidence. {assessment.reason}"[:1800]
+    if assessment is not None and assessment.assessment_domain == "security_test_artifact":
+        return f"{response.normalized} is the EICAR security test artifact. Its antivirus detections are intentional test behavior, not evidence of live malware."[:1800]
+    if assessment is not None and assessment.assessment_domain != "ioc_reputation":
+        return f"{response.normalized} is assessed in the {assessment.assessment_domain.replace('_', ' ')} domain as {assessment.final_verdict} with {assessment.confidence} confidence. {assessment.reason}"[:1800]
+    if assessment is not None:
+        score = assessment.normalized_score
+        verdict = assessment.final_verdict
+        confidence = assessment.confidence
 
     ss = score
     sentences = []
@@ -21,6 +49,10 @@ def generate_executive_summary(response: LookupResponse) -> str:
     sentences.append(
         f"The indicator {response.normalized} ({response.ioc_type}) received a composite score of {ss_label}, resulting in a verdict of {verdict} with {confidence} confidence."
     )
+    if assessment is not None:
+        sentences.append(assessment.reason)
+        if assessment.analyst_review_recommended:
+            sentences.append("Analyst review is recommended because the available evidence is incomplete or conflicting.")
 
     malicious = [sw for sw in c.source_breakdown if sw.verdict == "malicious" and sw.score and sw.score >= MALICIOUS_SOURCE_SCORE]
     suspicious = [sw for sw in c.source_breakdown if sw.verdict == "suspicious"]

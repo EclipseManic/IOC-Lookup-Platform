@@ -1,9 +1,7 @@
 import base64
 import time
 
-import httpx
-
-from app.backend.adapters.base import NormalizedResult, RateLimitConfig, SourceAdapter, is_valid_api_key
+from app.backend.adapters.base import NormalizedResult, RateLimitConfig, SourceAdapter, is_valid_api_key, retry_after_seconds
 from app.backend.config import settings
 
 
@@ -24,9 +22,21 @@ class CensysAdapter(SourceAdapter):
         if ":" in self.api_key:
             api_id, api_secret = self.api_key.split(":", 1)
             token = base64.b64encode(f"{api_id}:{api_secret}".encode()).decode()
-        else:
-            token = base64.b64encode(self.api_key.encode()).decode()
-        return f"Basic {token}"
+            return f"Basic {token}"
+        # Modern Censys personal access tokens (censys_...) use Bearer auth.
+        return f"Bearer {self.api_key}"
+
+    def _request_headers(self) -> dict:
+        """Platform API headers (PAT auth + vendor-specific accept version).
+
+        docs.censys.com (2026-07-28): the Platform API requires the vendor
+        Accept header ``application/vnd.censys.api.v3.host.v1+json`` and
+        authenticates with a Personal Access Token.
+        """
+        return {
+            "Authorization": self._auth_header(),
+            "Accept": "application/vnd.censys.api.v3.host.v1+json",
+        }
 
     def _check_credits(self) -> bool:
         now = time.time()
@@ -51,14 +61,15 @@ class CensysAdapter(SourceAdapter):
         client = self._get_client()
         resp = await client.get(
             f"https://api.platform.censys.io/v3/global/asset/host/{ioc_value}",
-            headers={"Authorization": self._auth_header()},
+            headers=self._request_headers(),
             timeout=15,
         )
 
         if resp.status_code == 429:
             return NormalizedResult(
                 ioc=ioc_value, ioc_type=ioc_type, source=self.name,
-                verdict="unknown", tags=["rate_limited"],
+                verdict="unknown", tags=["rate_limited"], http_status=resp.status_code,
+                retry_after_seconds=retry_after_seconds(resp),
             )
         if resp.status_code == 401:
             return NormalizedResult(
@@ -68,7 +79,7 @@ class CensysAdapter(SourceAdapter):
         if resp.status_code == 404:
             return NormalizedResult(
                 ioc=ioc_value, ioc_type=ioc_type, source=self.name,
-                verdict="unknown", raw_score=None,
+                verdict="unknown", raw_score=None, status="not_found",
             )
         if resp.status_code != 200:
             return NormalizedResult(
@@ -79,8 +90,16 @@ class CensysAdapter(SourceAdapter):
         CensysAdapter._monthly_credits_used += 1
 
         data = resp.json()
-        resource = data.get("result", {}).get("resource", {})
-        tags = []
+        resource = data.get("result", {}).get("resource")
+        if not resource:
+            return NormalizedResult(
+                ioc=ioc_value, ioc_type=ioc_type, source=self.name,
+                verdict="unknown", raw_score=None, status="not_found",
+            )
+        # A host returned by Censys is confirmed to exist on the internet.
+        # This tag also keeps NormalizedResult's post-validator from demoting
+        # a data-light host (no location/ASN/services) to not_found.
+        tags = ["active_ip"]
 
         location = resource.get("location", {})
         if location.get("city"):
@@ -130,5 +149,5 @@ class CensysAdapter(SourceAdapter):
 
         return NormalizedResult(
             ioc=ioc_value, ioc_type=ioc_type, source=self.name,
-            verdict="unknown", raw_score=None, tags=tags,
+            verdict="unknown", raw_score=None, status="found", tags=tags, raw_data=data,
         )

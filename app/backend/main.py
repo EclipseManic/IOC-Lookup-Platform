@@ -1,7 +1,9 @@
 import asyncio
+import hashlib
 import hmac
 import json
 import os
+import re
 import sys
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -188,10 +190,13 @@ class RateLimitMiddleware(BaseHTTPMiddleware):
     async def dispatch(self, request: Request, call_next):
         for prefix, (limit, window) in self.RATE_LIMITS.items():
             if request.url.path.startswith(prefix):
+                # Status polling of batches (GET) should not be throttled to 10/min
+                if prefix == "/api/batch" and request.method == "GET":
+                    continue
                 client_ip = request.client.host if request.client else "unknown"
                 limiter = get_rate_limiter()
                 if limiter is not None:
-                    allowed = await limiter.acquire(f"ip:{client_ip}", limit, window)
+                    allowed = await limiter.acquire(f"ip:{client_ip}:{prefix}:{request.method}", limit, window)
                     if not allowed:
                         return Response(status_code=429, content="Rate limit exceeded. Try again later.", media_type="text/plain")
                 break
@@ -297,7 +302,9 @@ async def source_inventory():
             if line and not line.startswith("#") and "=" in line:
                 env_file_names.add(line.split("=", 1)[0].strip())
     credential_names = {
-        "MalwareBazaar": ["MB_AUTH_KEY"], "ThreatFox": ["THREATFOX_API_KEY"],
+        "MalwareBazaar": ["MB_AUTH_KEY", "ABUSH_CH_AUTH_KEY", "ABUSE_CH_AUTH_KEY", "ABUSE_CH_API_KEY", "ABUSECH_API_KEY", "ABUSECH_AUTH_KEY"],
+        "ThreatFox": ["THREATFOX_API_KEY", "MB_AUTH_KEY", "ABUSH_CH_AUTH_KEY", "ABUSE_CH_AUTH_KEY", "ABUSE_CH_API_KEY", "ABUSECH_API_KEY", "ABUSECH_AUTH_KEY"],
+        "URLhaus": ["URLHAUS_API_KEY", "MB_AUTH_KEY", "ABUSH_CH_AUTH_KEY", "ABUSE_CH_AUTH_KEY", "ABUSE_CH_API_KEY", "ABUSECH_API_KEY", "ABUSECH_AUTH_KEY"],
         "VirusTotal": ["VT_API_KEY"], "AbuseIPDB": ["ABUSEIPDB_API_KEY", "AbuseDB_API_KEY"],
         "urlscan.io": ["URL_SCAN_API_KEY"], "Tria.ge": ["TRIAGE_API_KEY", "TRIA_GE_API_KEY"],
         "Hybrid Analysis": ["HA_API_KEY"], "GreyNoise": ["GREYNOISE_API_KEY"],
@@ -305,6 +312,8 @@ async def source_inventory():
         "SecurityTrails": ["SECURITYTRAILS_API_KEY"], "PhishTank": ["PHISHTANK_API_KEY"],
         "Spur.us": ["SPUR_US_API_KEY"], "Censys": ["CENSYS_API_KEY"],
         "IPinfo": ["IPINFO_API_KEY", "IPINFO_ACCESS_TOKEN"],
+        "Hudson Rock": ["HUDSON_API_KEY", "HUDSON_ROCK_API_KEY", "HUDSONROCK_API_KEY"],
+        "HIBP Pwned Passwords": [],
     }
     sources = []
     for adapter in ADAPTERS:
@@ -314,13 +323,12 @@ async def source_inventory():
         env_names = credential_names.get(adapter.name, [])
         env_name = next((name for name in env_names if name in os.environ or name in env_file_names), env_names[0] if env_names else None)
         configured = is_valid_api_key(key) if key is not None else True
-        if not env_name:
-            credential_source = "public_no_key"
-        elif env_name in os.environ and configured:
-            credential_source = "environment"
-        elif env_name in env_file_names and configured:
-            credential_source = ".env"
-        elif getattr(adapter, "public_without_key", False):
+        if configured and key:
+            if env_name and env_name in env_file_names and env_name not in os.environ:
+                credential_source = ".env"
+            else:
+                credential_source = "environment"
+        elif not requires_key or getattr(adapter, "public_without_key", False):
             credential_source = "public_no_key"
         else:
             credential_source = "not_configured"
@@ -397,6 +405,8 @@ def _task_to_response(task) -> LookupResponse:
         normalized=task.normalized,
         ioc_type=task.ioc_type or "unknown",
         composite=task.composite,
+        final_assessment=getattr(task, "final_assessment", None),
+        provider_health=getattr(task, "provider_health", []),
         enrichment=task.enrichment or None,
         results=task.results,
         relationships=task.relationships,
@@ -406,13 +416,25 @@ def _task_to_response(task) -> LookupResponse:
 
 @app.post("/api/lookup", response_model=TaskStatusResponse)
 async def start_lookup(request: LookupRequest, db: AsyncSession = Depends(get_db)):
+    req_type = request.ioc_type
     normalized = _normalize_ioc(request.ioc)
-    if request.ioc_type and request.ioc_type not in SUPPORTED_IOC_TYPES:
+    if req_type and req_type not in SUPPORTED_IOC_TYPES:
         raise HTTPException(status_code=400, detail="Unsupported IOC type")
-    if not request.ioc_type and classify_ioc(normalized) == "unknown":
+    if not req_type and classify_ioc(normalized) == "unknown":
         raise HTTPException(status_code=400, detail="Unrecognizable IOC format")
 
     fp_override = normalized in await _fetch_fp_overrides(db)
+
+    # For passwords, convert to SHA-1 hash for privacy-preserving k-anonymity lookup (HIBP)
+    target_ioc = normalized
+    effective_type = req_type
+    if req_type == "password":
+        import hashlib
+        if not re.fullmatch(r"^[a-f0-9]{40}$", normalized, re.IGNORECASE):
+            target_ioc = hashlib.sha1(normalized.encode("utf-8")).hexdigest()
+        else:
+            target_ioc = normalized.lower()
+        effective_type = "password"
 
     # A lookup can take up to the pipeline timeout. Queue it and return the
     # identifier immediately so the UI can reliably poll or use SSE instead
@@ -420,17 +442,17 @@ async def start_lookup(request: LookupRequest, db: AsyncSession = Depends(get_db
     task_id = uuid4().hex[:12]
     asyncio.create_task(
         run_analysis(
-            normalized,
+            target_ioc,
             task_id=task_id,
             fp_override=fp_override,
-            ioc_type_override=request.ioc_type,
+            ioc_type_override=effective_type,
         )
     )
     return TaskStatusResponse(
         task_id=task_id,
         status="pending",
-        ioc_value=normalized,
-        normalized=normalized,
+        ioc_value=target_ioc,
+        normalized=target_ioc,
         ioc_type=request.ioc_type or classify_ioc(normalized),
     )
 

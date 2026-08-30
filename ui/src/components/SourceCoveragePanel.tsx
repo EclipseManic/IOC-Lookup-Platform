@@ -3,10 +3,29 @@ import { getSourceInventory, type SourceInventory } from "../services/api";
 
 export default function SourceCoveragePanel() {
   const [inventory, setInventory] = useState<SourceInventory | null>(null);
-  useEffect(() => { getSourceInventory().then(setInventory).catch(() => setInventory(null)); }, []);
-  if (!inventory) return null;
+  const [error, setError] = useState(false);
+  useEffect(() => {
+    let cancelled = false;
+    getSourceInventory().then((inv) => { if (!cancelled) setInventory(inv); }).catch(() => { if (!cancelled) setError(true); });
+    return () => { cancelled = true; };
+  }, []);
+  if (error) {
+    return (
+      <p className="max-w-6xl mx-auto mb-6 text-xs text-text-secondary bg-bg-card border border-border rounded-lg p-4">
+        Source coverage could not be loaded. Check the backend health endpoint.
+      </p>
+    );
+  }
+  if (!inventory) {
+    return (
+      <div className="max-w-6xl mx-auto mb-6 bg-bg-card border border-border rounded-lg p-4">
+        <div className="h-4 w-48 bg-bg-elevated rounded animate-pulse" />
+        <div className="h-3 w-full bg-bg-elevated rounded mt-2 animate-pulse" />
+      </div>
+    );
+  }
   return (
-    <details className="max-w-4xl mx-auto mb-6 bg-bg-card border border-border rounded-lg p-4 text-sm">
+    <details className="max-w-6xl mx-auto mb-6 bg-bg-card border border-border rounded-lg p-4 text-sm">
       <summary className="cursor-pointer text-text-secondary uppercase tracking-wider text-xs font-semibold">
         Source coverage ({inventory.available_count}/{inventory.count} usable; {inventory.credential_configured_count} credentials loaded)
       </summary>

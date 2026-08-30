@@ -1,6 +1,6 @@
 import httpx
 
-from app.backend.adapters.base import NormalizedResult, RateLimitConfig, SourceAdapter, is_valid_api_key
+from app.backend.adapters.base import NormalizedResult, RateLimitConfig, SourceAdapter, is_valid_api_key, retry_after_seconds
 from app.backend.config import settings
 
 
@@ -64,7 +64,8 @@ class IPinfoAdapter(SourceAdapter):
         if resp.status_code == 429:
             return NormalizedResult(
                 ioc=ioc_value, ioc_type=ioc_type, source=self.name,
-                verdict="unknown", tags=["rate_limited"],
+                verdict="unknown", tags=["rate_limited"], http_status=resp.status_code,
+                retry_after_seconds=retry_after_seconds(resp),
             )
         if resp.status_code != 200:
             return NormalizedResult(
@@ -120,5 +121,5 @@ class IPinfoAdapter(SourceAdapter):
         return NormalizedResult(
             ioc=ioc_value, ioc_type=ioc_type, source=self.name,
             verdict=verdict, raw_score=raw_score, tags=tags,
-            categories=categories,
+            categories=categories, raw_data=data,
         )

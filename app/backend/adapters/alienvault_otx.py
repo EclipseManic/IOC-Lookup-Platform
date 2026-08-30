@@ -1,6 +1,6 @@
 import httpx
 
-from app.backend.adapters.base import NormalizedResult, RateLimitConfig, SourceAdapter, is_valid_api_key
+from app.backend.adapters.base import NormalizedResult, RateLimitConfig, SourceAdapter, is_valid_api_key, retry_after_seconds
 from app.backend.config import settings
 from app.backend.logger import get_logger
 
@@ -22,6 +22,7 @@ _TYPE_TO_SEGMENT = {
 class AlienVaultOTXAdapter(SourceAdapter):
     name = "AlienVault OTX"
     supported_types = ["ipv4", "ipv6", "domain", "url", "md5", "sha1", "sha256"]
+    public_without_key = True
     rate_limit = RateLimitConfig(requests_per_minute=16, requests_per_day=1000)
 
     def __init__(self):
@@ -31,8 +32,9 @@ class AlienVaultOTXAdapter(SourceAdapter):
         if not self._check_circuit():
             return None
         try:
+            headers = {"X-OTX-API-KEY": self.api_key} if is_valid_api_key(self.api_key) else None
             resp = await self._get_client().get(
-                url, headers={"X-OTX-API-KEY": self.api_key}, timeout=15,
+                url, headers=headers, timeout=15,
             )
             if resp.status_code == 200:
                 self._record_success()
@@ -45,12 +47,6 @@ class AlienVaultOTXAdapter(SourceAdapter):
             return None
 
     async def lookup(self, ioc_value: str, ioc_type: str) -> NormalizedResult:
-        if not is_valid_api_key(self.api_key):
-            return NormalizedResult(
-                ioc=ioc_value, ioc_type=ioc_type, source=self.name,
-                verdict="unknown", tags=["no_api_key_configured"],
-            )
-
         segment = _TYPE_TO_SEGMENT.get(ioc_type)
         if not segment:
             return NormalizedResult(
@@ -58,11 +54,27 @@ class AlienVaultOTXAdapter(SourceAdapter):
                 verdict="unknown", tags=["unsupported_type"],
             )
 
+        # OTX's public endpoint is not a reliable anonymous lookup path: in
+        # some environments it returns a normal 200 response without usable
+        # reputation data instead of a 401.  Surface that condition explicitly
+        # so batch scans account for it as provider unavailability.
+        if not is_valid_api_key(self.api_key):
+            return NormalizedResult(
+                ioc=ioc_value,
+                ioc_type=ioc_type,
+                source=self.name,
+                verdict="unknown",
+                execution_state="unavailable",
+                tags=["no_api_key_configured", "public_fallback"],
+                request_made=False,
+            )
+
+        headers = {"X-OTX-API-KEY": self.api_key} if is_valid_api_key(self.api_key) else None
         client = self._get_client()
         try:
             resp = await client.get(
                     f"https://otx.alienvault.com/api/v1/indicators/{segment}/{ioc_value}/reputation",
-                    headers={"X-OTX-API-KEY": self.api_key},
+                    headers=headers,
                     timeout=15,
                 )
         except httpx.TimeoutException:
@@ -80,6 +92,11 @@ class AlienVaultOTXAdapter(SourceAdapter):
             )
 
         if resp.status_code == 401:
+            if not is_valid_api_key(self.api_key):
+                return NormalizedResult(
+                    ioc=ioc_value, ioc_type=ioc_type, source=self.name,
+                    verdict="unknown", status="not_found", tags=["no_api_key_configured","public_fallback"],
+                )
             return NormalizedResult(
                 ioc=ioc_value, ioc_type=ioc_type, source=self.name,
                 verdict="error", tags=["unauthorized"],
@@ -92,7 +109,8 @@ class AlienVaultOTXAdapter(SourceAdapter):
         if resp.status_code == 429:
             return NormalizedResult(
                 ioc=ioc_value, ioc_type=ioc_type, source=self.name,
-                verdict="unknown", tags=["rate_limited"],
+                verdict="unknown", tags=["rate_limited"], http_status=resp.status_code,
+                retry_after_seconds=retry_after_seconds(resp),
             )
         if resp.status_code != 200:
             return NormalizedResult(
@@ -216,5 +234,5 @@ class AlienVaultOTXAdapter(SourceAdapter):
             malware_family=", ".join(sorted(all_families)) or None,
             mitre_attck=sorted(all_mitre),
             related_iocs=related,
-            raw_data=extra_data,
+            raw_data={"api_response": data, **extra_data},
         )

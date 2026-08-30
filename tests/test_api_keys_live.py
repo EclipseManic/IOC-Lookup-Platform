@@ -175,26 +175,6 @@ async def test_nvd():
         return f"HTTP {r.status_code}"
 
 
-async def test_leakcheck():
-    k = settings.leakcheck_api_key
-    if not is_valid_api_key(k):
-        return "SKIPPED (no key)"
-    async with httpx.AsyncClient(timeout=REQUEST_TIMEOUT) as c:
-        r = await c.get(
-            "https://leakcheck.io/api/v2/query/test@example.com",
-            headers={"X-API-Key": k, "Accept": "application/json"},
-        )
-        if r.status_code == 200:
-            return "OK (found)"
-        if r.status_code == 404:
-            return "OK (no records)"
-        if r.status_code in (401, 403):
-            return "401/403 UNAUTHORIZED"
-        if r.status_code == 429:
-            return "429 RATE LIMITED"
-        return f"HTTP {r.status_code}"
-
-
 async def main():
     print("=== API Key Live Test ===\n")
     tests = [
@@ -206,7 +186,6 @@ async def main():
         ("Tria.ge", test_triage),
         ("Hybrid Analysis", test_hybrid_analysis),
         ("NVD", test_nvd),
-        ("LeakCheck", test_leakcheck),
     ]
     for name, fn in tests:
         await _test(name, fn)

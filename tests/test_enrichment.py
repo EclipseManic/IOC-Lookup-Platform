@@ -109,7 +109,7 @@ class TestEnrichmentTypeSpecific:
     async def test_email_enrichment(self):
         result = await enrich_email("user@example.com")
         assert result.completeness.get("domain_extraction") == "ok"
-        assert all(k in result.completeness for k in ("leakcheck", "xposedornot", "proxynova_comb"))
+        assert all(k in result.completeness for k in ("xposedornot", "proxynova_comb"))
         assert result.completeness.get("email_security") is not None
 
     @pytest.mark.asyncio
@@ -168,7 +168,7 @@ class TestEnrichmentDispatcher:
     async def test_dispatcher_email(self):
         result = await enrich("admin@example.com", "email")
         assert result.completeness.get("domain_extraction") == "ok"
-        assert all(k in result.completeness for k in ("leakcheck", "xposedornot", "proxynova_comb"))
+        assert all(k in result.completeness for k in ("xposedornot", "proxynova_comb"))
 
     @pytest.mark.asyncio
     async def test_dispatcher_cve(self):
@@ -381,6 +381,35 @@ class TestRdap:
         monkeypatch.setattr(enrichment, "_get_http_client", lambda: FakeClient())
         result = await enrichment._rdap_lookup("example.com")
         assert result.registrar == "404 Fallback"
+
+    @pytest.mark.asyncio
+    async def test_rdap_ip_404_raises_no_record(self, monkeypatch):
+        """IP with no RDAP record is a data gap (unavailable), not a failure."""
+        from app.backend import enrichment
+        from app.backend.enrichment import RDAPNoRecordError
+
+        class FakeResp:
+            status_code = 404
+
+            def json(self):
+                return {}
+
+        class FakeClient:
+            async def get(self, url, timeout=8):
+                return FakeResp()
+
+        monkeypatch.setattr(enrichment, "_get_http_client", lambda: FakeClient())
+        with pytest.raises(RDAPNoRecordError):
+            await enrichment._rdap_lookup("1.2.3.4")
+
+    def test_completeness_label_maps_statuses(self):
+        from app.backend.enrichment import RDAPNoRecordError, _completeness_label
+
+        assert _completeness_label(RDAPNoRecordError("x")) == "unavailable"
+        assert _completeness_label(ValueError("boom")) == "error"
+        assert _completeness_label(None) == "unavailable"
+        assert _completeness_label(None, none_status="error") == "error"
+        assert _completeness_label("data") == "ok"
 
     @pytest.mark.asyncio
     async def test_rdap_lookup_parses_200_response(self, monkeypatch):

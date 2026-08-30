@@ -1,6 +1,6 @@
 import { useRef } from "react";
 
-const TABS = ["Overview", "Evidence", "Sources", "Enrichment", "Relationships", "Export"] as const;
+const TABS = ["Providers", "Enrichment", "Evidence", "Raw Data", "Relationships", "Export"] as const;
 export type TabName = (typeof TABS)[number];
 
 export default function TabBar({ active, onChange }: { active: TabName; onChange: (tab: TabName) => void }) {
@@ -32,6 +32,7 @@ export default function TabBar({ active, onChange }: { active: TabName; onChange
           onClick={() => onChange(tab)}
           role="tab"
           aria-selected={active === tab}
+          aria-controls="result-panel"
           tabIndex={active === tab ? 0 : -1}
           className={`px-4 py-2 text-sm font-medium transition-colors relative ${
             active === tab

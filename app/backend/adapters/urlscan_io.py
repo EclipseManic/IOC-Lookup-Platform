@@ -3,7 +3,7 @@ import time
 
 import httpx
 
-from app.backend.adapters.base import NormalizedResult, RateLimitConfig, SourceAdapter, is_valid_api_key
+from app.backend.adapters.base import NormalizedResult, RateLimitConfig, SourceAdapter, is_valid_api_key, retry_after_seconds
 from app.backend.config import settings
 from app.backend.logger import get_logger
 
@@ -27,7 +27,7 @@ class UrlScanIOAdapter(SourceAdapter):
             resp = await client.post(
                 "https://urlscan.io/api/v1/scan/",
                 headers={"API-Key": self.api_key, "Content-Type": "application/json"},
-                json={"url": ioc_value, "public": True},
+                json={"url": ioc_value, "public": "on"},
                 timeout=15,
             )
             if resp.status_code in (200, 201):
@@ -68,7 +68,8 @@ class UrlScanIOAdapter(SourceAdapter):
         if resp.status_code == 429:
             return NormalizedResult(
                 ioc=ioc_value, ioc_type=ioc_type, source=self.name,
-                verdict="unknown", tags=["rate_limited"],
+                verdict="unknown", tags=["rate_limited"], http_status=resp.status_code,
+                retry_after_seconds=retry_after_seconds(resp),
             )
         if resp.status_code == 401:
             return NormalizedResult(
@@ -262,4 +263,5 @@ class UrlScanIOAdapter(SourceAdapter):
             source_link=report_url,
             reports_count=total,
             samples=samples[:10],
+            raw_data=data,
         )

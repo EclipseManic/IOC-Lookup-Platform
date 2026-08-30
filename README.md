@@ -25,7 +25,8 @@ IOC coverage, whether it is public or key-backed, and whether its configured
 credential came from `.env` or the process environment. Secret values are never
 returned.
 
-The current source set is 19 providers:
+The current source set includes 21 provider adapters, plus public enrichment
+services used for context:
 
 | Source | Free/public behavior | IOC coverage |
 |---|---|---|
@@ -46,7 +47,7 @@ The current source set is 19 providers:
 | XposedOrNot | Public breach exposure lookup | Email |
 | MalwareBazaar | API key required by the current endpoint | MD5/SHA-1/SHA-256 |
 | ThreatFox | API key required by the current endpoint | IPs, domains, URLs, hashes |
-| VirusTotal, AbuseIPDB, OTX, Tria.ge, Hybrid Analysis, Censys, SecurityTrails, PhishTank, Spur.us | Optional API keys | Type-specific coverage shown in `/api/sources` |
+| VirusTotal, AbuseIPDB, OTX, Tria.ge, Hybrid Analysis, Censys | Optional API keys | Type-specific coverage shown in `/api/sources` |
 
 Public context is not a clean verdict. If no reputation provider covers an IOC,
 the result is explicitly marked as contextual/enrichment-only. Source errors,
@@ -83,7 +84,19 @@ npm run build
 
 ## Configure intelligence sources
 
-Edit `.env` and add only the keys you have. Missing keys do not prevent the application from starting; unavailable adapters are reported as skipped or unknown.
+**Empty `.env` is normal.** This is a single-user local tool — credentials are read from **system environment variables first** (never stored on disk). `.env` is only an optional fallback.
+
+```powershell
+# Recommended: set keys in your shell (PowerShell)
+$env:VT_API_KEY="your_key"; $env:ABUSEIPDB_API_KEY="..."; python run.py
+
+# Alternative: add to .env as literal, ${REF} or bare env-var name
+# VT_API_KEY=actual_key
+# VT_API_KEY=${MY_VT_KEY}
+# VT_API_KEY=my_vt_key   # resolves my_vt_key from system env
+```
+
+Missing keys do not prevent the application from starting; unavailable adapters are reported as skipped or unknown. Check `/api/sources` or the Sources panel to see `credential_source: environment | .env | public_no_key`.
 
 Common variables include:
 
@@ -94,14 +107,32 @@ Common variables include:
 | `URL_SCAN_API_KEY` | urlscan.io |
 | `MB_AUTH_KEY` | MalwareBazaar |
 | `THREATFOX_API_KEY` | ThreatFox |
+| `URLHAUS_API_KEY` | URLhaus |
 | `TRIAGE_API_KEY` | Tria.ge |
 | `HA_API_KEY` | Hybrid Analysis |
 | `GREYNOISE_API_KEY` | GreyNoise |
 | `OTX_API_KEY` | AlienVault OTX |
 | `SHODAN_API_KEY` | Shodan |
-| `SECURITYTRAILS_API_KEY` | SecurityTrails |
 | `CENSYS_API_KEY` | Censys (`ID:secret`) |
 | `IPINFO_API_KEY` | IPinfo |
+
+Credential priority — every API key is resolved as follows:
+1. System environment variable (e.g. `VT_API_KEY`) — always wins, never stored on disk.
+2. `.env` file value, which can be the literal key, an explicit reference (`VT_API_KEY=${MY_VT_KEY}`), or a bare reference to a system env variable (`VT_API_KEY=my_vt_key`).
+
+Additional app-level settings:
+
+| Variable | Purpose |
+|---|---|
+| `API_KEYS` | Only needed if you bind `HOST` outside loopback |
+| `FAIL_FAST_MISSING_KEYS` | Set to `true` to reject startup when required provider keys are missing or placeholders |
+
+Summary:
+
+- 15 third-party provider keys are supported in `app/backend/config.py` (including `EMAILREP_API_KEY`)
+- 1 enrichment-only key is supported: `NVD_API_KEY`
+- Host-artifact types (`mutex`, `named_pipe`, `registry_key`, `service_name`, `ssdeep`) now query Hybrid Analysis / Tria.ge search when keys are present, otherwise show structural enrichment as `context only`.
+- The sample `.env` ships empty — add keys to system env or `.env` as you prefer.
 
 The local SQLite database is stored at `data/ioc_platform.db`. Cached task and adapter data is stored under `.cache/`.
 
@@ -146,4 +177,6 @@ npm run build
 | `POST` | `/api/export/siem` | SIEM export |
 | `GET` | `/api/health` | Local application health |
 
-Interactive API documentation is available at `http://127.0.0.1:8000/docs`.
+Interactive API documentation is available at `http://127.0.0.1:8000/docs` for
+the default loopback configuration. It is disabled automatically when
+`API_KEYS` is configured.

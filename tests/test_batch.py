@@ -1,7 +1,7 @@
 import sys
 sys.path.insert(0, ".")
 
-from app.backend.batch import BatchTask, consolidate_batch_results, parse_csv, parse_json, get_batch_queue
+from app.backend.batch import BatchTask, consolidate_batch_results, normalize_batch_iocs, parse_csv, parse_json, get_batch_queue
 from app.backend.adapters.base import CompositeScore
 from app.backend.pipeline import AnalysisTask
 
@@ -30,7 +30,7 @@ def test_parse_csv_whitespace():
 
 def test_parse_csv_skips_header_row():
     iocs = parse_csv("ioc,verdict,score\n8.8.8.8,clean,0.0\ngoogle.com,unknown,0.1")
-    assert iocs == ["8.8.8.8", "clean", "0.0", "google.com", "unknown", "0.1"]
+    assert iocs == ["8.8.8.8", "google.com"]
 
 
 def test_parse_csv_single_column_header():
@@ -85,6 +85,25 @@ def test_parse_json_mixed_whitespace():
     iocs = parse_json('["  8.8.8.8  ", "google.com"]')
     assert "8.8.8.8" in iocs
     assert "google.com" in iocs
+
+
+def test_normalize_batch_iocs_handles_markdown_and_escaped_values():
+    values = normalize_batch_iocs([
+        "[https://example.com/login](https://example.com/login)",
+        r"test\@example.com",
+        r"attacker\@example.com CVE-2024-3094 T1059.001 AS15169",
+    ])
+    assert "https://example.com/login" in values
+    assert "test@example.com" in values
+    assert "attacker@example.com" in values
+    assert "CVE-2024-3094" in values
+    assert "T1059.001" in values
+    assert "AS15169" in values
+    assert all("[" not in value and "]" not in value for value in values)
+
+
+def test_normalize_batch_iocs_deduplicates_values():
+    assert normalize_batch_iocs(["example.com", "example.com"]) == ["example.com"]
 
 
 def _task(ioc_value, verdict, status="done"):

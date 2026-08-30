@@ -1,18 +1,63 @@
+import logging
 from datetime import datetime
 
 import httpx
 
-from app.backend.adapters.base import NormalizedResult, RateLimitConfig, SourceAdapter, is_valid_api_key
+from app.backend.adapters.base import NormalizedResult, RateLimitConfig, SourceAdapter, is_valid_api_key, retry_after_seconds
 from app.backend.config import settings
+from app.backend.logger import get_logger
+
+logger = get_logger("hybrid_analysis")
 
 
 class HybridAnalysisAdapter(SourceAdapter):
     name = "Hybrid Analysis"
-    supported_types = ["md5", "sha1", "sha256"]
+    supported_types = ["md5", "sha1", "sha256", "mutex", "named_pipe", "registry_key", "service_name", "ssdeep"]
     rate_limit = RateLimitConfig(requests_per_minute=100, requests_per_day=3000)
 
     def __init__(self):
         self.api_key = settings.hybridanalysis_api_key
+
+    async def _search_by_terms(self, client, ioc_value: str, ioc_type: str):
+        """Search Hybrid Analysis by host-artifact terms.
+
+        Uses the documented search/terms endpoint for non-hash IOCs.
+        Returns the first matching report, None for not-found,
+        or sentinel strings "rate_limited", "auth_error", "error" for transient failures.
+        """
+        try:
+            # Map IOC type to search field — Hybrid uses generic term search
+            resp = await client.post(
+                "https://hybrid-analysis.com/api/v2/search/terms",
+                json={"terms": [ioc_value]},
+                headers={
+                    "api-key": self.api_key,
+                    "user-agent": "IOC-Platform/1.0",
+                    "Accept": "application/json",
+                    "Content-Type": "application/json",
+                },
+                timeout=15,
+            )
+            if resp.status_code == 404:
+                return None
+            if resp.status_code == 429:
+                logger.warning("Hybrid Analysis rate limited for %s", ioc_value)
+                return "rate_limited"
+            if resp.status_code in (401, 403):
+                logger.warning("Hybrid Analysis auth failed %s for %s", resp.status_code, ioc_value)
+                return "auth_error"
+            if resp.status_code != 200:
+                logger.warning("Hybrid Analysis search/terms failed %s for %s", resp.status_code, ioc_value)
+                return "error"
+            data = resp.json()
+            # Response is {"result": [...]} or list
+            items = data.get("result", data) if isinstance(data, dict) else data
+            if not isinstance(items, list) or not items:
+                return None
+            return items[0]
+        except Exception as exc:
+            logger.debug("Hybrid Analysis _search_by_terms exception for %s: %s", ioc_value, exc)
+            return "error"
 
     async def lookup(self, ioc_value: str, ioc_type: str) -> NormalizedResult:
         if not is_valid_api_key(self.api_key):
@@ -22,6 +67,54 @@ class HybridAnalysisAdapter(SourceAdapter):
             )
 
         client = self._get_client()
+        # Host-artifact and ssdeep types use term search instead of hash lookup
+        if ioc_type in ("mutex", "named_pipe", "registry_key", "service_name", "ssdeep"):
+            term_result = await self._search_by_terms(client, ioc_value, ioc_type)
+            if term_result == "rate_limited":
+                return NormalizedResult(
+                    ioc=ioc_value, ioc_type=ioc_type, source=self.name,
+                    verdict="unknown", tags=["rate_limited"],
+                )
+            if term_result == "auth_error":
+                return NormalizedResult(
+                    ioc=ioc_value, ioc_type=ioc_type, source=self.name,
+                    verdict="error", tags=["http_401", "auth_error"],
+                )
+            if term_result == "error":
+                return NormalizedResult(
+                    ioc=ioc_value, ioc_type=ioc_type, source=self.name,
+                    verdict="error", tags=["search_error"],
+                )
+            if term_result is None:
+                return NormalizedResult(
+                    ioc=ioc_value, ioc_type=ioc_type, source=self.name,
+                    verdict="unknown", raw_score=0.0, status="not_found",
+                    tags=["term_not_found"],
+                )
+            # Reuse report parsing by wrapping term result as report
+            # Term search returns summary; fetch full report if sha256 available
+            sha = term_result.get("sha256", "")
+            if sha:
+                # Fetch full sample for verdict
+                resp = await client.get(
+                    f"https://hybrid-analysis.com/api/v2/search/hash",
+                    params={"hash": sha},
+                    headers={
+                        "api-key": self.api_key,
+                        "user-agent": "IOC-Platform/1.0",
+                        "Accept": "application/json",
+                    },
+                    timeout=15,
+                )
+                if resp.status_code == 200:
+                    data = resp.json()
+                    if isinstance(data, list) and data:
+                        report = data[0]
+                        # Parse as normal hash result but keep original IOC
+                        return await self._parse_report(report, ioc_value, ioc_type, client)
+            # Fallback: parse term result directly
+            return await self._parse_report(term_result, ioc_value, ioc_type, client)
+
         resp = await client.get(
                 "https://hybrid-analysis.com/api/v2/search/hash",
                 params={"hash": ioc_value},
@@ -41,7 +134,8 @@ class HybridAnalysisAdapter(SourceAdapter):
         if resp.status_code == 429:
             return NormalizedResult(
                 ioc=ioc_value, ioc_type=ioc_type, source=self.name,
-                verdict="unknown", tags=["rate_limited"],
+                verdict="unknown", tags=["rate_limited"], http_status=resp.status_code,
+                retry_after_seconds=retry_after_seconds(resp),
             )
         if resp.status_code != 200:
             return NormalizedResult(
@@ -57,6 +151,9 @@ class HybridAnalysisAdapter(SourceAdapter):
             )
 
         report = data[0]
+        return await self._parse_report(report, ioc_value, ioc_type, client)
+
+    async def _parse_report(self, report: dict, ioc_value: str, ioc_type: str, client) -> NormalizedResult:
         threat_score = report.get("threat_score")
         if threat_score is None:
             threat_score = 0
@@ -161,13 +258,14 @@ class HybridAnalysisAdapter(SourceAdapter):
             mitre_attck=mitre,
             first_seen=self._parse_dt(report.get("analysis_start_time")),
             source_link=f"https://hybrid-analysis.com/sample/{ioc_value}",
-            reports_count=len(data),
+            reports_count=1,
             dropped_files=dropped,
             registry_keys=registry_keys,
             network_iocs=network_iocs,
             process_tree=process_tree or None,
             ssdeep=ssdeep or None,
             tlsh=tlsh or None,
+            raw_data=report,
         )
 
     def _parse_dt(self, val: str) -> datetime | None:

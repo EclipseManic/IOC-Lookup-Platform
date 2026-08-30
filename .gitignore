@@ -36,3 +36,15 @@ ui/tsconfig.tsbuildinfo
 # Planning / working dirs
 .planning/
 undefined/
+
+# Logs & scratch
+*.log
+backend.log
+backend.err.log
+ui/*.log
+temp/
+live_probe_output.json
+
+# Test Artifacts & Screenshots
+ui/e2e-proof/
+ui/qa-shots/

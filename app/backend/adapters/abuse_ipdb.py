@@ -4,7 +4,7 @@ import time
 
 import httpx
 
-from app.backend.adapters.base import NormalizedResult, RateLimitConfig, SourceAdapter, is_valid_api_key
+from app.backend.adapters.base import NormalizedResult, RateLimitConfig, SourceAdapter, is_valid_api_key, retry_after_seconds
 from app.backend.config import settings
 
 
@@ -136,7 +136,8 @@ class AbuseIPDBAdapter(SourceAdapter):
         if resp.status_code == 429:
             return NormalizedResult(
                 ioc=ioc_value, ioc_type=ioc_type, source=self.name,
-                verdict="unknown", tags=["rate_limited"],
+                verdict="unknown", tags=["rate_limited"], http_status=resp.status_code,
+                retry_after_seconds=retry_after_seconds(resp),
             )
         if resp.status_code != 200:
             return NormalizedResult(
@@ -224,6 +225,7 @@ class AbuseIPDBAdapter(SourceAdapter):
             source_link=f"https://www.abuseipdb.com/check/{ioc_value}",
             reports_count=total_reports,
             reports=reports_out,
+            raw_data=data,
         )
 
     def _parse_dt(self, val: str):

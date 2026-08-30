@@ -12,6 +12,7 @@ import httpx
 import mmh3
 
 from app.backend.http_client import get_client as _get_http_client
+from app.backend.config import settings
 from app.backend.logger import get_logger
 
 logger = get_logger("enrichment")
@@ -24,7 +25,6 @@ from app.backend.adapters.base import (
     FaviconInfo,
     GeoIPInfo,
     NormalizedResult,
-    PassiveDNSInfo,
     ReverseDNSInfo,
     SSLInfo,
     SubdomainInfo,
@@ -45,6 +45,7 @@ async def enrich(value: str, ioc_type: str) -> EnrichmentData:
         "cve": enrich_cve,
         "ssdeep": enrich_ssdeep,
         "btc": enrich_btc,
+        "eth": enrich_eth,
         "mitre_attack": enrich_mitre_attack,
         "asn": enrich_asn,
         "mutex": lambda value: enrich_host_artifact(value, "mutex"),
@@ -93,62 +94,42 @@ async def _quick_port_scan(ip: str) -> list[int]:
     return [p for p in results if p is not None]
 
 
-async def _passive_dns(domain: str) -> PassiveDNSInfo | None:
-    from app.backend.adapters.base import is_valid_api_key
-    from app.backend.config import settings
-    try:
-        client = _get_http_client()
-        api_key = settings.securitytrails_api_key
-        if is_valid_api_key(api_key):
-            headers = {"APIKEY": api_key, "Accept": "application/json"}
-            r = await client.get(
-                f"https://api.securitytrails.com/v1/domain/{domain}/history/dns/a",
-                headers=headers, timeout=10,
-            )
-            if r.status_code == 200:
-                data = r.json()
-                records = data.get("records", [])
-                return PassiveDNSInfo(records=records[:50])
-        return None
-    except Exception:
-        return None
+class RDAPNoRecordError(Exception):
+    """The authoritative RDAP registry responded but holds no record for the
+    target. This is a data gap (reported as ``unavailable``), not a failure
+    (reported as ``error``)."""
 
 
-async def _passive_dns_by_ip(ip: str) -> PassiveDNSInfo | None:
-    from app.backend.adapters.base import is_valid_api_key
-    from app.backend.config import settings
-    try:
-        client = _get_http_client()
-        api_key = settings.securitytrails_api_key
-        if is_valid_api_key(api_key):
-            headers = {"APIKEY": api_key, "Accept": "application/json"}
-            r = await client.get(
-                f"https://api.securitytrails.com/v1/domain/list?ip={ip}",
-                headers=headers, timeout=10,
-            )
-            if r.status_code == 200:
-                data = r.json()
-                domains = data.get("domains", [])
-                return PassiveDNSInfo(records=[{"domain": d} for d in domains[:50]])
-        return None
-    except Exception:
-        return None
+def _completeness_label(val, none_status: str = "unavailable") -> str:
+    """Map an enrichment result to an honest completeness status.
+
+    - ``ok``: data was produced.
+    - ``unavailable``: no data exists for this target (no RDAP record, no PTR,
+      HTTP-only site without a certificate) — a data gap, not a bug.
+    - ``error``: the lookup itself failed (timeout, transport, parse).
+    """
+    if isinstance(val, RDAPNoRecordError):
+        return "unavailable"
+    if isinstance(val, Exception):
+        return "error"
+    if val is None:
+        return none_status
+    return "ok"
 
 
 async def enrich_ip(value: str) -> EnrichmentData:
     completeness: dict[str, str] = {}
 
-    geoip, rdns, whois, pdns = await asyncio.gather(
+    geoip, rdns, whois = await asyncio.gather(
         _geoip_ipapi(value),
         _reverse_dns(value),
         _rdap_lookup(value),
-        _passive_dns_by_ip(value),
         return_exceptions=True,
     )
 
-    completeness["geoip"] = "error" if isinstance(geoip, Exception) or geoip is None else "ok"
-    completeness["reverse_dns"] = "error" if isinstance(rdns, Exception) or rdns is None else "ok"
-    completeness["whois"] = "error" if isinstance(whois, Exception) or whois is None else "ok"
+    completeness["geoip"] = _completeness_label(geoip)
+    completeness["reverse_dns"] = _completeness_label(rdns)
+    completeness["whois"] = _completeness_label(whois)
 
     from app.backend.config import settings
     from app.backend.adapters.base import is_valid_api_key
@@ -181,15 +162,11 @@ async def enrich_ip(value: str) -> EnrichmentData:
     geoip_val = geoip if not isinstance(geoip, Exception) else None
     rdns_val = rdns if not isinstance(rdns, Exception) else None
     whois_val = whois if not isinstance(whois, Exception) else None
-    pdns_val = pdns if not isinstance(pdns, Exception) else None
-
-    completeness["passive_dns"] = "ok" if pdns_val and pdns_val.records else "error"
 
     return EnrichmentData(
         geoip=geoip_val,
         reverse_dns=rdns_val,
         whois=whois_val,
-        passive_dns=pdns_val,
         relationships=_rdns_relationships(value, rdns_val) if rdns_val else [],
         completeness=completeness,
         open_ports=open_ports_result if open_ports_result else [],
@@ -199,24 +176,20 @@ async def enrich_ip(value: str) -> EnrichmentData:
 async def enrich_domain(value: str) -> EnrichmentData:
     completeness: dict[str, str] = {}
 
-    whois, dns_records, ssl_info, subdomains, favicon, pdns = await asyncio.gather(
+    whois, dns_records, ssl_info, subdomains, favicon = await asyncio.gather(
         _rdap_lookup(value),
         _dns_lookup(value),
         _ssl_cert(value),
         _crt_sh_subdomains(value),
         _favicon_hash(value),
-        _passive_dns(value),
         return_exceptions=True,
     )
 
-    completeness["whois"] = "error" if isinstance(whois, Exception) or whois is None else "ok"
-    completeness["dns"] = "error" if isinstance(dns_records, Exception) or dns_records is None else "ok"
-    completeness["ssl"] = "error" if isinstance(ssl_info, Exception) or ssl_info is None else "ok"
-    completeness["subdomains"] = "error" if isinstance(subdomains, Exception) or subdomains is None else "ok"
+    completeness["whois"] = _completeness_label(whois)
+    completeness["dns"] = _completeness_label(dns_records, none_status="error")
+    completeness["ssl"] = _completeness_label(ssl_info)
+    completeness["subdomains"] = _completeness_label(subdomains, none_status="not_found")
     completeness["favicon"] = "not_found" if isinstance(favicon, Exception) or favicon is None else "ok"
-
-    pdns_val = pdns if not isinstance(pdns, Exception) else None
-    completeness["passive_dns"] = "ok" if pdns_val and pdns_val.records else "error"
 
     return EnrichmentData(
         whois=whois if not isinstance(whois, Exception) else None,
@@ -224,7 +197,6 @@ async def enrich_domain(value: str) -> EnrichmentData:
         ssl=ssl_info if not isinstance(ssl_info, Exception) else None,
         subdomains=subdomains if not isinstance(subdomains, Exception) else None,
         favicon=favicon if not isinstance(favicon, Exception) else None,
-        passive_dns=pdns_val,
         completeness=completeness,
     )
 
@@ -289,7 +261,29 @@ async def _url_content_preview(url: str) -> dict:
             logger.warning("Blocked unsafe URL enrichment target: %s", url)
             return {}
         client = _get_http_client()
-        r = await client.get(url, timeout=10, follow_redirects=True)
+        # SSRF-safe manual redirect handling (validate each hop)
+        r = None
+        current = url
+        seen_urls = set()
+        for _ in range(6):
+            if not await _is_public_fetch_target(current):
+                logger.warning("Blocked unsafe URL enrichment target: %s", current)
+                return {}
+            if current in seen_urls:
+                break
+            seen_urls.add(current)
+            r = await client.get(current, timeout=10, follow_redirects=False)
+            if r.status_code in (301, 302, 303, 307, 308):
+                loc = r.headers.get("Location", "")
+                if loc:
+                    from urllib.parse import urljoin
+                    nxt = urljoin(current, loc)
+                    if nxt not in seen_urls:
+                        current = nxt
+                        continue
+            break
+        if r is None or r.status_code != 200:
+            return {}
         if r.status_code != 200:
             return {}
         text = r.text
@@ -414,9 +408,8 @@ async def enrich_email(value: str) -> EnrichmentData:
     completeness: dict[str, str] = {}
     domain = value.split("@")[-1] if "@" in value else value
 
-    domain_result, leakcheck, xposed, proxynova, email_sec, dnsbl = await asyncio.gather(
+    domain_result, xposed, proxynova, email_sec, dnsbl = await asyncio.gather(
         _enrich_domain_for_email(domain),
-        _leakcheck_lookup(value),
         _xposedornot_lookup(value),
         _proxynova_comb_lookup(value),
         _email_security(domain),
@@ -426,7 +419,6 @@ async def enrich_email(value: str) -> EnrichmentData:
 
     completeness["domain_extraction"] = "ok" if domain != value else "error"
 
-    completeness["leakcheck"] = "ok" if not isinstance(leakcheck, Exception) and leakcheck is not None else "not_configured"
     completeness["xposedornot"] = "ok" if not isinstance(xposed, Exception) and xposed is not None else "error"
 
     if isinstance(proxynova, Exception) or proxynova is None:
@@ -440,7 +432,7 @@ async def enrich_email(value: str) -> EnrichmentData:
     completeness["dnsbl"] = "ok" if isinstance(dnsbl, list) and dnsbl else "not_found"
 
     # Merge breach results
-    all_sources = [leakcheck, xposed, proxynova]
+    all_sources = [xposed, proxynova]
     all_failed = all(isinstance(r, Exception) or r is None for r in all_sources)
 
     if all_failed:
@@ -566,7 +558,13 @@ async def enrich_cve(value: str) -> EnrichmentData:
             kev_date_added=kev_date,
             epss_score=epss_score,
             epss_percentile=epss_percentile,
+            cvss_score=nvd_data.get("baseScore"),
+            cvss_severity=nvd_data.get("baseSeverity", ""),
             cvss_vector=nvd_data.get("vectorString", ""),
+            vulnerability_status=nvd_data.get("vulnerabilityStatus") or None,
+            published_at=nvd_data.get("publishedAt"),
+            modified_at=nvd_data.get("modifiedAt"),
+            exploit_status="known_exploited" if in_kev else ("reported" if exploit_list or poc_list else "unknown"),
             cwe=nvd_data.get("cwe", []),
             references=nvd_data.get("references", []),
             public_exploits_exist=len(exploit_list) > 0,
@@ -638,6 +636,56 @@ async def enrich_btc(value: str) -> EnrichmentData:
     except Exception as exc:
         logger.debug("Bitcoin enrichment failed for %s: %s", value, exc)
         return EnrichmentData(completeness={"blockchain_address": "error"})
+
+
+async def enrich_eth(value: str) -> EnrichmentData:
+    """Fetch lightweight Ethereum wallet context for the enrichment tab."""
+    from app.backend.adapters.base import is_valid_api_key
+
+    if not is_valid_api_key(settings.etherscan_api_key):
+        return EnrichmentData(
+            completeness={"ethereum_address": "not_configured"},
+            analysis_notes=["Ethereum balance enrichment requires ETHERSCAN_API_KEY; provider results may still be available."],
+        )
+    try:
+        client = _get_http_client()
+        common = {"address": value, "apikey": settings.etherscan_api_key}
+        balance_response, tx_response = await asyncio.gather(
+            client.get(
+                "https://api.etherscan.io/api",
+                params={"module": "account", "action": "balance", **common}, timeout=15,
+            ),
+            client.get(
+                "https://api.etherscan.io/api",
+                params={"module": "account", "action": "txlist", "startblock": 0, "endblock": 99999999, "page": 1, "offset": 25, "sort": "desc", **common},
+                timeout=15,
+            ),
+            return_exceptions=True,
+        )
+        balance = balance_response.json() if not isinstance(balance_response, Exception) and balance_response.status_code == 200 else {}
+        transactions_payload = tx_response.json() if not isinstance(tx_response, Exception) and tx_response.status_code == 200 else {}
+        transactions = transactions_payload.get("result", []) if isinstance(transactions_payload, dict) else []
+        transactions = [tx for tx in transactions if isinstance(tx, dict)] if isinstance(transactions, list) else []
+        balance_wei = balance.get("result", "0") if isinstance(balance, dict) else "0"
+        try:
+            balance_eth = int(balance_wei) / 10**18
+        except (TypeError, ValueError):
+            balance_eth = 0.0
+        return EnrichmentData(
+            completeness={"ethereum_address": "ok" if balance or transactions else "not_found"},
+            extra={"ethereum": {
+                "address": value,
+                "balance_eth": balance_eth,
+                "transaction_count": len(transactions),
+                "recent_transactions": [
+                    {"hash": tx.get("hash"), "value_eth": (int(tx.get("value", 0) or 0) / 10**18), "time": tx.get("timeStamp")}
+                    for tx in transactions[:5]
+                ],
+            }},
+        )
+    except Exception as exc:
+        logger.debug("Ethereum enrichment failed for %s: %s", value, exc)
+        return EnrichmentData(completeness={"ethereum_address": "error"})
 
 
 async def enrich_asn(value: str) -> EnrichmentData:
@@ -845,6 +893,8 @@ async def _rdap_lookup(target: str) -> WhoisInfo | None:
             return await _whois_fallback(target)
         c = _get_http_client()
         r = await c.get(url, timeout=8)
+        if r.status_code == 404 and _is_ip(target):
+            raise RDAPNoRecordError(target)
         if r.status_code != 200:
             return await _whois_fallback(target)
         d = r.json()
@@ -859,6 +909,8 @@ async def _rdap_lookup(target: str) -> WhoisInfo | None:
             abuse_email=_extract_abuse_email(d),
             org=d.get("name", d.get("handle", "")),
         )
+    except RDAPNoRecordError:
+        raise
     except Exception:
         return await _whois_fallback(target)
 
@@ -1325,81 +1377,27 @@ async def _nvd_cve(cve_id: str) -> dict:
 
         return {
             "vectorString": cvss_data.get("vectorString", ""),
+            "baseScore": cvss_data.get("baseScore"),
+            "baseSeverity": cvss_data.get("baseSeverity", ""),
+            "cvssBreakdown": cvss_data,
             "cwe": cwe_list,
             "references": refs,
+            "vulnerabilityStatus": cve_data.get("vulnStatus", ""),
+            "publishedAt": cve_data.get("published"),
+            "modifiedAt": cve_data.get("lastModified"),
         }
     except Exception:
         return {}
 
 
-# ─── 5a. LeakCheck (primary — API key required) ────
+# ─── 5. XposedOrNot (free, no key — rate-limited, now parallel-safe) ─
 
 
-async def _leakcheck_lookup(email: str) -> BreachInfo | None:
-    from app.backend.adapters.base import is_valid_api_key
-    from app.backend.config import settings
-
-    if not is_valid_api_key(settings.leakcheck_api_key):
-        return None
-    try:
-        c = _get_http_client()
-        r = await c.get(
-            f"https://leakcheck.io/api/v2/query/{email}",
-            headers={
-                "X-API-Key": settings.leakcheck_api_key,
-                "Accept": "application/json",
-            },
-        )
-        if r.status_code in (401, 403):
-            return None
-        if r.status_code == 404:
-            return BreachInfo(breach_count=0, breach_names=[])
-        if r.status_code == 429:
-            return None
-        if r.status_code != 200:
-            return None
-        data = r.json()
-        if not data.get("success"):
-            return None
-        found = data.get("found", 0)
-        rows = data.get("result", [])
-        names: list[str] = []
-        dates: list[str] = []
-        fields: set[str] = set()
-        for row in rows:
-            src = row.get("source", {})
-            name = src.get("name", "")
-            if name:
-                names.append(name)
-            d = src.get("breach_date", "")
-            if d:
-                dates.append(d)
-            for f in row.get("fields", []):
-                if isinstance(f, str):
-                    fields.add(f)
-        dates.sort(reverse=True)
-        return BreachInfo(
-            breach_count=found,
-            breach_names=names[:50],
-            most_recent_breach=dates[0] if dates else "",
-            exposed_data_types=sorted(fields),
-            source="leakcheck",
-        )
-    except httpx.TimeoutException:
-        return None
-    except Exception:
-        return None
-
-
-# ─── 5b. XposedOrNot (free, no key — rate-limited) ─
-
-
-_xon_semaphore = asyncio.Semaphore(1)
+_xon_semaphore = asyncio.Semaphore(5)
 
 
 async def _xposedornot_lookup(email: str) -> BreachInfo | None:
     async with _xon_semaphore:
-        await asyncio.sleep(0.5)
         for attempt in range(3):
             try:
                 c = _get_http_client()
@@ -1457,16 +1455,20 @@ async def _xposedornot_lookup(email: str) -> BreachInfo | None:
     return None
 
 
-# ─── 5c. ProxyNova Comb (best-effort, undocumented) ─
+# ─── 5c. ProxyNova Comb (best-effort fallback, unofficial — 5s timeout + label) ─
 
 
 async def _proxynova_comb_lookup(email: str) -> BreachInfo | None:
-    """Unofficial ProxyNova Comb endpoint. Undocumented, unstable — best-effort only."""
+    """Unofficial ProxyNova Comb endpoint. Best-effort fallback only — 5s timeout.
+
+    Marked as proxynova_comb_unofficial so UI can label it stale/unofficial.
+    """
     try:
         c = _get_http_client()
         r = await c.post(
             "https://proxynova.com/tools/comb/",
             data={"email": email},
+            timeout=5,
         )
         if r.status_code != 200:
             return None
@@ -1546,31 +1548,20 @@ async def _email_security(domain: str) -> EmailSecurityInfo | None:
 
 
 def normalize_cve_enrichment(cve: CVEInfo, cve_id: str) -> NormalizedResult:
-    raw_score = 0.0
+    # Enrichment is a vulnerability observation.  EPSS/KEV/CVSS are never
+    # converted into a reputation verdict here; the vulnerability assessor
+    # consumes the typed fields below.
+    raw_score = None
     verdict = "unknown"
-    confidence = "low"
+    confidence = "high" if (cve.cvss_score is not None or cve.epss_score is not None or cve.is_in_kev) else "low"
     tags: list[str] = []
 
     if cve.is_in_kev:
-        raw_score = 1.0
-        verdict = "malicious"
-        confidence = "high"
         tags.append("cisa_kev")
         if cve.kev_date_added:
             tags.append(f"kev_added:{cve.kev_date_added}")
 
-    epss_weight = (cve.epss_score or 0) * 0.7
-    if not cve.is_in_kev and (cve.epss_score or 0) > 0:
-        raw_score = min(round(epss_weight + 0.1, 4), 1.0)
-        if (cve.epss_score or 0) >= 0.1:
-            verdict = "malicious"
-            confidence = "high"
-        elif (cve.epss_score or 0) >= 0.01:
-            verdict = "suspicious"
-            confidence = "medium"
-        else:
-            verdict = "unknown"
-            confidence = "low"
+    if (cve.epss_score or 0) > 0:
         if (cve.epss_percentile or 0) > 0:
             tags.append(f"epss_p{int((cve.epss_percentile or 0) * 100)}")
 
@@ -1591,18 +1582,44 @@ def normalize_cve_enrichment(cve: CVEInfo, cve_id: str) -> NormalizedResult:
 
     categories = [w.split(":")[-1].strip() if ":" in w else w for w in cve.cwe if w]
 
-    if not cve.is_in_kev and (cve.epss_score or 0) == 0 and not cve.cvss_vector:
-        raw_score = 0.0
-        verdict = "unknown"
-
     return NormalizedResult(
         ioc=cve_id,
         ioc_type="cve",
         source="CVE",
         verdict=verdict,
+        assessment_domain="vulnerability",
+        provider_verdict="vulnerability_record",
+        normalized_verdict="unknown",
         raw_score=raw_score,
         confidence=confidence,
         tags=tags,
         categories=categories,
         source_link=f"https://nvd.nist.gov/vuln/detail/{cve_id}",
+        vulnerability_status=cve.vulnerability_status,
+        severity=(cve.cvss_severity or "informational").lower(),
+        cvss_score=cve.cvss_score,
+        cvss_vector=cve.cvss_vector or None,
+        epss_score=cve.epss_score,
+        cwe=list(cve.cwe),
+        affected_products=list(cve.affected_products),
+        published_at=cve.published_at,
+        modified_at=cve.modified_at,
+        exploit_status="known_exploited" if cve.is_in_kev else cve.exploit_status,
+        references=list(cve.references),
+        source_record_id=cve_id,
+        source_independence_group="cve_record",
+        raw_data={
+            "cve_id": cve_id,
+            "vulnerability_status": cve.vulnerability_status,
+            "severity": (cve.cvss_severity or "informational").lower(),
+            "cvss_score": cve.cvss_score,
+            "cvss_vector": cve.cvss_vector,
+            "epss_score": cve.epss_score,
+            "cwe": list(cve.cwe),
+            "affected_products": list(cve.affected_products),
+            "published_at": cve.published_at,
+            "modified_at": cve.modified_at,
+            "exploit_status": "known_exploited" if cve.is_in_kev else cve.exploit_status,
+            "references": list(cve.references),
+        },
     )

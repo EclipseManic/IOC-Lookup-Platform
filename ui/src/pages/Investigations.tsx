@@ -2,6 +2,7 @@ import { useCallback, useEffect, useState } from "react";
 import Modal from "../components/Modal";
 import Tag from "../components/Tag";
 import { showToast } from "../components/Toast";
+import { timeAgo } from "../lib/timeAgo";
 import type { InvestigationDetail, InvestigationSummary } from "../services/api";
 import {
   addIOCToInvestigation,
@@ -29,7 +30,7 @@ function InvestigationCard({ inv, onClick }: { inv: InvestigationSummary; onClic
         <p className="text-xs text-text-secondary line-clamp-2 mb-2">{inv.description}</p>
       )}
       <p className="text-[10px] text-text-secondary">
-        Updated {new Date(inv.updated_at).toLocaleDateString()}
+        Updated {timeAgo(inv.updated_at)}
       </p>
     </button>
   );
@@ -52,9 +53,10 @@ function NoteEditor({
         onChange={(e) => setText(e.target.value)}
         className="w-full h-20 px-3 py-2 bg-bg-elevated border border-border rounded text-xs font-mono text-text-primary outline-none focus:border-accent resize-none"
         placeholder="Add notes..."
+        aria-label="Investigation notes"
       />
       <div className="flex gap-2">
-        <button onClick={() => onSave(text)} className="px-3 py-1 text-xs bg-accent text-white rounded hover:bg-accent/90 transition-colors">Save</button>
+        <button onClick={() => onSave(text)} className="px-3 py-1 text-xs bg-accent text-[#06070d] rounded hover:bg-accent/90 transition-colors">Save</button>
         <button onClick={onCancel} className="px-3 py-1 text-xs bg-bg-elevated border border-border rounded text-text-secondary hover:text-text-primary transition-colors">Cancel</button>
       </div>
     </div>
@@ -65,12 +67,14 @@ export default function Investigations() {
   const [view, setView] = useState<View>("list");
   const [investigations, setInvestigations] = useState<InvestigationSummary[]>([]);
   const [detail, setDetail] = useState<InvestigationDetail | null>(null);
+  const [detailLoading, setDetailLoading] = useState(false);
   const [loading, setLoading] = useState(true);
   const [showCreate, setShowCreate] = useState(false);
   const [createName, setCreateName] = useState("");
   const [createDesc, setCreateDesc] = useState("");
   const [addIOCValue, setAddIOCValue] = useState("");
   const [editingNotes, setEditingNotes] = useState<number | null>(null);
+  const [confirmDelete, setConfirmDelete] = useState(false);
 
   const loadList = useCallback(async () => {
     setLoading(true);
@@ -100,6 +104,7 @@ export default function Investigations() {
   }
 
   async function openDetail(id: number) {
+    setDetailLoading(true);
     try {
       const data = await getInvestigation(id);
       setDetail(data);
@@ -107,6 +112,7 @@ export default function Investigations() {
     } catch (e: any) {
       showToast(e.message, "error");
     }
+    setDetailLoading(false);
   }
 
   async function handleDelete(id: number) {
@@ -159,9 +165,24 @@ export default function Investigations() {
     }
   }
 
+  if (detailLoading) {
+    return (
+      <div className="page-enter">
+        <div className="h-4 w-24 bg-bg-elevated rounded animate-pulse mb-4" />
+        <div className="h-20 bg-bg-card border border-border rounded-lg animate-pulse mb-4" />
+        <div className="h-10 bg-bg-card border border-border rounded-lg animate-pulse mb-4" />
+        <div className="space-y-2">
+          {[0, 1, 2].map((n) => (
+            <div key={n} className="h-16 bg-bg-card border border-border rounded-lg animate-pulse" />
+          ))}
+        </div>
+      </div>
+    );
+  }
+
   if (view === "detail" && detail) {
     return (
-      <div>
+      <div className="page-enter">
         <button
           onClick={() => { setView("list"); setDetail(null); }}
           className="flex items-center gap-1 text-xs text-text-secondary hover:text-text-primary mb-4 transition-colors"
@@ -180,11 +201,11 @@ export default function Investigations() {
             </div>
             <div className="flex gap-2">
               <span className="text-xs font-mono text-text-secondary">{detail.iocs.length} IOCs</span>
-              <button onClick={() => handleDelete(detail.id)} className="text-xs text-verdict-malicious hover:underline">Delete</button>
+              <button onClick={() => setConfirmDelete(true)} className="text-xs text-verdict-malicious hover:underline">Delete</button>
             </div>
           </div>
           <p className="text-[10px] text-text-secondary">
-            Created {new Date(detail.created_at).toLocaleString()} · Updated {new Date(detail.updated_at).toLocaleString()}
+            Created {timeAgo(detail.created_at)} · Updated {timeAgo(detail.updated_at)}
           </p>
         </div>
 
@@ -195,12 +216,13 @@ export default function Investigations() {
             onChange={(e) => setAddIOCValue(e.target.value)}
             onKeyDown={(e) => e.key === "Enter" && handleAddIOC()}
             placeholder="Add IOC (IP, domain, hash, URL, email, CVE)..."
+            aria-label="IOC value to add"
             className="flex-1 px-3 py-2 bg-bg-card border border-border rounded-lg text-text-primary placeholder-text-secondary outline-none focus:border-accent focus:ring-1 focus:ring-accent text-sm font-mono"
           />
           <button
             onClick={handleAddIOC}
             disabled={!addIOCValue.trim()}
-            className="px-4 py-2 bg-accent text-white text-sm rounded-lg hover:bg-accent/90 disabled:opacity-40 disabled:cursor-not-allowed transition-colors"
+            className="px-4 py-2 bg-accent text-[#06070d] text-sm rounded-lg hover:bg-accent/90 disabled:opacity-40 disabled:cursor-not-allowed transition-colors"
           >
             Add
           </button>
@@ -231,7 +253,7 @@ export default function Investigations() {
                         </span>
                       )}
                       {entry.looked_up_at && (
-                        <span className="text-text-secondary">{new Date(entry.looked_up_at).toLocaleDateString()}</span>
+                        <span className="text-text-secondary" title={new Date(entry.looked_up_at).toLocaleString()}>{timeAgo(entry.looked_up_at)}</span>
                       )}
                     </div>
                   </div>
@@ -266,12 +288,23 @@ export default function Investigations() {
             ))}
           </div>
         )}
+        <Modal open={confirmDelete} onClose={() => setConfirmDelete(false)} title="Delete investigation">
+          <p className="text-sm text-text-secondary mb-4">Delete "{detail.name}" and its {detail.iocs.length} IOCs? This cannot be undone.</p>
+          <div className="flex justify-end gap-2">
+            <button onClick={() => setConfirmDelete(false)} className="px-4 py-2 text-xs bg-bg-elevated border border-border rounded-lg text-text-secondary hover:text-text-primary transition-colors">
+              Cancel
+            </button>
+            <button onClick={() => { setConfirmDelete(false); handleDelete(detail.id); }} className="px-4 py-2 text-xs bg-verdict-malicious text-white rounded-lg hover:bg-verdict-malicious/90 transition-colors">
+              Delete
+            </button>
+          </div>
+        </Modal>
       </div>
     );
   }
 
   return (
-    <div>
+    <div className="page-enter">
       <div className="flex items-center justify-between mb-6">
         <div>
           <h2 className="text-lg font-bold">Investigations</h2>
@@ -279,7 +312,7 @@ export default function Investigations() {
         </div>
         <button
           onClick={() => setShowCreate(true)}
-          className="px-4 py-2 bg-accent text-white text-sm rounded-lg hover:bg-accent/90 transition-colors font-medium"
+          className="px-4 py-2 bg-accent text-[#06070d] text-sm rounded-lg hover:bg-accent/90 transition-colors font-medium"
         >
           New Investigation
         </button>
@@ -336,7 +369,7 @@ export default function Investigations() {
           </div>
           <div className="flex justify-end gap-2">
             <button onClick={() => setShowCreate(false)} className="px-4 py-2 text-sm text-text-secondary hover:text-text-primary transition-colors">Cancel</button>
-            <button onClick={handleCreate} disabled={!createName.trim()} className="px-4 py-2 bg-accent text-white text-sm rounded-lg hover:bg-accent/90 disabled:opacity-40 transition-colors">Create</button>
+            <button onClick={handleCreate} disabled={!createName.trim()} className="px-4 py-2 bg-accent text-[#06070d] text-sm rounded-lg hover:bg-accent/90 disabled:opacity-40 transition-colors">Create</button>
           </div>
         </div>
       </Modal>

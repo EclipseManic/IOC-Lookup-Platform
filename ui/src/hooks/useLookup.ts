@@ -1,6 +1,6 @@
-import { useCallback, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import type { LookupResponse, StageInfo, TaskResponse } from "../services/api";
-import { ApiError, getTaskResult, getTaskStatus, lookupIOC } from "../services/api";
+import { ApiError, getTaskResult, getTaskStatus, lookupIOC, saveLookup } from "../services/api";
 
 export type LookupState =
   | { status: "idle" }
@@ -19,10 +19,12 @@ export function useLookup() {
     }
   }, []);
 
-  const submit = useCallback(async (value: string, iocType?: string) => {
+  useEffect(() => () => stopPolling(), [stopPolling]);
+
+  const submit = useCallback(async (value: string, iocType?: string, refresh = false) => {
     stopPolling();
     try {
-      const task: TaskResponse = await lookupIOC(value, iocType);
+      const task: TaskResponse = await lookupIOC(value, iocType, { refresh });
       const taskId = task.task_id;
       setState({
         status: "loading",
@@ -36,6 +38,9 @@ export function useLookup() {
           const result = await getTaskResult(taskId);
           stopPolling();
           setState({ status: "done", result });
+          saveLookup(result.normalized ?? value, iocType, taskId).catch((e) => {
+            console.debug("saveLookup failed", e);
+          });
         } catch (e: unknown) {
           if (e instanceof ApiError && e.status === 425) {
             try {

@@ -1,10 +1,9 @@
 import base64
 from datetime import datetime
-import hashlib
 
 import httpx
 
-from app.backend.adapters.base import NormalizedResult, RateLimitConfig, SourceAdapter, is_valid_api_key
+from app.backend.adapters.base import NormalizedResult, RateLimitConfig, SourceAdapter, is_valid_api_key, retry_after_seconds
 from app.backend.config import settings
 
 
@@ -43,22 +42,29 @@ class VirusTotalAdapter(SourceAdapter):
         if resp.status_code == 401:
             return NormalizedResult(
                 ioc=ioc_value, ioc_type=ioc_type, source=self.name,
-                verdict="error", tags=["invalid_api_key"],
+                verdict="error", tags=["invalid_api_key"], http_status=resp.status_code,
             )
-        if resp.status_code in (400, 404):
+        if resp.status_code == 400:
             return NormalizedResult(
                 ioc=ioc_value, ioc_type=ioc_type, source=self.name,
-                verdict="unknown", raw_score=0.0, status="not_found",
+                verdict="unknown", tags=["invalid_request"], status="error",
+                http_status=resp.status_code,
+            )
+        if resp.status_code == 404:
+            return NormalizedResult(
+                ioc=ioc_value, ioc_type=ioc_type, source=self.name,
+                verdict="unknown", raw_score=0.0, status="not_found", http_status=resp.status_code,
             )
         if resp.status_code == 429:
             return NormalizedResult(
                 ioc=ioc_value, ioc_type=ioc_type, source=self.name,
-                verdict="unknown", tags=["rate_limited"],
+                verdict="unknown", tags=["rate_limited"], http_status=resp.status_code,
+                retry_after_seconds=retry_after_seconds(resp),
             )
         if resp.status_code != 200:
             return NormalizedResult(
                 ioc=ioc_value, ioc_type=ioc_type, source=self.name,
-                verdict="error", raw_score=0.0, tags=[f"http_{resp.status_code}"],
+                verdict="error", raw_score=0.0, tags=[f"http_{resp.status_code}"], http_status=resp.status_code,
             )
 
         data = resp.json()
@@ -81,6 +87,7 @@ class VirusTotalAdapter(SourceAdapter):
         score = ratio
         confidence = "high" if malicious >= 5 else "medium" if malicious > 0 else "low"
         raw_data = {
+            "api_response": data,
             "detection_ratio": f"{malicious}/{total}",
             "malicious": malicious,
             "suspicious": suspicious,
@@ -186,10 +193,13 @@ class VirusTotalAdapter(SourceAdapter):
             related_iocs=related,
             source_link=f"https://www.virustotal.com/gui/{self._url_type(ioc_type)}/{ioc_value}",
             reports_count=malicious,
+            detection_count=malicious,
+            total_engines=total,
             first_seen=first_seen,
             last_seen=last_seen,
             samples=samples,
             raw_data=raw_data,
+            http_status=resp.status_code,
         )
 
     def _endpoint(self, value: str, ioc_type: str) -> str:
@@ -201,7 +211,9 @@ class VirusTotalAdapter(SourceAdapter):
             "ipv4": f"{base}/ip_addresses/{value}",
             "ipv6": f"{base}/ip_addresses/{value}",
             "domain": f"{base}/domains/{value}",
-            "url": f"{base}/urls/{base64.urlsafe_b64encode(hashlib.sha256(value.encode()).digest()).decode().rstrip('=')}",
+            # VirusTotal URL objects use URL-safe base64 of the URL itself,
+            # without padding, rather than a hash of the URL.
+            "url": f"{base}/urls/{base64.urlsafe_b64encode(value.encode()).decode().rstrip('=')}",
         }
         return mapping.get(ioc_type, "")
 

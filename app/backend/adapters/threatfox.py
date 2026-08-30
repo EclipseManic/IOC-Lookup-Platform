@@ -4,8 +4,38 @@ import re
 
 import httpx
 
-from app.backend.adapters.base import NormalizedResult, RateLimitConfig, SourceAdapter, is_valid_api_key
+from app.backend.adapters.base import NormalizedResult, RateLimitConfig, SourceAdapter, is_valid_api_key, retry_after_seconds
 from app.backend.config import settings
+
+# F1 quality gate: submissions that carry junk/test markers are excluded from
+# evidence. ThreatFox allows test submissions and low-trust reporters to tag
+# entries; treating them as full-strength malicious evidence caused false
+# positives on legitimate domains (e.g. example.com flagged by a "test" entry).
+_JUNK_TAG_MARKERS = (
+    "test", "testing", "benign", "joke", "canary", "sandbox",
+    "falsepositive", "false_positive", "poc", "demo", "sample",
+)
+_JUNK_REPORTERS = ("lenny_3bo", "test", "tester", "junk")
+_MIN_CONFIDENCE_LEVEL = 50
+
+
+def _is_junk_entry(entry: dict) -> bool:
+    tags = entry.get("tags", "")
+    if isinstance(tags, str):
+        tag_list = [t.strip().lower() for t in tags.split(",") if t.strip()]
+    elif isinstance(tags, list):
+        tag_list = [str(t).strip().lower() for t in tags]
+    else:
+        tag_list = []
+    if any(marker in tag for tag in tag_list for marker in _JUNK_TAG_MARKERS):
+        return True
+    reporter = str(entry.get("reporter", "")).lower()
+    if any(r in reporter for r in _JUNK_REPORTERS):
+        return True
+    confidence = entry.get("confidence_level")
+    if isinstance(confidence, (int, float)) and confidence < _MIN_CONFIDENCE_LEVEL:
+        return True
+    return False
 
 
 class ThreatFoxAdapter(SourceAdapter):
@@ -33,7 +63,8 @@ class ThreatFoxAdapter(SourceAdapter):
         if resp.status_code == 429:
             return NormalizedResult(
                 ioc=ioc_value, ioc_type=ioc_type, source=self.name,
-                verdict="unknown", tags=["rate_limited"],
+                verdict="unknown", tags=["rate_limited"], http_status=resp.status_code,
+                retry_after_seconds=retry_after_seconds(resp),
             )
         if resp.status_code != 200:
             return NormalizedResult(
@@ -69,12 +100,17 @@ class ThreatFoxAdapter(SourceAdapter):
         all_mitre = set()
         categories = set()
         all_reporters = set()
-        iocs_count = len(entries)
 
         max_confidence = 0
+        kept = 0
+        junk_skipped = 0
         for entry in entries:
             if not isinstance(entry, dict):
                 continue
+            if _is_junk_entry(entry):
+                junk_skipped += 1
+                continue
+            kept += 1
             confidence_level = entry.get("confidence_level", 0)
             if isinstance(confidence_level, (int, float)) and confidence_level > max_confidence:
                 max_confidence = confidence_level
@@ -145,13 +181,25 @@ class ThreatFoxAdapter(SourceAdapter):
             if re.match(r"^(TA\d{4}|T\d{4}(\.\d{3})?)$", tag, re.IGNORECASE):
                 all_mitre.add(tag.upper())
 
+        if kept == 0:
+            return NormalizedResult(
+                ioc=ioc_value,
+                ioc_type=ioc_type,
+                source=self.name,
+                verdict="unknown",
+                raw_score=0.0,
+                status="not_found",
+                tags=[f"filtered_junk_entries:{junk_skipped}"],
+                reports_count=0,
+            )
+
         confidence_factor = max_confidence / 100.0 if max_confidence > 0 else 1.0
         return NormalizedResult(
             ioc=ioc_value,
             ioc_type=ioc_type,
             source=self.name,
             verdict="malicious",
-            confidence="high" if iocs_count > 2 else "medium",
+            confidence="high" if kept > 2 else "medium",
             raw_score=confidence_factor,
             tags=sorted(all_tags),
             categories=sorted(categories),
@@ -161,7 +209,8 @@ class ThreatFoxAdapter(SourceAdapter):
             last_seen=last,
             related_iocs=related,
             source_link=next(iter(refs), None) or f"https://threatfox.abuse.ch/browse.php?search={ioc_value}",
-            reports_count=iocs_count,
+            reports_count=kept,
+            raw_data=data,
         )
 
     def _parse_dt(self, val: str) -> datetime | None:

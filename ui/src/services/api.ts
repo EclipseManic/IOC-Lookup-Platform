@@ -17,13 +17,27 @@ interface RequestOptions extends RequestInit {
   timeoutMs?: number;
 }
 
+/** Add the optional deployment API key to every browser-originated API call. */
+export function apiHeaders(headers: HeadersInit = {}): Headers {
+  const result = new Headers(headers);
+  const apiKey = import.meta.env.VITE_API_KEY?.trim();
+  if (apiKey && !result.has("X-API-Key")) {
+    result.set("X-API-Key", apiKey);
+  }
+  return result;
+}
+
 async function request<T>(path: string, options: RequestOptions = {}): Promise<T> {
   const { timeoutMs = DEFAULT_TIMEOUT_MS, ...init } = options;
   const controller = new AbortController();
   const timer = window.setTimeout(() => controller.abort(), timeoutMs);
 
   try {
-    const res = await fetch(`${API_BASE}${path}`, { ...init, signal: controller.signal });
+    const res = await fetch(`${API_BASE}${path}`, {
+      ...init,
+      headers: apiHeaders(init.headers),
+      signal: controller.signal,
+    });
     if (!res.ok) {
       let detail: string | undefined;
       try {
@@ -65,11 +79,36 @@ export interface TaskResponse {
 export interface NormalizedResult {
   ioc: string;
   ioc_type: string;
+  assessment_domain?: string;
+  domain_classification?: string | null;
   source: string;
   verdict: string;
   status: string;
+  execution_state: string;
+  provider_verdict?: string | null;
+  normalized_verdict?: string;
   raw_score: number | null;
   confidence: string;
+  detection_count?: number | null;
+  total_engines?: number | null;
+  cached?: boolean;
+  cache_age?: number | null;
+  observed_at?: string | null;
+  expires_at?: string | null;
+  source_timestamp?: string | null;
+  cache_status?: string;
+  cache_key?: string | null;
+  cache_created_at?: string | null;
+  retrieved_at?: string | null;
+  freshness_class?: string | null;
+  stale?: boolean;
+  latency_ms?: number | null;
+  queue_wait_ms?: number;
+  network_latency_ms?: number | null;
+  retry_count?: number;
+  http_status?: number | null;
+  retry_after_seconds?: number | null;
+  request_made?: boolean;
   tags: string[];
   categories: string[];
   malware_family?: string;
@@ -81,6 +120,25 @@ export interface NormalizedResult {
   reports_count?: number;
   reports?: Record<string, unknown>[];
   raw_data?: Record<string, unknown>;
+  provider_summary?: string;
+  evidence_items?: Record<string, unknown>[];
+  provenance_family?: string | null;
+  source_record_id?: string | null;
+  record_fingerprint?: string | null;
+  source_independence_group?: string | null;
+  evidence_hash?: string | null;
+  duplicate_of?: string | null;
+  vulnerability_status?: string | null;
+  severity?: string | null;
+  cvss_score?: number | null;
+  cvss_vector?: string | null;
+  epss_score?: number | null;
+  cwe?: string[];
+  affected_products?: string[];
+  published_at?: string | null;
+  modified_at?: string | null;
+  exploit_status?: string | null;
+  references?: string[];
   samples?: string[];
   dropped_files?: string[];
   registry_keys?: string[];
@@ -150,6 +208,8 @@ export interface CVEInfo {
   kev_date_added: string;
   epss_score?: number;
   epss_percentile?: number;
+  cvss_score?: number;
+  cvss_severity?: string;
   cvss_vector: string;
   cvss_attack_vector: string;
   cvss_complexity: string;
@@ -161,6 +221,11 @@ export interface CVEInfo {
   exploit_sources: string[];
   poc_available: boolean;
   affected_products: string[];
+  cvss_breakdown?: Record<string, unknown>;
+  vulnerability_status?: string | null;
+  published_at?: string | null;
+  modified_at?: string | null;
+  exploit_status?: string | null;
 }
 
 export interface BreachInfo {
@@ -217,6 +282,144 @@ export interface CompositeScore {
   confidence: string;
   sources_contributing: number;
   source_breakdown: SourceWeight[];
+  malicious_sources?: number;
+  suspicious_sources?: number;
+  clean_sources?: number;
+  agreement?: number;
+}
+
+export interface CacheMetadata {
+  cached: boolean;
+  cache_age?: number | null;
+  observed_at?: string | null;
+  expires_at?: string | null;
+  source_timestamp?: string | null;
+  status: string;
+}
+
+export interface EvidenceObservation {
+  source: string;
+  status: string;
+  execution_state: string;
+  provider_verdict?: string | null;
+  normalized_verdict?: string;
+  assessment_domain?: string;
+  verdict: string;
+  role: string;
+  evidence_class: string;
+  weight: number;
+  normalized_signal: number;
+  contribution: string;
+  confidence: string;
+  reason: string;
+  detection_count?: number | null;
+  total_engines?: number | null;
+  cached?: boolean;
+  cache_age?: number | null;
+  observed_at?: string | null;
+  expires_at?: string | null;
+  source_timestamp?: string | null;
+  cache_status?: string;
+  freshness_class?: string;
+  stale?: boolean;
+  latency_ms?: number | null;
+  retry_count?: number;
+  http_status?: number | null;
+  retry_after_seconds?: number | null;
+  request_made?: boolean;
+  cache_metadata?: CacheMetadata;
+  reports_count?: number | null;
+  malware_family?: string | null;
+  tags: string[];
+  categories: string[];
+  provenance?: string | null;
+  evidence_hash?: string | null;
+  source_record_id?: string | null;
+  provenance_family?: string | null;
+  source_independence_group?: string | null;
+  duplicate_of?: string | null;
+  evidence_items?: Record<string, unknown>[];
+  metadata: Record<string, unknown>;
+}
+
+export interface IOCAssessment {
+  ioc: string;
+  normalized_ioc?: string | null;
+  ioc_type: string;
+  assessment_domain?: string;
+  classification?: string | null;
+  final_verdict: string;
+  risk_score?: number;
+  confidence_score?: number;
+  confidence: string;
+  normalized_score: number;
+  evidence_strength: number;
+  coverage: number;
+  needs_review: boolean;
+  assessment_status?: string;
+  review_reasons?: string[];
+  freshness?: string;
+  evidence_counts?: Record<string, number>;
+  cache_status: string;
+  evidence_summary: Record<string, unknown>;
+  provider_breakdown: EvidenceObservation[];
+  provider_plan?: Record<string, unknown>[];
+  provider_health: ProviderHealth[];
+  relationships?: Relationship[];
+  malicious_sources: string[];
+  suspicious_sources: string[];
+  clean_sources: string[];
+  unknown_sources: string[];
+  not_found_sources: string[];
+  rate_limited_sources: string[];
+  unavailable_sources: string[];
+  error_sources: string[];
+  strongest_evidence: EvidenceObservation[];
+  supporting_evidence: EvidenceObservation[];
+  conflicting_evidence: EvidenceObservation[];
+  context: string[];
+  malware_families: string[];
+  mitre_attck: string[];
+  first_seen?: string | null;
+  last_seen?: string | null;
+  reason: string;
+  analyst_review_recommended: boolean;
+  negative_evidence?: EvidenceObservation[];
+  techniques?: Record<string, unknown>[];
+  vulnerabilities?: Record<string, unknown>[];
+  timestamps?: Record<string, unknown>;
+  provider_summary?: Record<string, unknown>[];
+  provider_health_summary?: Record<string, unknown>[];
+  provenance?: Record<string, unknown>[];
+  assessment_engine_version?: string;
+  normalization_version?: string;
+  scoring_policy_version?: string;
+  provider_config_version?: string;
+  analyzed_at?: string | null;
+}
+
+export interface ProviderHealth {
+  source: string;
+  request_count: number;
+  success_count: number;
+  failure_count: number;
+  rate_limit_count: number;
+  timeout_count: number;
+  error_count: number;
+  unavailable_count: number;
+  not_found_count: number;
+  invalid_request_count: number;
+  retry_count: number;
+  cache_hit_count: number;
+  cache_miss_count: number;
+  total_latency_ms: number;
+  average_latency_ms: number;
+  queue_wait_ms?: number;
+  average_queue_wait_ms?: number;
+  total_latency?: number;
+  average_latency?: number;
+  queue_wait?: number;
+  last_execution_state: string;
 }
 
 export interface Relationship {
@@ -232,6 +435,8 @@ export interface LookupResponse {
   normalized: string;
   ioc_type: string;
   composite: CompositeScore;
+  final_assessment?: IOCAssessment | null;
+  provider_health?: ProviderHealth[];
   enrichment: EnrichmentData;
   results: NormalizedResult[];
   relationships: Relationship[];
@@ -249,6 +454,40 @@ export interface SourceInventoryItem {
   credential_env?: string;
   credential_source: string;
   rate_limit_per_minute: number;
+  rate_limit_per_day: number;
+  operations?: string[];
+  evidence_roles?: string[];
+  provenance_family?: string;
+  reliability?: number;
+  produces_reputation?: boolean;
+  produces_vulnerability_intelligence?: boolean;
+  produces_infrastructure_context?: boolean;
+  produces_metadata?: boolean;
+  produces_relationships?: boolean;
+  cache_ttl_seconds?: number | null;
+}
+
+export interface KeyHealthResponse {
+  keys: Record<string, boolean>;
+  active_providers: number;
+  total_providers: number;
+  required_keys?: Record<string, boolean>;
+  missing_keys: string[];
+  public_providers?: string[];
+}
+
+export interface RawLookupResponse {
+  ioc: string;
+  ioc_type: string;
+  provider_count: number;
+  providers: Array<{
+    source: string;
+    execution_state: string;
+    verdict: string;
+    provider_verdict?: string | null;
+    provider_summary?: string;
+    raw_data?: Record<string, unknown>;
+  }>;
 }
 
 export interface SourceInventory {
@@ -258,16 +497,27 @@ export interface SourceInventory {
   credential_configured_count: number;
 }
 
-export async function lookupIOC(value: string, iocType?: string): Promise<TaskResponse> {
+export async function lookupIOC(value: string, iocType?: string, options?: { refresh?: boolean }): Promise<TaskResponse> {
+  const body: Record<string, string | boolean> = { ioc: value };
+  if (iocType) body.ioc_type = iocType;
+  if (options?.refresh) body.refresh = true;
   return request<TaskResponse>("/lookup", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ ioc: value, ioc_type: iocType }),
+    body: JSON.stringify(body),
   });
 }
 
 export async function getSourceInventory(): Promise<SourceInventory> {
   return request<SourceInventory>("/sources");
+}
+
+export async function getKeyHealth(): Promise<KeyHealthResponse> {
+  return request<KeyHealthResponse>("/health/keys");
+}
+
+export async function getRawLookup(ioc: string): Promise<RawLookupResponse> {
+  return request<RawLookupResponse>(`/lookup/${encodeURIComponent(ioc)}/raw`, { timeoutMs: 30_000 });
 }
 
 export async function getTaskStatus(taskId: string): Promise<TaskResponse> {
@@ -291,6 +541,10 @@ export interface BatchSubtask {
   status: string;
   progress: number;
   error?: string;
+  final_verdict?: string | null;
+  confidence?: string | null;
+  coverage?: number | null;
+  needs_review?: boolean | null;
 }
 
 export interface BatchStatus {
@@ -299,6 +553,17 @@ export interface BatchStatus {
   progress: number;
   total: number;
   completed: number;
+  active_iocs?: string[];
+  expected_lookups: number;
+  completed_lookups: number;
+  successful_lookups: number;
+  not_found_lookups: number;
+  rate_limited_lookups: number;
+  timeout_lookups: number;
+  failed_lookups: number;
+  not_applicable_lookups?: number;
+  batch_deadline_exceeded?: number;
+  provider_health?: ProviderHealth[];
   subtasks: BatchSubtask[];
   error?: string;
 }
@@ -309,6 +574,9 @@ export interface BatchResultSummary {
   clean: number;
   unknown: number;
   error: number;
+  context_only?: number;
+  vulnerability?: number;
+  attack_technique?: number;
 }
 
 export interface BatchResultItem extends NormalizedResult {
@@ -319,9 +587,50 @@ export interface BatchResult {
   batch_id: string;
   total: number;
   completed: number;
+  expected_lookups: number;
+  completed_lookups: number;
+  successful_lookups: number;
+  not_found_lookups: number;
+  rate_limited_lookups: number;
+  timeout_lookups: number;
+  failed_lookups: number;
+  not_applicable_lookups?: number;
+  batch_deadline_exceeded?: number;
+  provider_health?: ProviderHealth[];
   summary: BatchResultSummary;
   results: BatchResultItem[];
   relationships: Relationship[];
+  assessments?: IOCAssessment[];
+  final_results?: IOCAssessment[];
+  assessment_distribution?: Record<string, number>;
+  execution_health?: Record<string, number>;
+}
+
+export interface SavedBatch {
+  batch_id: string;
+  total: number;
+  completed: number;
+  created_at: string;
+  result: BatchResult;
+}
+
+const SAVED_BATCHES_KEY = "ioc-platform.batch-history.v1";
+export function getSavedBatches(): SavedBatch[] {
+  try { return JSON.parse(localStorage.getItem(SAVED_BATCHES_KEY) || "[]") as SavedBatch[]; } catch { return []; }
+}
+export function saveBatchHistory(result: BatchResult): void {
+  const existing = getSavedBatches().filter((item) => item.batch_id !== result.batch_id);
+  const saved: SavedBatch = { batch_id: result.batch_id, total: result.total, completed: result.completed, created_at: new Date().toISOString(), result };
+  try {
+    localStorage.setItem(SAVED_BATCHES_KEY, JSON.stringify([saved, ...existing].slice(0, 25)));
+  } catch {
+    // Large provider payloads can exceed browser storage. Retain a useful
+    // recent index rather than making a completed batch look unsuccessful.
+    try { localStorage.setItem(SAVED_BATCHES_KEY, JSON.stringify([saved, ...existing].slice(0, 5))); } catch { /* storage is optional */ }
+  }
+}
+export function deleteSavedBatch(batchId: string): void {
+  localStorage.setItem(SAVED_BATCHES_KEY, JSON.stringify(getSavedBatches().filter((item) => item.batch_id !== batchId)));
 }
 
 export async function startBatch(iocs: string[]): Promise<{ batch_id: string; total: number; status: string }> {
@@ -363,7 +672,7 @@ export async function streamBatchProgress(
   onEvent: (event: BatchSSEEvent) => void,
   signal?: AbortSignal,
 ): Promise<void> {
-  const res = await fetch(`${API_BASE}/batch/${batchId}/stream`, { signal });
+  const res = await fetch(`${API_BASE}/batch/${batchId}/stream`, { signal, headers: apiHeaders() });
   if (!res.ok || !res.body) throw new ApiError(`Stream failed: ${res.status}`, res.status);
   const reader = res.body.getReader();
   const decoder = new TextDecoder();
@@ -495,6 +804,14 @@ export interface RecentIOC {
 
 export async function getRecentIOCs(): Promise<RecentIOC[]> {
   return request<RecentIOC[]>("/recent");
+}
+
+export async function saveLookup(value: string, iocType?: string, taskId?: string): Promise<void> {
+  await request<void>("/save", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ ioc: value, ioc_type: iocType, task_id: taskId }),
+  });
 }
 
 export async function deleteRecentIOC(id: number): Promise<void> {

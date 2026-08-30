@@ -1,4 +1,5 @@
 import sys
+import time
 
 sys.path.insert(0, ".")
 
@@ -190,6 +191,20 @@ class TestRateLimiterRedis:
 
         async def main():
             assert await rl.acquire_blocking("VT", limit=2, window=10, timeout=2.0) is True
+
+        asyncio.run(main())
+
+    def test_redis_provider_quota_reservation_does_not_leak_minute_token(self):
+        rl = RateLimiter()
+        rl._redis = _FakeRedisLimiter()
+
+        async def main():
+            now = time.time()
+            rl._redis.sorted["ratelimit:Provider:day"] = [now]
+            denied = await rl.acquire_provider("Provider", 1, 1)
+            assert denied.allowed is False
+            assert denied.reason == "daily_quota_exhausted"
+            assert rl._redis.sorted.get("ratelimit:Provider", []) == []
 
         asyncio.run(main())
 

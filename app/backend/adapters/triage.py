@@ -1,18 +1,55 @@
+import logging
 from datetime import datetime
 
 import httpx
 
-from app.backend.adapters.base import NormalizedResult, RateLimitConfig, SourceAdapter, is_valid_api_key
+from app.backend.adapters.base import NormalizedResult, RateLimitConfig, SourceAdapter, is_valid_api_key, retry_after_seconds
 from app.backend.config import settings
+from app.backend.logger import get_logger
+
+logger = get_logger("triage")
 
 
 class TriageAdapter(SourceAdapter):
     name = "Tria.ge"
-    supported_types = ["md5", "sha1", "sha256"]
+    supported_types = ["md5", "sha1", "sha256", "mutex", "named_pipe", "registry_key", "service_name", "ssdeep"]
     rate_limit = RateLimitConfig(requests_per_minute=10)
 
     def __init__(self):
         self.api_key = settings.triage_api_key
+
+    async def _search_by_term(self, client, ioc_value: str):
+        """Search Tria.ge by host-artifact term. Uses v0 search API."""
+        try:
+            resp = await client.get(
+                "https://api.tria.ge/v0/search",
+                params={"query": ioc_value},
+                headers={"Authorization": f"Bearer {self.api_key}"},
+                timeout=15,
+            )
+            if resp.status_code == 404:
+                return None
+            if resp.status_code == 429:
+                logger.warning("Tria.ge rate limited for %s", ioc_value)
+                return "rate_limited"
+            if resp.status_code in (401, 403):
+                logger.warning("Tria.ge auth failed %s for %s", resp.status_code, ioc_value)
+                return "auth_error"
+            if resp.status_code != 200:
+                logger.warning("Tria.ge search failed %s for %s", resp.status_code, ioc_value)
+                return "error"
+            data = resp.json()
+            items = data.get("data", []) if isinstance(data, dict) else data
+            if not isinstance(items, list) or not items:
+                return None
+            first = items[0]
+            sample_id = first.get("id", first.get("sample", {}).get("id", ""))
+            if sample_id:
+                return sample_id
+            return None
+        except Exception as exc:
+            logger.debug("Tria.ge _search_by_term exception for %s: %s", ioc_value, exc)
+            return "error"
 
     async def lookup(self, ioc_value: str, ioc_type: str) -> NormalizedResult:
         if not is_valid_api_key(self.api_key):
@@ -22,7 +59,38 @@ class TriageAdapter(SourceAdapter):
             )
 
         client = self._get_client()
-        resp = await client.get(
+        sample_id = None
+        if ioc_type in ("mutex", "named_pipe", "registry_key", "service_name", "ssdeep"):
+            sample_id = await self._search_by_term(client, ioc_value)
+            if sample_id == "rate_limited":
+                return NormalizedResult(
+                    ioc=ioc_value, ioc_type=ioc_type, source=self.name,
+                    verdict="unknown", tags=["rate_limited"],
+                )
+            if sample_id == "auth_error":
+                return NormalizedResult(
+                    ioc=ioc_value, ioc_type=ioc_type, source=self.name,
+                    verdict="error", tags=["http_401", "auth_error"],
+                )
+            if sample_id == "error":
+                return NormalizedResult(
+                    ioc=ioc_value, ioc_type=ioc_type, source=self.name,
+                    verdict="error", tags=["search_error"],
+                )
+            if not sample_id:
+                return NormalizedResult(
+                    ioc=ioc_value, ioc_type=ioc_type, source=self.name,
+                    verdict="unknown", raw_score=0.0, status="not_found",
+                    tags=["term_not_found"],
+                )
+            # Fetch that sample
+            resp = await client.get(
+                f"https://api.tria.ge/v2/sample/{sample_id}",
+                headers={"Authorization": f"Bearer {self.api_key}"},
+                timeout=30,
+            )
+        else:
+            resp = await client.get(
                 f"https://api.tria.ge/v2/sample/{ioc_value}",
                 headers={"Authorization": f"Bearer {self.api_key}"},
                 timeout=30,
@@ -36,7 +104,8 @@ class TriageAdapter(SourceAdapter):
         if resp.status_code == 429:
             return NormalizedResult(
                 ioc=ioc_value, ioc_type=ioc_type, source=self.name,
-                verdict="unknown", tags=["rate_limited"],
+                verdict="unknown", tags=["rate_limited"], http_status=resp.status_code,
+                retry_after_seconds=retry_after_seconds(resp),
             )
         if resp.status_code != 200:
             return NormalizedResult(
@@ -61,8 +130,9 @@ class TriageAdapter(SourceAdapter):
 
         if status == "complete":
             try:
+                overview_id = sample_id if sample_id else ioc_value
                 overview_resp = await client.get(
-                    f"https://api.tria.ge/v2/sample/{ioc_value}/overview.json",
+                    f"https://api.tria.ge/v2/sample/{overview_id}/overview.json",
                     headers={"Authorization": f"Bearer {self.api_key}"},
                     timeout=15,
                 )
@@ -158,7 +228,7 @@ class TriageAdapter(SourceAdapter):
             mitre_attck=mitre,
             first_seen=self._parse_dt(data.get("submitted")),
             last_seen=self._parse_dt(data.get("completed")),
-            source_link=f"https://tria.ge/s/{ioc_value}",
+            source_link=f"https://tria.ge/s/{sample_id if sample_id else ioc_value}",
             reports_count=1,
             dropped_files=dropped,
             registry_keys=registry_keys,
@@ -166,6 +236,7 @@ class TriageAdapter(SourceAdapter):
             process_tree=process_tree or None,
             ssdeep=ssdeep or None,
             tlsh=tlsh or None,
+            raw_data=data,
         )
 
     def _parse_dt(self, val: str) -> datetime | None:

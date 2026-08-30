@@ -2,7 +2,7 @@
 
 import inspect
 
-from app.backend.adapters.base import NormalizedResult, RateLimitConfig, SourceAdapter
+from app.backend.adapters.base import NormalizedResult, RateLimitConfig, SourceAdapter, retry_after_seconds
 
 
 class StopForumSpamAdapter(SourceAdapter):

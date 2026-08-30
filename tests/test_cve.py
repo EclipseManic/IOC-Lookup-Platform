@@ -35,9 +35,11 @@ class TestCveNormalize:
         from app.backend.enrichment import normalize_cve_enrichment
         cve = CVEInfo(is_in_kev=True, kev_date_added="2024-01-15")
         result = normalize_cve_enrichment(cve, "CVE-2024-1234")
-        assert result.verdict == "malicious"
+        assert result.verdict == "unknown"
+        assert result.assessment_domain == "vulnerability"
         assert result.confidence == "high"
-        assert result.raw_score == 1.0
+        assert result.raw_score is None
+        assert result.exploit_status == "known_exploited"
         assert "cisa_kev" in result.tags
         assert result.source == "CVE"
 
@@ -45,30 +47,33 @@ class TestCveNormalize:
         from app.backend.enrichment import normalize_cve_enrichment
         cve = CVEInfo(is_in_kev=False, epss_score=0.95, epss_percentile=0.99)
         result = normalize_cve_enrichment(cve, "CVE-2024-5678")
-        assert result.verdict == "malicious"
+        assert result.verdict == "unknown"
+        assert result.assessment_domain == "vulnerability"
         assert result.confidence == "high"
-        assert result.raw_score >= 0.7
+        assert result.epss_score == 0.95
 
     def test_medium_epss_suspicious(self):
         from app.backend.enrichment import normalize_cve_enrichment
         cve = CVEInfo(is_in_kev=False, epss_score=0.05, epss_percentile=0.80)
         result = normalize_cve_enrichment(cve, "CVE-2024-9012")
-        assert result.verdict == "suspicious"
-        assert result.confidence == "medium"
+        assert result.verdict == "unknown"
+        assert result.assessment_domain == "vulnerability"
+        assert result.epss_score == 0.05
 
     def test_low_epss_unknown(self):
         from app.backend.enrichment import normalize_cve_enrichment
         cve = CVEInfo(is_in_kev=False, epss_score=0.001, epss_percentile=0.10)
         result = normalize_cve_enrichment(cve, "CVE-2024-3456")
         assert result.verdict == "unknown"
-        assert result.confidence == "low"
+        assert result.confidence == "high"
 
     def test_no_data_unknown(self):
         from app.backend.enrichment import normalize_cve_enrichment
         cve = CVEInfo()
         result = normalize_cve_enrichment(cve, "CVE-2024-7890")
         assert result.verdict == "unknown"
-        assert result.raw_score == 0.0
+        assert result.raw_score is None
+        assert result.assessment_domain == "vulnerability"
 
     def test_source_is_cve(self):
         from app.backend.enrichment import normalize_cve_enrichment
@@ -108,23 +113,27 @@ class TestCveScorer:
         assert "CVE" in SOURCE_WEIGHTS
         assert SOURCE_WEIGHTS["CVE"] == 1.0
 
-    def test_kev_overrides_to_malicious(self):
+    def test_kev_is_vulnerability_context_not_reputation(self):
         from app.backend.enrichment import normalize_cve_enrichment
         from app.backend.scorer import compute_composite
         cve = CVEInfo(is_in_kev=True)
         kev_result = normalize_cve_enrichment(cve, "CVE-2024-6666")
-        composite = compute_composite([kev_result])
-        assert composite.verdict == "malicious"
-        assert composite.confidence == "high"
-        assert composite.score >= 90
+        from app.backend.scorer import aggregate_evidence
+        assessment = aggregate_evidence("CVE-2024-6666", "cve", [kev_result])
+        assert assessment.assessment_domain == "vulnerability"
+        assert assessment.final_verdict == "informational"
+        assert assessment.final_verdict not in {"malicious", "suspicious"}
 
-    def test_high_epss_results_in_high_score(self):
+    def test_high_epss_is_typed_vulnerability_risk(self):
         from app.backend.enrichment import normalize_cve_enrichment
         from app.backend.scorer import compute_composite
         cve = CVEInfo(is_in_kev=False, epss_score=0.95, epss_percentile=0.99)
         result = normalize_cve_enrichment(cve, "CVE-2024-7777")
-        composite = compute_composite([result])
-        assert composite.score >= 50
+        from app.backend.scorer import aggregate_evidence
+        assessment = aggregate_evidence("CVE-2024-7777", "cve", [result])
+        assert assessment.assessment_domain == "vulnerability"
+        assert assessment.risk_score == 0.95
+        assert assessment.final_verdict == "informational"
 
     def test_no_cve_data_low_score(self):
         from app.backend.enrichment import normalize_cve_enrichment

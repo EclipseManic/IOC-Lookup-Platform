@@ -1,6 +1,5 @@
 from datetime import datetime
 from typing import Optional
-
 from sqlalchemy import DateTime, Float, ForeignKey, Index, Integer, String, Text, UniqueConstraint, func
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
 
@@ -14,7 +13,7 @@ class IOC(Base):
     __table_args__ = (UniqueConstraint("value", name="uq_ioc_value"),)
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
-    value: Mapped[str] = mapped_column(String(512), nullable=False, index=True)
+    value: Mapped[str] = mapped_column(String(2048), nullable=False, index=True)
     ioc_type: Mapped[str] = mapped_column("ioc_type", String(50), nullable=False)
     first_seen: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
     last_seen: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
@@ -44,8 +43,8 @@ class InvestigationIOC(Base):
     )
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
-    investigation_id: Mapped[int] = mapped_column(ForeignKey("investigations.id"), nullable=False, index=True)
-    ioc_id: Mapped[int] = mapped_column(ForeignKey("iocs.id"), nullable=False, index=True)
+    investigation_id: Mapped[int] = mapped_column(ForeignKey("investigations.id", ondelete="CASCADE"), nullable=False, index=True)
+    ioc_id: Mapped[int] = mapped_column(ForeignKey("iocs.id", ondelete="CASCADE"), nullable=False, index=True)
     notes: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())
 
@@ -68,7 +67,7 @@ class IOCFeedback(Base):
     __table_args__ = (UniqueConstraint("ioc_value", name="uq_ioc_feedback_value"),)
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
-    ioc_value: Mapped[str] = mapped_column(String(512), nullable=False, index=True)
+    ioc_value: Mapped[str] = mapped_column(String(2048), nullable=False, index=True)
     feedback: Mapped[str] = mapped_column(String(20), nullable=False, default="false_positive")
     note: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())
@@ -79,10 +78,12 @@ class LookupResult(Base):
     __tablename__ = "lookup_results"
     __table_args__ = (
         Index("ix_lookup_results_ioc_task", "ioc_id", "task_id"),
+        Index("ix_lookup_results_created_at", "created_at"),
+        Index("ix_lookup_results_ioc_created", "ioc_id", "created_at"),
     )
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
-    ioc_id: Mapped[int] = mapped_column(ForeignKey("iocs.id"), nullable=False, index=True)
+    ioc_id: Mapped[int] = mapped_column(ForeignKey("iocs.id", ondelete="CASCADE"), nullable=False, index=True)
     task_id: Mapped[str] = mapped_column(String(32), nullable=False, index=True)
     composite_score: Mapped[float] = mapped_column(Float, default=0.0)
     composite_verdict: Mapped[str] = mapped_column(String(20), default="unknown")

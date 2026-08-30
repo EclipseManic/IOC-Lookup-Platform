@@ -117,3 +117,34 @@ def test_md5_vs_sha1_length():
 
 def test_asn():
     assert classify_ioc("AS12345") == "asn"
+
+
+def test_classify_sample_artifacts_without_domain_or_ssdeep_collisions():
+    assert classify_ioc("payload.exe") == "filename"
+    assert classify_ioc(r"C:\Users\Public\payload.exe") == "windows_path"
+    assert classify_ioc("/tmp/payload") == "linux_path"
+    assert classify_ioc("00:1A:2B:3C:4D:5E") == "mac"
+    assert classify_ioc("t13d1516h2") == "ja4"
+    assert classify_ioc("Mozilla/5.0") == "user_agent"
+    assert classify_ioc("e7d705a328a1e57f") == "unknown"
+
+
+def test_password_classification():
+    from app.backend.classifier import normalize_ioc, SUPPORTED_IOC_TYPES
+    assert "password" in SUPPORTED_IOC_TYPES
+    # Explicit type passed
+    res = normalize_ioc("P@ssw0rd123!", expected_type="password")
+    assert res.ioc_type == "password"
+    assert res.valid is True
+    assert "password" in res.candidate_types
+
+    # Prefix auto-detect
+    res_prefix = normalize_ioc("pass:Admin@2024")
+    assert res_prefix.ioc_type == "password"
+    assert res_prefix.value == "Admin@2024"
+    assert res_prefix.valid is True
+
+    res_long_prefix = normalize_ioc("password:SecretVaultKey#1")
+    assert res_long_prefix.ioc_type == "password"
+    assert res_long_prefix.value == "SecretVaultKey#1"
+    assert res_long_prefix.valid is True

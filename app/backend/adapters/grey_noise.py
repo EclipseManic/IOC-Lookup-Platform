@@ -2,7 +2,7 @@ import time
 
 import httpx
 
-from app.backend.adapters.base import NormalizedResult, RateLimitConfig, SourceAdapter, is_valid_api_key
+from app.backend.adapters.base import NormalizedResult, RateLimitConfig, SourceAdapter, is_valid_api_key, retry_after_seconds
 from app.backend.config import settings
 
 
@@ -70,7 +70,8 @@ class GreyNoiseAdapter(SourceAdapter):
                 GreyNoiseAdapter._quota_remaining = 0
             return NormalizedResult(
                 ioc=ioc_value, ioc_type=ioc_type, source=self.name,
-                verdict="unknown", tags=["rate_limited"],
+                verdict="unknown", tags=["rate_limited"], http_status=resp.status_code,
+                retry_after_seconds=retry_after_seconds(resp),
             )
         if resp.status_code == 401:
             return NormalizedResult(
@@ -122,5 +123,5 @@ class GreyNoiseAdapter(SourceAdapter):
 
         return NormalizedResult(
             ioc=ioc_value, ioc_type=ioc_type, source=self.name,
-            verdict=verdict, raw_score=raw_score, tags=tags,
+            verdict=verdict, raw_score=raw_score, tags=tags, raw_data=data,
         )

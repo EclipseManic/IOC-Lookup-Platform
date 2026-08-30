@@ -1,0 +1,83 @@
+import sys
+
+sys.path.insert(0, ".")
+
+from app.backend.adapters.base import EnrichmentData, GeoIPInfo, NormalizedResult
+from app.backend.scorer import aggregate_evidence
+
+
+def result(source, verdict, ioc="8.8.8.8", ioc_type="ipv4", **kwargs):
+    return NormalizedResult(
+        ioc=ioc,
+        ioc_type=ioc_type,
+        source=source,
+        verdict=verdict,
+        **kwargs,
+    )
+
+
+def test_not_found_unknown_and_health_failures_are_not_reputation_evidence():
+    assessment = aggregate_evidence("example.com", "domain", [
+        result("ThreatFox", "unknown", ioc="example.com", status="not_found"),
+        result("VirusTotal", "unknown", ioc="example.com", tags=["rate_limited"]),
+        result("URLhaus", "error", ioc="example.com", tags=["timeout"]),
+    ])
+    assert assessment.final_verdict == "unknown"
+    assert assessment.malicious_sources == []
+    assert set(assessment.error_sources) == {"VirusTotal", "URLhaus"}
+    assert assessment.unknown_sources == ["ThreatFox"]
+
+
+def test_infrastructure_context_does_not_raise_score_by_itself():
+    assessment = aggregate_evidence("185.199.108.153", "ipv4", [
+        result("Shodan", "unknown", tags=["ports:80,443", "org:Fastly"]),
+        result("Censys", "unknown", tags=["active_ip", "asn:54113"]),
+        result("IPinfo", "unknown", tags=["asn_name:Fastly"]),
+    ], EnrichmentData(geoip=GeoIPInfo(org="Fastly"), open_ports=[80, 443]))
+    assert assessment.final_verdict == "unknown"
+    assert assessment.normalized_score == 0.0
+    assert assessment.context
+    assert all(item.role == "context" for item in assessment.provider_breakdown)
+
+
+def test_abuse_ipdb_is_supporting_and_single_report_is_not_malicious():
+    assessment = aggregate_evidence("8.8.8.8", "ipv4", [
+        result("AbuseIPDB", "malicious", confidence="high", reports_count=3),
+    ])
+    assert assessment.final_verdict == "suspicious"
+    assert assessment.analyst_review_recommended is True
+    assert assessment.provider_breakdown[0].role == "supporting"
+    assert "supporting evidence" in assessment.provider_breakdown[0].reason
+
+
+def test_virustotal_engine_count_and_ratio_are_standardized():
+    assessment = aggregate_evidence("x", "sha256", [
+        result("VirusTotal", "malicious", ioc="x", ioc_type="sha256", confidence="high",
+               raw_score=0.99, raw_data={"malicious": 1, "suspicious": 0, "harmless": 20, "undetected": 79}),
+    ])
+    observation = assessment.provider_breakdown[0]
+    assert observation.detection_count == 1
+    assert observation.total_engines == 100
+    assert assessment.final_verdict == "suspicious"
+
+
+def test_eicar_is_explicit_test_artifact_not_live_malware():
+    ioc = "44d88612fea8a8f36de82e1278abb02f"
+    assessment = aggregate_evidence(ioc, "md5", [
+        result("VirusTotal", "malicious", ioc=ioc, ioc_type="md5", confidence="high", malware_family="EICAR"),
+        result("Hashlookup", "clean", ioc=ioc, ioc_type="md5", confidence="high", tags=["FileName:eicar.com"]),
+    ])
+    assert assessment.final_verdict == "malicious_test_artifact"
+    assert assessment.confidence == "high"
+    assert "EICAR" in assessment.reason
+
+
+def test_duplicate_provider_results_are_counted_once():
+    assessment = aggregate_evidence("evil.example", "domain", [
+        result("ThreatFox", "malicious", ioc="evil.example", ioc_type="domain", confidence="high"),
+        result("ThreatFox", "malicious", ioc="evil.example", ioc_type="domain", confidence="high"),
+    ])
+    assert assessment.evidence_summary["providers_received"] == 2
+    assert assessment.evidence_summary["providers_aggregated"] == 1
+    assert assessment.evidence_summary["duplicate_provider_results_ignored"] == 1
+    assert assessment.malicious_sources == ["ThreatFox"]

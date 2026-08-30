@@ -62,7 +62,7 @@ export default function ToastContainer() {
         <div
           key={t.id}
           role={t.type === "error" ? "alert" : "status"}
-          className={`px-4 py-2 rounded-lg border text-sm shadow-lg animate-in slide-in-from-right flex items-center gap-3 ${TYPE_STYLES[t.type]}`}
+          className={`px-4 py-2 rounded-lg border text-sm shadow-lg toast-in flex items-center gap-3 ${TYPE_STYLES[t.type]}`}
         >
           <span className="flex-1">{t.message}</span>
           <button

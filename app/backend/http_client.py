@@ -13,18 +13,18 @@ ADAPTER_TIMEOUTS: dict[str, Timeout] = {
     "GreyNoise": Timeout(5.0, connect=3.0, read=10.0),
     "Shodan": Timeout(10.0, connect=5.0, read=20.0),
     "AlienVault OTX": Timeout(10.0, connect=5.0, read=15.0),
-    "PhishTank": Timeout(5.0, connect=3.0, read=10.0),
     "URLhaus": Timeout(5.0, connect=3.0, read=10.0),
-    "SecurityTrails": Timeout(10.0, connect=5.0, read=15.0),
     "MalwareBazaar": Timeout(10.0, connect=5.0, read=15.0),
     "ThreatFox": Timeout(10.0, connect=5.0, read=15.0),
     "Tria.ge": Timeout(10.0, connect=5.0, read=20.0),
     "Hybrid Analysis": Timeout(10.0, connect=5.0, read=20.0),
-    "Spur.us": Timeout(10.0, connect=5.0, read=15.0),
     "Tor Exit": Timeout(5.0, connect=3.0, read=10.0),
     "Censys": Timeout(10.0, connect=5.0, read=20.0),
     "IPinfo": Timeout(5.0, connect=3.0, read=10.0),
     "urlscan.io": Timeout(10.0, connect=5.0, read=20.0),
+    "EmailRep.io": Timeout(5.0, connect=3.0, read=10.0),
+    "Team Cymru": Timeout(5.0, connect=3.0, read=10.0),
+    "cve.org": Timeout(5.0, connect=3.0, read=10.0),
 }
 
 

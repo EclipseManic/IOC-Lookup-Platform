@@ -4,7 +4,7 @@ sys.path.insert(0, ".")
 
 import pytest
 
-from app.backend.config import Settings
+from app.backend.config import Settings, resolve_credential
 
 VALID_KEYS = {
     "virustotal_api_key": "a" * 40,
@@ -12,18 +12,16 @@ VALID_KEYS = {
     "urlscanio_api_key": "a" * 40,
     "malwarebazaar_api_key": "a" * 40,
     "threatfox_api_key": "a" * 40,
+    "urlhaus_api_key": "a" * 40,
     "nvd_api_key": "a" * 40,
-    "leakcheck_api_key": "a" * 40,
     "triage_api_key": "a" * 40,
     "hybridanalysis_api_key": "a" * 40,
     "greynoise_api_key": "a" * 40,
     "alienvault_otx_api_key": "a" * 40,
     "shodan_api_key": "a" * 40,
-    "securitytrails_api_key": "a" * 40,
-    "phishtank_api_key": "a" * 40,
-    "spur_us_api_key": "a" * 40,
     "censys_api_key": "a" * 40,
     "ipinfo_api_key": "a" * 40,
+    "emailrep_api_key": "a" * 40,
 }
 
 ALIAS_KEYS = {
@@ -32,18 +30,16 @@ ALIAS_KEYS = {
     "urlscanio_api_key": "URL_SCAN_API_KEY",
     "malwarebazaar_api_key": "MB_AUTH_KEY",
     "threatfox_api_key": "THREATFOX_API_KEY",
+    "urlhaus_api_key": "URLHAUS_API_KEY",
     "nvd_api_key": "NVD_API_KEY",
-    "leakcheck_api_key": "LEAKCHECK_API_KEY",
     "triage_api_key": "TRIAGE_API_KEY",
     "hybridanalysis_api_key": "HA_API_KEY",
     "greynoise_api_key": "GREYNOISE_API_KEY",
     "alienvault_otx_api_key": "OTX_API_KEY",
     "shodan_api_key": "SHODAN_API_KEY",
-    "securitytrails_api_key": "SECURITYTRAILS_API_KEY",
-    "phishtank_api_key": "PHISHTANK_API_KEY",
-    "spur_us_api_key": "SPUR_US_API_KEY",
     "censys_api_key": "CENSYS_API_KEY",
     "ipinfo_api_key": "IPINFO_API_KEY",
+    "emailrep_api_key": "EMAILREP_API_KEY",
 }
 
 
@@ -61,9 +57,22 @@ def test_defaults_applied():
     assert s.enable_active_port_scan is False
     assert s.enable_url_content_fetch is False
     assert s.webhooks_enabled is False
+    assert s.history_retention_days == 30
 
 
-def test_aliases():
+def test_history_retention_days_alias(monkeypatch):
+    monkeypatch.delenv("HISTORY_RETENTION_DAYS", raising=False)
+    s = _settings(HISTORY_RETENTION_DAYS="90")
+    assert s.history_retention_days == 90
+
+
+def test_history_retention_days_must_be_positive():
+    with pytest.raises(ValueError, match="HISTORY_RETENTION_DAYS must be >= 1"):
+        _settings(HISTORY_RETENTION_DAYS="0")
+
+
+def test_aliases(monkeypatch):
+    monkeypatch.delenv("VT_API_KEY", raising=False)
     s = _settings(VT_API_KEY="key12345")
     assert s.virustotal_api_key == "key12345"
 
@@ -95,14 +104,18 @@ def test_fail_fast_with_all_keys_passes():
     assert s.fail_fast_missing_keys is True
 
 
-def test_fail_fast_missing_key_raises():
+def test_fail_fast_missing_key_raises(monkeypatch):
+    monkeypatch.delenv("VT_API_KEY", raising=False)
     aliased = {ALIAS_KEYS[k]: v for k, v in VALID_KEYS.items()}
     aliased["VT_API_KEY"] = ""
     with pytest.raises(ValueError, match="FAIL_FAST_MISSING_KEYS"):
         _settings(fail_fast_missing_keys=True, **aliased)
 
 
-def test_alias_choices():
+def test_alias_choices(monkeypatch):
+    monkeypatch.delenv("ABUSEIPDB_API_KEY", raising=False)
+    monkeypatch.delenv("AbuseDB_API_KEY", raising=False)
+    monkeypatch.delenv("ABUSH_CH_AUTH_KEY", raising=False)
     s = Settings(
         _env_file=None,
         database_url="sqlite+aiosqlite:///./test.db",
@@ -118,3 +131,94 @@ def test_alias_choices():
 def test_debug_accepts_common_environment_modes(value, expected):
     s = _settings(debug=value)
     assert s.debug is expected
+
+# ------------------------------------------------------------
+# Credential resolution: system env > .env (literal or reference)
+# ------------------------------------------------------------
+
+def _write_env(tmp_path, name, text):
+    path = tmp_path / name
+    path.write_text(text, encoding="utf-8")
+    return str(path)
+
+
+def test_resolve_system_env_wins_over_env_file_literal(tmp_path):
+    env_file = _write_env(tmp_path, "a.env", "VT_API_KEY=file-key\n")
+    assert resolve_credential("VT_API_KEY", env_file=env_file, environ={"VT_API_KEY": "sys-key"}) == "sys-key"
+
+
+def test_resolve_system_env_wins_over_env_file_reference(tmp_path):
+    env_file = _write_env(tmp_path, "b.env", "VT_API_KEY=${MY_VT_KEY}\n")
+    assert resolve_credential(
+        "VT_API_KEY", env_file=env_file, environ={"VT_API_KEY": "sys-key", "MY_VT_KEY": "other-key"}
+    ) == "sys-key"
+
+
+def test_resolve_env_file_literal_when_no_system_var(tmp_path):
+    env_file = _write_env(tmp_path, "c.env", "VT_API_KEY=file-key\n")
+    assert resolve_credential("VT_API_KEY", env_file=env_file, environ={}) == "file-key"
+
+
+def test_resolve_explicit_reference_from_system_env(tmp_path):
+    env_file = _write_env(tmp_path, "d.env", "VT_API_KEY=${MY_VT_KEY}\n")
+    assert resolve_credential("VT_API_KEY", env_file=env_file, environ={"MY_VT_KEY": "real-key-123"}) == "real-key-123"
+
+
+def test_resolve_dollar_name_reference_from_system_env(tmp_path):
+    env_file = _write_env(tmp_path, "e.env", "VT_API_KEY=$MY_VT_KEY\n")
+    assert resolve_credential("VT_API_KEY", env_file=env_file, environ={"MY_VT_KEY": "real-key-123"}) == "real-key-123"
+
+
+def test_resolve_bare_name_reference_to_system_env_var(tmp_path):
+    env_file = _write_env(tmp_path, "f.env", "VT_API_KEY=vt_ai_key\n")
+    assert resolve_credential("VT_API_KEY", env_file=env_file, environ={"vt_ai_key": "real-key-123"}) == "real-key-123"
+
+
+def test_resolve_reference_chained_within_env_file(tmp_path):
+    env_file = _write_env(tmp_path, "g.env", "VT_API_KEY=${MY_VT_KEY}\nMY_VT_KEY=chained-key\n")
+    assert resolve_credential("VT_API_KEY", env_file=env_file, environ={}) == "chained-key"
+
+
+def test_resolve_bare_reference_chains_into_env_file(tmp_path):
+    env_file = _write_env(tmp_path, "h.env", "VT_API_KEY=vt_ai_key\nvt_ai_key=chain-key\n")
+    assert resolve_credential("VT_API_KEY", env_file=env_file, environ={}) == "chain-key"
+
+
+def test_resolve_unresolved_reference_returns_empty(tmp_path):
+    env_file = _write_env(tmp_path, "i.env", "VT_API_KEY=${DOES_NOT_EXIST}\n")
+    assert resolve_credential("VT_API_KEY", env_file=env_file, environ={}) == ""
+
+
+def test_resolve_literal_with_special_chars_stays_literal(tmp_path):
+    env_file = _write_env(tmp_path, "j.env", "VT_API_KEY=abc-def:123xyz\n")
+    assert resolve_credential("VT_API_KEY", env_file=env_file, environ={"abc-def:123xyz": "nope"}) == "abc-def:123xyz"
+
+
+def test_resolve_missing_alias_returns_empty(tmp_path):
+    env_file = _write_env(tmp_path, "k.env", "SHODAN_API_KEY=x\n")
+    assert resolve_credential("VT_API_KEY", env_file=env_file, environ={}) == ""
+
+
+def test_resolve_ignores_empty_env_file(tmp_path):
+    env_file = _write_env(tmp_path, "l.env", "VT_API_KEY=\n")
+    assert resolve_credential("VT_API_KEY", env_file=env_file, environ={}) == ""
+
+
+def test_resolve_self_reference_does_not_loop(tmp_path):
+    env_file = _write_env(tmp_path, "m.env", "VT_API_KEY=${VT_API_KEY}\n")
+    assert resolve_credential("VT_API_KEY", env_file=env_file, environ={}) == ""
+
+
+def test_settings_resolves_env_file_reference(tmp_path, monkeypatch):
+    env_file = _write_env(tmp_path, "n.env", "VT_API_KEY=vt_ai_key\nMB_AUTH_KEY=mb-key\n")
+    monkeypatch.setenv("vt_ai_key", "system-vt-key")
+    monkeypatch.delenv("VT_API_KEY", raising=False)
+    s = Settings(_env_file=env_file, database_url="sqlite+aiosqlite:///./test.db")
+    assert s.virustotal_api_key == "system-vt-key"
+    assert s.malwarebazaar_api_key == "mb-key"
+
+
+def test_settings_system_env_wins_over_settings_kwarg(monkeypatch):
+    monkeypatch.setenv("VT_API_KEY", "system-key")
+    s = _settings(VT_API_KEY="kwarg-key")
+    assert s.virustotal_api_key == "system-key"

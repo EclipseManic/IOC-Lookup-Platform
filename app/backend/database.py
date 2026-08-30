@@ -1,12 +1,13 @@
 import asyncio
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
-from sqlalchemy import event
+from sqlalchemy import event, select, delete
 from sqlalchemy.exc import OperationalError
 from sqlalchemy.ext.asyncio import create_async_engine, async_sessionmaker, AsyncSession
 
 from app.backend.config import settings
-from app.backend.models import Base
+from app.backend.models import Base, IOC, LookupResult
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
 
@@ -101,3 +102,35 @@ async def retry_sqlite_commit(session: AsyncSession, *, attempts: int = 3, delay
                 raise
             await session.rollback()
             await asyncio.sleep(delay * attempt)
+
+
+async def cleanup_old_lookups(days: int | None = None) -> int:
+    """Delete lookup results older than ``HISTORY_RETENTION_DAYS``.
+
+    Retention is config-driven (``HISTORY_RETENTION_DAYS``, default 30).
+    Lookup results that fall out of the retention window are removed, and
+    IOC rows that no longer reference any lookup result are pruned as well.
+
+    Returns the number of rows deleted (lookups + pruned IOCs).
+    """
+    retention_days = days if days is not None else settings.history_retention_days
+    cutoff = datetime.now(UTC).replace(tzinfo=None) - timedelta(days=retention_days)
+    deleted = 0
+
+    async with async_session() as session:
+        result = await session.execute(
+            delete(LookupResult).where(LookupResult.created_at < cutoff)
+        )
+        deleted += result.rowcount or 0
+        # Prune IOCs that are no longer referenced by any lookup result.
+        referenced = select(LookupResult.ioc_id).distinct()
+        stale_iocs = (
+            select(IOC.id)
+            .where(IOC.id.not_in(referenced))
+        )
+        ioc_rows = (await session.execute(stale_iocs)).scalars().all()
+        if ioc_rows:
+            await session.execute(delete(IOC).where(IOC.id.in_(ioc_rows)))
+            deleted += len(ioc_rows)
+        await retry_sqlite_commit(session)
+    return deleted

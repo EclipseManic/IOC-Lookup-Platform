@@ -23,7 +23,7 @@ export function SkeletonHeader() {
 
 export function SkeletonSourceGrid() {
   return (
-    <div className="grid grid-cols-2 md:grid-cols-3 gap-3" aria-busy="true" role="status" aria-label="Loading sources">
+    <div className="grid grid-cols-2 md:grid-cols-3 gap-3 items-start" aria-busy="true" role="status" aria-label="Loading sources">
       {Array.from({ length: 6 }).map((_, i) => (
         <SkeletonCard key={i} />
       ))}

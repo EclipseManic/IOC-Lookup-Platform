@@ -9,61 +9,50 @@ class URLHausAdapter(SourceAdapter):
     public_without_key = True
     rate_limit = RateLimitConfig(requests_per_minute=60)
 
-    async def _query_host(self, ioc_value: str) -> dict:
+    def __init__(self):
+        super().__init__()
+        from app.backend.config import settings
+        self.api_key = settings.urlhaus_api_key
+
+    def _auth_headers(self) -> dict:
+        headers = {"Content-Type": "application/x-www-form-urlencoded"}
+        if is_valid_api_key(self.api_key):
+            headers["Auth-Key"] = self.api_key
+        return headers
+
+    async def _post(self, url: str, data: dict) -> dict:
         client = self._get_client()
-        resp = await client.post(
-                "https://urlhaus-api.abuse.ch/v1/host/",
-                data={"host": ioc_value},
-                headers={"Content-Type": "application/x-www-form-urlencoded"},
-                timeout=15,
-            )
+        try:
+            resp = await client.post(url, data=data, headers=self._auth_headers(), timeout=15)
+        except httpx.ConnectError:
+            try:
+                async with httpx.AsyncClient(verify=False, timeout=15) as fb_client:
+                    resp = await fb_client.post(url, data=data, headers=self._auth_headers())
+            except Exception:
+                return {}
+        except Exception:
+            return {}
+
         if resp.status_code == 429:
             return {"query_status": "rate_limited"}
         if resp.status_code != 200:
             return {}
-        return resp.json()
+        try:
+            return resp.json()
+        except Exception:
+            return {}
+
+    async def _query_host(self, ioc_value: str) -> dict:
+        return await self._post("https://urlhaus-api.abuse.ch/v1/host/", {"host": ioc_value})
 
     async def _query_url(self, ioc_value: str) -> dict:
-        client = self._get_client()
-        resp = await client.post(
-                "https://urlhaus-api.abuse.ch/v1/url/",
-                data={"url": ioc_value},
-                headers={"Content-Type": "application/x-www-form-urlencoded"},
-                timeout=15,
-            )
-        if resp.status_code == 429:
-            return {"query_status": "rate_limited"}
-        if resp.status_code != 200:
-            return {}
-        return resp.json()
+        return await self._post("https://urlhaus-api.abuse.ch/v1/url/", {"url": ioc_value})
 
     async def _query_payload(self, ioc_value: str) -> dict:
-        client = self._get_client()
-        resp = await client.post(
-                "https://urlhaus-api.abuse.ch/v1/payload/",
-                data={"hash": ioc_value},
-                headers={"Content-Type": "application/x-www-form-urlencoded"},
-                timeout=15,
-            )
-        if resp.status_code == 429:
-            return {"query_status": "rate_limited"}
-        if resp.status_code != 200:
-            return {}
-        return resp.json()
+        return await self._post("https://urlhaus-api.abuse.ch/v1/payload/", {"hash": ioc_value})
 
     async def _query_tag(self, tag: str) -> dict:
-        client = self._get_client()
-        resp = await client.post(
-                "https://urlhaus-api.abuse.ch/v1/tag/",
-                data={"tag": tag},
-                headers={"Content-Type": "application/x-www-form-urlencoded"},
-                timeout=15,
-            )
-        if resp.status_code == 429:
-            return {"query_status": "rate_limited"}
-        if resp.status_code != 200:
-            return {}
-        return resp.json()
+        return await self._post("https://urlhaus-api.abuse.ch/v1/tag/", {"tag": tag})
 
     async def lookup(self, ioc_value: str, ioc_type: str) -> NormalizedResult:
         if ioc_type == "domain":

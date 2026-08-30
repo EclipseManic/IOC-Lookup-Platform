@@ -1,25 +1,32 @@
 import { useCallback, useEffect, useState } from "react";
-import { deleteRecentIOC, getRecentIOCs, type RecentIOC } from "../services/api";
+import { deleteRecentIOC, getRecentIOCs, getSavedBatches, deleteSavedBatch, type RecentIOC, type SavedBatch } from "../services/api";
 import { showToast } from "../components/Toast";
 import type { NavigateEvent } from "../App";
+import { timeAgo } from "../lib/timeAgo";
+import Modal from "../components/Modal";
 
 export default function History() {
   const [items, setItems] = useState<RecentIOC[]>([]);
+  const [batches, setBatches] = useState<SavedBatch[]>([]);
   const [loading, setLoading] = useState(true);
+  const [loadError, setLoadError] = useState<string | null>(null);
   const [filter, setFilter] = useState("");
   const [typeFilter, setTypeFilter] = useState("");
+  const [confirmOpen, setConfirmOpen] = useState(false);
 
   const load = useCallback(() => {
     setLoading(true);
+    setLoadError(null);
     getRecentIOCs()
-      .then((data) => setItems(data))
-      .catch((e: Error) => { setItems([]); showToast(e.message, "error"); })
+      .then((data) => { setItems(data); setBatches(getSavedBatches()); })
+      .catch((e: Error) => { setLoadError(e.message); setItems([]); })
       .finally(() => setLoading(false));
   }, []);
 
   useEffect(load, [load]);
 
   function clearAll() {
+    setConfirmOpen(false);
     Promise.all(items.map((i) => deleteRecentIOC(i.id)))
       .then(load)
       .catch((e: Error) => showToast(e.message, "error"));
@@ -32,6 +39,12 @@ export default function History() {
       .catch((err: Error) => showToast(err.message, "error"));
   }
 
+  function copyValue(value: string, e: React.MouseEvent) {
+    e.stopPropagation();
+    navigator.clipboard.writeText(value);
+    showToast("IOC copied", "success");
+  }
+
   const types = [...new Set(items.map(i => i.ioc_type))].sort();
   const filtered = items.filter(i => {
     if (filter && !i.value.toLowerCase().includes(filter.toLowerCase())) return false;
@@ -40,14 +53,44 @@ export default function History() {
   });
 
   if (loading) {
-    return <div className="text-center py-16 text-text-secondary">Loading...</div>;
+    return (
+      <div className="page-enter" aria-busy="true" role="status">
+        <h2 className="text-lg font-bold mb-4">Lookup History</h2>
+        <div className="space-y-2">
+          {[0, 1, 2, 3].map((n) => (
+            <div key={n} className="h-14 bg-bg-card border border-border rounded-lg animate-pulse" />
+          ))}
+        </div>
+      </div>
+    );
   }
 
-  if (items.length === 0) {
+  if (loadError) {
     return (
-      <div className="text-center py-16 text-text-secondary">
-        <h2 className="text-2xl font-bold mb-2">History</h2>
-        <p>No lookup history yet. Search for an IOC to get started.</p>
+      <div className="page-enter">
+        <h2 className="text-lg font-bold mb-4">Lookup History</h2>
+        <div className="bg-verdict-malicious/10 border border-verdict-malicious/30 rounded-lg p-6 text-center">
+          <p className="text-verdict-malicious font-medium mb-2">Failed to load history</p>
+          <p className="text-sm text-text-secondary mb-4">{loadError}</p>
+          <button onClick={load} className="px-4 py-1.5 text-sm bg-accent text-[#06070d] rounded-lg hover:bg-accent/90 transition-colors">
+            Try Again
+          </button>
+        </div>
+      </div>
+    );
+  }
+
+  if (items.length === 0 && batches.length === 0) {
+    return (
+      <div className="page-enter">
+        <h2 className="text-lg font-bold mb-4">Lookup History</h2>
+        <div className="flex flex-col items-center justify-center py-16 text-center text-text-secondary">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.5" className="w-12 h-12 mb-4" aria-hidden="true">
+            <path strokeLinecap="round" strokeLinejoin="round" d="M12 8v4l3 3m6-3a9 9 0 11-18 0 9 9 0 0118 0z" />
+          </svg>
+        <h3 className="text-lg font-bold text-text-secondary mb-1.5">No lookup history yet</h3>
+          <p className="text-sm">Search for an IOC to get started.</p>
+        </div>
       </div>
     );
   }
@@ -57,8 +100,8 @@ export default function History() {
       <div className="flex items-center justify-between mb-4">
         <h2 className="text-lg font-bold">Lookup History</h2>
         <button
-          onClick={clearAll}
-          className="text-xs px-3 py-1.5 bg-bg-elevated border border-border rounded-md text-text-secondary hover:text-text-primary transition-colors"
+          onClick={() => setConfirmOpen(true)}
+          className="text-xs px-3 py-1.5 bg-bg-elevated border border-border rounded-md text-text-secondary hover:text-text-primary hover:border-red-400/40 hover:text-red-400 transition-colors"
         >
           Clear All
         </button>
@@ -86,12 +129,25 @@ export default function History() {
         </select>
       </div>
 
+      {batches.length > 0 && <section className="mb-6 rounded-xl border border-accent/20 bg-accent/5 p-4">
+        <div className="mb-3 flex items-center justify-between"><div><h3 className="text-sm font-semibold">Batch scans</h3><p className="mt-0.5 text-xs text-text-secondary">Completed scans saved on this device. Select one to reopen its full report.</p></div><span className="rounded-full bg-accent/10 px-2 py-1 text-[10px] font-semibold text-accent">{batches.length}</span></div>
+        <div className="space-y-2">{batches.map((batch) => <div key={batch.batch_id} className="flex items-center gap-3 rounded-lg border border-border bg-bg-card px-3 py-3"><div className="min-w-0 flex-1"><div className="text-sm font-semibold">Batch scan <span className="font-mono text-xs text-text-secondary">#{batch.batch_id}</span></div><div className="mt-1 text-xs text-text-secondary">{batch.completed}/{batch.total} IOCs · {new Date(batch.created_at).toLocaleString()}</div></div><button type="button" onClick={() => window.dispatchEvent(new CustomEvent<NavigateEvent>("navigate", { detail: { page: "lookup", tool: "batch", batchId: batch.batch_id } }))} className="rounded-md bg-accent px-3 py-1.5 text-xs font-semibold text-[#06070d] hover:bg-accent/90">Open scan</button><button type="button" onClick={() => { deleteSavedBatch(batch.batch_id); setBatches(getSavedBatches()); }} className="rounded-md border border-border px-2 py-1.5 text-xs text-text-secondary hover:border-red-400/50 hover:text-red-300" aria-label={`Delete batch ${batch.batch_id}`}>Remove</button></div>)}</div>
+      </section>}
+
       <div className="space-y-2">
         {filtered.map(item => (
           <div
             key={item.id}
-            onClick={() => { window.dispatchEvent(new CustomEvent<NavigateEvent>("navigate", { detail: { page: "home", ioc: item.value } })); }}
-            className="flex items-center gap-3 px-4 py-2.5 bg-bg-card border border-border rounded-lg hover:bg-bg-elevated transition-colors cursor-pointer"
+            role="button"
+            tabIndex={0}
+            onClick={() => { window.dispatchEvent(new CustomEvent<NavigateEvent>("navigate", { detail: { page: "lookup", ioc: item.value } })); }}
+            onKeyDown={(e) => {
+              if (e.key === "Enter" || e.key === " ") {
+                e.preventDefault();
+                window.dispatchEvent(new CustomEvent<NavigateEvent>("navigate", { detail: { page: "lookup", ioc: item.value } }));
+              }
+            }}
+            className="flex items-center gap-3 px-4 py-2.5 bg-bg-card border border-border rounded-lg hover:bg-bg-elevated transition-colors cursor-pointer focus:outline-none focus:border-accent"
           >
             <div className="flex-1 min-w-0">
               <div className="font-mono text-xs truncate">{item.value}</div>
@@ -100,7 +156,7 @@ export default function History() {
                   {item.ioc_type}
                 </span>
                 {item.score !== null && (
-                  <span className="text-xs text-text-secondary">Score: {item.score.toFixed(0)}</span>
+                  <span className="text-xs text-text-secondary">Score: {item.score.toFixed(0)}/100</span>
                 )}
               </div>
             </div>
@@ -117,9 +173,19 @@ export default function History() {
                   {item.verdict}
                 </span>
               )}
+              <button
+                onClick={e => copyValue(item.value, e)}
+                className="text-text-secondary hover:text-accent transition-colors p-1"
+                title="Copy IOC"
+                aria-label={`Copy ${item.value}`}
+              >
+                <svg className="w-3.5 h-3.5" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M8 16H6a2 2 0 01-2-2V6a2 2 0 012-2h8a2 2 0 012 2v2m-6 12h8a2 2 0 002-2v-8a2 2 0 00-2-2h-8a2 2 0 00-2 2v8a2 2 0 002 2z" />
+                </svg>
+              </button>
               {item.created_at && (
-                <span className="text-xs text-text-secondary hidden sm:block whitespace-nowrap">
-                  {new Date(item.created_at).toLocaleString()}
+                <span className="text-xs text-text-secondary hidden sm:block whitespace-nowrap" title={new Date(item.created_at).toLocaleString()}>
+                  {timeAgo(item.created_at)}
                 </span>
               )}
               <button
@@ -140,6 +206,18 @@ export default function History() {
       {filtered.length === 0 && (
         <div className="text-center py-12 text-text-secondary">No matching entries.</div>
       )}
+
+      <Modal open={confirmOpen} onClose={() => setConfirmOpen(false)} title="Clear lookup history">
+        <p className="text-sm text-text-secondary mb-4">Delete all {items.length} saved lookups? This cannot be undone.</p>
+        <div className="flex gap-2 justify-end">
+          <button onClick={() => setConfirmOpen(false)} className="px-4 py-2 text-xs bg-bg-elevated border border-border rounded-lg text-text-secondary hover:text-text-primary transition-colors">
+            Cancel
+          </button>
+          <button onClick={clearAll} className="px-4 py-2 text-xs bg-verdict-malicious text-white rounded-lg hover:bg-verdict-malicious/90 transition-colors">
+            Delete All
+          </button>
+        </div>
+      </Modal>
     </div>
   );
 }

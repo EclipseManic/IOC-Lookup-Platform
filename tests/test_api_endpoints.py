@@ -87,6 +87,23 @@ async def test_health(client):
     assert "status" in r.json()
 
 
+async def test_configured_api_key_protects_private_routes_but_not_health(client, monkeypatch):
+    monkeypatch.setattr(main_mod.settings, "api_keys", "test-secret")
+
+    health = await client.get("/api/health")
+    assert health.status_code == 200
+
+    missing = await client.get("/api/recent")
+    assert missing.status_code == 401
+    assert missing.headers["www-authenticate"] == "ApiKey"
+
+    wrong = await client.get("/api/recent", headers={"X-API-Key": "wrong"})
+    assert wrong.status_code == 401
+
+    valid = await client.get("/api/recent", headers={"X-API-Key": "test-secret"})
+    assert valid.status_code == 200
+
+
 async def test_adapters_health(client):
     r = await client.get("/api/adapters/health")
     assert r.status_code == 200
@@ -244,3 +261,17 @@ async def test_batch_upload_json(client):
     assert r.status_code == 200
     await asyncio.sleep(0)
     assert r.json()["total"] == 1
+
+
+async def test_batch_status_polling_is_not_rate_limited(client, monkeypatch):
+    from app.backend import main as main_mod
+
+    class AlwaysLimited:
+        async def acquire(self, source, limit, window):
+            return False
+
+    monkeypatch.setattr(main_mod, "get_rate_limiter", lambda: AlwaysLimited())
+    r = await client.get("/api/batch/not-a-real-batch")
+    # The request reaches the batch route; it is not rejected by the HTTP
+    # submission limiter before route handling.
+    assert r.status_code == 404

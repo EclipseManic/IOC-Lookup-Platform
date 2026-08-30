@@ -1,5 +1,7 @@
 import json
 import time
+import uuid
+from uuid import uuid4
 from collections.abc import Awaitable, Callable
 from pathlib import Path
 from typing import Any
@@ -18,14 +20,33 @@ class LocalFileCache:
             self.cache_dir = Path(settings.cache_dir) if settings.cache_dir else Path(__file__).resolve().parent.parent.parent / ".cache"
         self.cache_dir.mkdir(parents=True, exist_ok=True)
 
+    def _safe_name(self, key: str) -> str:
+        return key.replace(":", "_").replace("/", "_").replace("?", "_").replace(" ", "_")[:64]
+
+    def _digest_path(self, key: str) -> Path:
+        import hashlib
+
+        digest = hashlib.sha256(key.encode("utf-8")).hexdigest()[:16]
+        safe = self._safe_name(key)
+        return self.cache_dir / f"{safe}_{digest}.json"
+
     def _path(self, key: str) -> Path:
-        safe = key.replace(":", "_").replace("/", "_").replace("?", "_").replace(" ", "_")
-        return self.cache_dir / f"{safe}.json"
+        # Preserve the readable filename used by the local-cache API.  When
+        # two keys sanitize to the same name, set() transparently falls back
+        # to the digest path below and get() checks both forms.
+        return self.cache_dir / f"{self._safe_name(key)}.json"
+
+    def _read_path(self, key: str) -> Path | None:
+        readable = self._path(key)
+        if readable.exists():
+            return readable
+        digest = self._digest_path(key)
+        return digest if digest.exists() else None
 
     def get(self, key: str) -> dict | None:
-        path = self._path(key)
+        path = self._read_path(key)
         try:
-            if not path.exists():
+            if path is None:
                 return None
             with path.open("r", encoding="utf-8") as f:
                 entry = json.load(f)
@@ -36,17 +57,45 @@ class LocalFileCache:
         except Exception:
             return None
 
+    def get_entry(self, key: str) -> tuple[dict, bool] | None:
+        """Read a value without deleting an expired entry.
+
+        Normal ``get`` retains its strict-expiry behavior for callers that
+        need a cache miss.  The analysis pipeline uses this audit-preserving
+        method so stale intelligence can be shown as stale instead of being
+        silently relabeled as fresh.
+        """
+        path = self._read_path(key)
+        try:
+            if path is None:
+                return None
+            entry = json.loads(path.read_text(encoding="utf-8"))
+            expires_at = float(entry.get("expires_at", 0) or 0)
+            return entry.get("value"), bool(expires_at and time.time() > expires_at)
+        except Exception:
+            return None
+
     def set(self, key: str, value: dict, ttl: int):
         path = self._path(key)
         try:
-            entry = {"value": value, "expires_at": time.time() + ttl}
-            path.write_text(json.dumps(entry), encoding="utf-8")
+            if path.exists():
+                try:
+                    existing = json.loads(path.read_text(encoding="utf-8"))
+                    if existing.get("key") not in (None, key):
+                        path = self._digest_path(key)
+                except Exception:
+                    pass
+            entry = {"key": key, "value": value, "expires_at": time.time() + ttl}
+            tmp = path.with_suffix(f".tmp.{uuid4().hex}")
+            tmp.write_text(json.dumps(entry), encoding="utf-8")
+            tmp.replace(path)
         except Exception:
             pass
 
     def delete(self, key: str):
         try:
             self._path(key).unlink(missing_ok=True)
+            self._digest_path(key).unlink(missing_ok=True)
         except Exception:
             pass
 
@@ -59,9 +108,19 @@ class LocalFileCache:
 
     def list_keys(self, prefix: str = "task:", limit: int = 50) -> list[str]:
         try:
-            safe = prefix.replace(":", "_").replace("/", "_").replace("?", "_").replace(" ", "_")
-            keys = [f.stem for f in self.cache_dir.glob(f"{safe}*.json")]
-            return keys[:limit]
+            safe = self._safe_name(prefix)
+            keys = []
+            for path in self.cache_dir.glob("*.json"):
+                stem = path.stem
+                if not stem.startswith(safe):
+                    continue
+                # Digest suffixes are an internal collision detail; callers
+                # of list_keys should see the same readable key form.
+                if len(stem) > 17 and stem[-17] == "_" and all(c in "0123456789abcdef" for c in stem[-16:]):
+                    stem = stem[:-17]
+                keys.append(stem)
+            seen = list(dict.fromkeys(keys))
+            return seen[:limit]
         except Exception:
             return []
 
@@ -109,6 +168,27 @@ class CacheLayer:
         except Exception:
             return self._local.get(key)
         return None
+
+    async def get_entry(self, key: str) -> tuple[dict, bool] | None:
+        """Return ``(value, stale)`` while preserving expired audit records."""
+        r = await self._get_redis()
+        if r is None:
+            return self._local.get_entry(key)
+        try:
+            data = await r.get(key)
+            if data is None:
+                return None
+            value = json.loads(data)
+            expires_at = value.get("expires_at") if isinstance(value, dict) else None
+            if isinstance(expires_at, str):
+                try:
+                    from datetime import datetime, timezone
+                    expires_at = datetime.fromisoformat(expires_at.replace("Z", "+00:00")).timestamp()
+                except ValueError:
+                    expires_at = None
+            return value, bool(expires_at and time.time() > expires_at)
+        except Exception:
+            return self._local.get_entry(key)
 
     async def set(self, key: str, value: dict, ttl: int):
         r = await self._get_redis()
@@ -221,13 +301,22 @@ CACHE_TTL = {
     "GreyNoise": 3600,
     "AlienVault OTX": 1800,
     "Shodan": 3600,
-    "SecurityTrails": 3600,
-    "PhishTank": 1800,
     "URLhaus": 1800,
-    "Spur.us": 3600,
     "Tor Exit": 3600,
     "Censys": 3600,
     "IPinfo": 3600,
+    "EmailRep.io": 3600,
+    "Team Cymru": 3600,
+    "cve.org": 3600,
+    "NVD": 3600,
+    "Hashlookup": 3600,
+}
+
+CACHE_TTL_BY_TYPE = {
+    "cve": {"NVD": 21600, "cve.org": 21600, "CVE": 21600},
+    "md5": {"VirusTotal": 900, "MalwareBazaar": 1800, "Hashlookup": 3600},
+    "sha1": {"VirusTotal": 900, "MalwareBazaar": 1800, "Hashlookup": 3600},
+    "sha256": {"VirusTotal": 900, "MalwareBazaar": 1800, "Hashlookup": 3600},
 }
 
 DEFAULT_TTL = 300
@@ -237,3 +326,7 @@ TASK_TTL = 3600
 
 def cache_key(source: str, ioc_type: str, value: str) -> str:
     return f"cache:{source}:{ioc_type}:{value.lower().strip()}"
+
+
+def cache_ttl(source: str, ioc_type: str) -> int:
+    return int(CACHE_TTL_BY_TYPE.get(ioc_type, {}).get(source, CACHE_TTL.get(source, DEFAULT_TTL)))

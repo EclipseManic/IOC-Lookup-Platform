@@ -1,7 +1,7 @@
-"""Tests for 11 extended threat-intelligence adapters.
+"""Tests for 9 extended threat-intelligence adapters.
 
-Covers: GreyNoise, AlienVault OTX, Shodan, SecurityTrails,
-OpenPhish, PhishTank, URLhaus, Spur.us, Tor Exit, Censys, IPinfo.
+Covers: GreyNoise, AlienVault OTX, Shodan,
+OpenPhish, URLhaus, Tor Exit, Censys, IPinfo.
 
 Uses the same mocking patterns as tests/test_ti.py.
 """
@@ -74,11 +74,9 @@ from app.backend.adapters.base import NormalizedResult, SourceAdapter
 from app.backend.adapters.grey_noise import GreyNoiseAdapter
 from app.backend.adapters.alienvault_otx import AlienVaultOTXAdapter
 from app.backend.adapters.shodan import ShodanAdapter
-from app.backend.adapters.security_trails import SecurityTrailsAdapter
 from app.backend.adapters.openphish import OpenPhishAdapter
-from app.backend.adapters.phish_tank import PhishTankAdapter
+from app.backend.adapters.openphish import OpenPhishAdapter
 from app.backend.adapters.urlhaus import URLHausAdapter
-from app.backend.adapters.spur_us import SpurUsAdapter
 from app.backend.adapters.tor_exit import TorExitAdapter
 from app.backend.adapters.censys import CensysAdapter
 from app.backend.adapters.ipinfo import IPinfoAdapter
@@ -406,86 +404,6 @@ class TestShodanAdapter:
 
 
 # ============================================================
-# SecurityTrails
-# ============================================================
-
-class TestSecurityTrailsAdapter:
-    def test_supported_types(self):
-        a = SecurityTrailsAdapter()
-        assert "domain" in a.supported_types
-        assert "ipv4" in a.supported_types
-
-    @pytest.mark.asyncio
-    async def test_no_key(self):
-        a = SecurityTrailsAdapter()
-        a.api_key = ""
-        r = await a.lookup("example.com", "domain")
-        assert r.verdict == "unknown"
-        assert "no_api_key_configured" in r.tags
-
-    @pytest.mark.asyncio
-    async def test_401_unauthorized(self):
-        a = SecurityTrailsAdapter()
-        a.api_key = "bad_key"
-        mock_class, _ = _mock_async_client(status_code=401)
-        with patch("httpx.AsyncClient", mock_class):
-            r = await a.lookup("example.com", "domain")
-        assert r.verdict == "error"
-        assert "unauthorized" in r.tags
-
-    @pytest.mark.asyncio
-    async def test_404_not_found(self):
-        a = SecurityTrailsAdapter()
-        a.api_key = "valid"
-        mock_class, _ = _mock_async_client(status_code=404)
-        with patch("httpx.AsyncClient", mock_class):
-            r = await a.lookup("nonexist.xyz", "domain")
-        assert r.verdict == "unknown"
-        assert r.raw_score is None
-
-    @pytest.mark.asyncio
-    async def test_domain_lookup(self):
-        """Domain type returns subdomains and related_iocs."""
-        data = {"subdomains": ["www", "mail", "api", "blog"]}
-        a = SecurityTrailsAdapter()
-        a.api_key = "valid"
-        mock_class, _ = _mock_async_client(json_data=data)
-        with patch("httpx.AsyncClient", mock_class):
-            r = await a.lookup("example.com", "domain")
-        assert r.verdict == "unknown"
-        assert r.raw_score is None
-        assert "has_subdomains" in r.tags
-        assert "subdomains:4" in r.tags
-        # Related IOCs should include subdomain entries
-        assert len(r.related_iocs) > 0
-
-    @pytest.mark.asyncio
-    async def test_ipv4_lookup(self):
-        """IPv4 type also fetches IP subdomains."""
-        data = {"subdomains": ["test.example.com"]}
-        a = SecurityTrailsAdapter()
-        a.api_key = "valid"
-        mock_class, _ = _mock_async_client(json_data=data)
-        with patch("httpx.AsyncClient", mock_class):
-            r = await a.lookup("1.2.3.4", "ipv4")
-        assert r.verdict == "unknown"
-        assert r.raw_score is None
-        assert "ip_subdomains: 1" in r.tags
-
-    @pytest.mark.asyncio
-    async def test_empty_subdomains(self):
-        """No subdomains returns minimal tags."""
-        data = {"subdomains": []}
-        a = SecurityTrailsAdapter()
-        a.api_key = "valid"
-        mock_class, _ = _mock_async_client(json_data=data)
-        with patch("httpx.AsyncClient", mock_class):
-            r = await a.lookup("example.com", "domain")
-        assert r.verdict == "unknown"
-        assert "has_subdomains" not in r.tags
-
-
-# ============================================================
 # OpenPhish (feed-based, no API key)
 # ============================================================
 
@@ -544,71 +462,6 @@ class TestOpenPhishAdapter:
             r = await a.lookup("https://evil.com/phish", "url")
         assert r.verdict == "unknown"
         assert "feed_unavailable" in r.tags
-
-
-# ============================================================
-# PhishTank
-# ============================================================
-
-class TestPhishTankAdapter:
-    def test_supported_types(self):
-        a = PhishTankAdapter()
-        assert a.supported_types == ["url"]
-
-    @pytest.mark.asyncio
-    async def test_no_key(self):
-        a = PhishTankAdapter()
-        a.api_key = ""
-        r = await a.lookup("https://evil.com", "url")
-        assert r.verdict == "unknown"
-        assert "no_api_key_configured" in r.tags
-
-    @pytest.mark.asyncio
-    async def test_malicious_response(self):
-        """in_database=True AND valid="y" → malicious."""
-        data = {"results": {"in_database": True, "valid": "y"}}
-        a = PhishTankAdapter()
-        a.api_key = "valid"
-        mock_class, _ = _mock_async_client(json_data=data)
-        with patch("httpx.AsyncClient", mock_class):
-            r = await a.lookup("https://evil.com/phish", "url")
-        assert r.verdict == "malicious"
-        assert r.raw_score == 1.0
-        assert "phishing" in r.tags
-
-    @pytest.mark.asyncio
-    async def test_not_in_tank(self):
-        """in_database=False → unknown."""
-        data = {"results": {"in_database": False, "valid": "n"}}
-        a = PhishTankAdapter()
-        a.api_key = "valid"
-        mock_class, _ = _mock_async_client(json_data=data)
-        with patch("httpx.AsyncClient", mock_class):
-            r = await a.lookup("https://safe.example.com", "url")
-        assert r.verdict == "unknown"
-        assert r.raw_score is None
-
-    @pytest.mark.asyncio
-    async def test_valid_false(self):
-        """in_database=True but valid="n" → unknown."""
-        data = {"results": {"in_database": True, "valid": "n"}}
-        a = PhishTankAdapter()
-        a.api_key = "valid"
-        mock_class, _ = _mock_async_client(json_data=data)
-        with patch("httpx.AsyncClient", mock_class):
-            r = await a.lookup("https://maybe-phish.com", "url")
-        assert r.verdict == "unknown"
-
-    @pytest.mark.asyncio
-    async def test_error_response(self):
-        """Non-200 status → error."""
-        a = PhishTankAdapter()
-        a.api_key = "valid"
-        mock_class, _ = _mock_async_client(status_code=500)
-        with patch("httpx.AsyncClient", mock_class):
-            r = await a.lookup("https://evil.com", "url")
-        assert r.verdict == "error"
-        assert "http_500" in r.tags
 
 
 # ============================================================
@@ -697,80 +550,6 @@ class TestURLHausAdapter:
 
 
 # ============================================================
-# Spur.us
-# ============================================================
-
-class TestSpurUsAdapter:
-    def test_supported_types(self):
-        a = SpurUsAdapter()
-        assert a.supported_types == ["ipv4"]
-
-    @pytest.mark.asyncio
-    async def test_no_key(self):
-        a = SpurUsAdapter()
-        a.api_key = ""
-        r = await a.lookup("8.8.8.8", "ipv4")
-        assert r.verdict == "unknown"
-        assert "no_api_key_configured" in r.tags
-
-    @pytest.mark.asyncio
-    async def test_401_unauthorized(self):
-        a = SpurUsAdapter()
-        a.api_key = "bad_key"
-        mock_class, _ = _mock_async_client(status_code=401)
-        with patch("httpx.AsyncClient", mock_class):
-            r = await a.lookup("8.8.8.8", "ipv4")
-        assert r.verdict == "error"
-        assert "unauthorized" in r.tags
-
-    @pytest.mark.asyncio
-    async def test_404_not_found(self):
-        a = SpurUsAdapter()
-        a.api_key = "valid"
-        mock_class, _ = _mock_async_client(status_code=404)
-        with patch("httpx.AsyncClient", mock_class):
-            r = await a.lookup("10.0.0.1", "ipv4")
-        assert r.verdict == "unknown"
-        assert r.raw_score is None
-
-    @pytest.mark.asyncio
-    async def test_normal_response(self):
-        """Returns usage_type and risk_score as tags + normalized raw_score."""
-        data = {"usage_type": "hosting", "risk_score": 85}
-        a = SpurUsAdapter()
-        a.api_key = "valid"
-        mock_class, _ = _mock_async_client(json_data=data)
-        with patch("httpx.AsyncClient", mock_class):
-            r = await a.lookup("1.2.3.4", "ipv4")
-        assert r.verdict == "unknown"
-        assert r.raw_score == 0.85
-        assert "usage:hosting" in r.tags
-        assert "risk:85" in r.tags
-
-    @pytest.mark.asyncio
-    async def test_minimal_response(self):
-        """No usage_type or risk_score → empty tags."""
-        data = {}
-        a = SpurUsAdapter()
-        a.api_key = "valid"
-        mock_class, _ = _mock_async_client(json_data=data)
-        with patch("httpx.AsyncClient", mock_class):
-            r = await a.lookup("1.2.3.4", "ipv4")
-        assert r.verdict == "unknown"
-        assert len(r.tags) == 0
-
-    @pytest.mark.asyncio
-    async def test_500_error(self):
-        a = SpurUsAdapter()
-        a.api_key = "valid"
-        mock_class, _ = _mock_async_client(status_code=500)
-        with patch("httpx.AsyncClient", mock_class):
-            r = await a.lookup("1.2.3.4", "ipv4")
-        assert r.verdict == "error"
-        assert "http_500" in r.tags
-
-
-# ============================================================
 # Tor Exit (feed-based, no API key)
 # ============================================================
 
@@ -849,7 +628,7 @@ class TestCensysAdapter:
 
     @pytest.mark.asyncio
     async def test_no_key(self):
-        """Both API ID and secret required."""
+        """Personal Access Token required."""
         a = CensysAdapter()
         a.api_key = ""
         a._has_credentials = False
@@ -859,9 +638,9 @@ class TestCensysAdapter:
 
     @pytest.mark.asyncio
     async def test_no_key_partial(self):
-        """Only one of API ID/secret → no_api_key_configured."""
+        """Placeholder/too-short token → no_api_key_configured."""
         a = CensysAdapter()
-        a.api_key = "valid_id:"
+        a.api_key = "abc"
         a._has_credentials = False
         r = await a.lookup("8.8.8.8", "ipv4")
         assert r.verdict == "unknown"
@@ -870,7 +649,7 @@ class TestCensysAdapter:
     @pytest.mark.asyncio
     async def test_401_unauthorized(self):
         a = CensysAdapter()
-        a.api_key = "invalid_key:invalid_secret"
+        a.api_key = "censys_invalid_token"
         a._has_credentials = True
         mock_class, _ = _mock_async_client(status_code=401)
         with patch("httpx.AsyncClient", mock_class):
@@ -881,13 +660,51 @@ class TestCensysAdapter:
     @pytest.mark.asyncio
     async def test_404_not_found(self):
         a = CensysAdapter()
-        a.api_key = "valid_key:valid_sec"
+        a.api_key = "censys_valid_token"
         a._has_credentials = True
         mock_class, _ = _mock_async_client(status_code=404)
         with patch("httpx.AsyncClient", mock_class):
             r = await a.lookup("10.0.0.1", "ipv4")
         assert r.verdict == "unknown"
         assert r.raw_score is None
+        assert r.status == "not_found"
+
+    @pytest.mark.asyncio
+    async def test_empty_resource_not_found(self):
+        """200 with no result.resource → not_found, not found."""
+        a = CensysAdapter()
+        a.api_key = "censys_valid_token"
+        a._has_credentials = True
+        mock_class, _ = _mock_async_client(json_data={"result": {}})
+        with patch("httpx.AsyncClient", mock_class):
+            r = await a.lookup("1.2.3.4", "ipv4")
+        assert r.verdict == "unknown"
+        assert r.status == "not_found"
+        assert r.tags == []
+
+    @pytest.mark.asyncio
+    async def test_request_uses_platform_headers(self):
+        """Platform API: Bearer PAT + vendor-specific Accept header."""
+        a = CensysAdapter()
+        a.api_key = "censys_valid_token"
+        a._has_credentials = True
+        mock_class, _ = _mock_async_client(json_data={"result": {}})
+        with patch("httpx.AsyncClient", mock_class) as mock:
+            await a.lookup("1.2.3.4", "ipv4")
+        headers = mock.return_value.get.await_args.kwargs["headers"]
+        assert headers["Authorization"] == "Bearer censys_valid_token"
+        assert headers["Accept"] == "application/vnd.censys.api.v3.host.v1+json"
+
+    @pytest.mark.asyncio
+    async def test_rate_limited(self):
+        a = CensysAdapter()
+        a.api_key = "censys_valid_token"
+        a._has_credentials = True
+        mock_class, _ = _mock_async_client(status_code=429)
+        with patch("httpx.AsyncClient", mock_class):
+            r = await a.lookup("8.8.8.8", "ipv4")
+        assert r.verdict == "unknown"
+        assert "rate_limited" in r.tags
 
     @pytest.mark.asyncio
     async def test_normal_response(self):
@@ -906,28 +723,30 @@ class TestCensysAdapter:
             }
         }
         a = CensysAdapter()
-        a.api_key = "valid_key:valid_sec"
+        a.api_key = "censys_valid_token"
         a._has_credentials = True
         mock_class, _ = _mock_async_client(json_data=data)
         with patch("httpx.AsyncClient", mock_class):
             r = await a.lookup("1.2.3.4", "ipv4")
         assert r.verdict == "unknown"
         assert r.raw_score is None
+        assert r.status == "found"
         assert "services:3" in r.tags
         assert "ports:80,443,22" in r.tags
 
     @pytest.mark.asyncio
     async def test_empty_services(self):
-        """No services in response → minimal tags."""
-        data = {"result": {"services": []}}
+        """No services in response → active_ip tag only."""
+        data = {"result": {"resource": {"ip": "1.2.3.4"}}}
         a = CensysAdapter()
-        a.api_key = "valid_key:valid_sec"
+        a.api_key = "censys_valid_token"
         a._has_credentials = True
         mock_class, _ = _mock_async_client(json_data=data)
         with patch("httpx.AsyncClient", mock_class):
             r = await a.lookup("1.2.3.4", "ipv4")
         assert r.verdict == "unknown"
-        assert len(r.tags) == 0
+        assert r.status == "found"
+        assert r.tags == ["active_ip"]
 
 
 # ============================================================
@@ -1005,11 +824,8 @@ class TestExtendedAdapterConsistency:
         ("GreyNoise", GreyNoiseAdapter, ["ipv4"]),
         ("AlienVault OTX", AlienVaultOTXAdapter, ["ipv4", "ipv6", "domain", "url", "md5", "sha1", "sha256"]),
         ("Shodan", ShodanAdapter, ["ipv4"]),
-        ("SecurityTrails", SecurityTrailsAdapter, ["domain", "ipv4"]),
         ("OpenPhish", OpenPhishAdapter, ["url"]),
-        ("PhishTank", PhishTankAdapter, ["url"]),
         ("URLhaus", URLHausAdapter, ["url", "domain", "md5", "sha1", "sha256"]),
-        ("Spur.us", SpurUsAdapter, ["ipv4"]),
         ("Tor Exit", TorExitAdapter, ["ipv4"]),
         ("Censys", CensysAdapter, ["ipv4"]),
         ("IPinfo", IPinfoAdapter, ["ipv4", "ipv6"]),

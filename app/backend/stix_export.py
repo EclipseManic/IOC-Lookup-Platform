@@ -52,24 +52,29 @@ def _verdict_to_labels(verdict: str) -> list[str]:
     return m.get(verdict, ["unknown"])
 
 
+def _escape_stix(value: str) -> str:
+    return value.replace("\\", "\\\\").replace("'", "\\'")
+
+
 def _build_pattern(value: str, ioc_type: str) -> str:
+    esc = _escape_stix(value)
     obj_type = _STIX_IOC_MAP.get(ioc_type, "observed-data")
     if obj_type == "file":
         key = _HASH_KEYS.get(ioc_type, "SHA-256")
-        return f"[file:hashes.{key} = '{value}']"
+        return f"[file:hashes.{key} = '{esc}']"
     if obj_type == "ipv4-addr":
-        return f"[ipv4-addr:value = '{value}']"
+        return f"[ipv4-addr:value = '{esc}']"
     if obj_type == "ipv6-addr":
-        return f"[ipv6-addr:value = '{value}']"
+        return f"[ipv6-addr:value = '{esc}']"
     if obj_type == "domain-name":
-        return f"[domain-name:value = '{value}']"
+        return f"[domain-name:value = '{esc}']"
     if obj_type == "url":
-        return f"[url:value = '{value}']"
+        return f"[url:value = '{esc}']"
     if obj_type == "email-addr":
-        return f"[email-addr:value = '{value}']"
+        return f"[email-addr:value = '{esc}']"
     if obj_type == "vulnerability":
-        return f"[vulnerability:name = '{value}']"
-    return f"[observed-data:value = '{value}']"
+        return f"[vulnerability:name = '{esc}']"
+    return f"[observed-data:value = '{esc}']"
 
 
 def _ioc_to_observable(value: str, ioc_type: str) -> dict:
@@ -239,6 +244,12 @@ def build_stix_bundle(response: dict) -> dict:
     }
 
 
+def _csv_safe(value):
+    if isinstance(value, str) and value.startswith(("=", "+", "-", "@")):
+        return "'" + value
+    return value
+
+
 def results_to_csv(results: list[dict]) -> str:
     output = io.StringIO()
     writer = csv.writer(output)
@@ -246,10 +257,10 @@ def results_to_csv(results: list[dict]) -> str:
                      "Reports Count", "Tags", "Categories", "MITRE ATT&CK", "Source Link"])
     for r in results:
         writer.writerow([
-            r.get("source", ""), r.get("ioc_type", ""), r.get("verdict", ""),
-            r.get("raw_score", ""), r.get("confidence", ""), r.get("malware_family", ""),
-            r.get("reports_count", ""), "; ".join(r.get("tags", [])),
-            "; ".join(r.get("categories", [])), "; ".join(r.get("mitre_attck", [])),
-            r.get("source_link", ""),
+            _csv_safe(r.get("source", "")), _csv_safe(r.get("ioc_type", "")), _csv_safe(r.get("verdict", "")),
+            _csv_safe(r.get("raw_score", "")), _csv_safe(r.get("confidence", "")), _csv_safe(r.get("malware_family", "")),
+            _csv_safe(r.get("reports_count", "")), _csv_safe("; ".join(r.get("tags", []))),
+            _csv_safe("; ".join(r.get("categories", []))), _csv_safe("; ".join(r.get("mitre_attck", []))),
+            _csv_safe(r.get("source_link", "")),
         ])
     return output.getvalue()

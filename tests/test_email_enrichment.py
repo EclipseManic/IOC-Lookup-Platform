@@ -6,9 +6,8 @@ from unittest.mock import AsyncMock, patch
 import pytest
 import httpx
 
-from app.backend.adapters.base import BreachInfo, is_valid_api_key
+from app.backend.adapters.base import BreachInfo
 from app.backend.enrichment import (
-    _leakcheck_lookup,
     _xposedornot_lookup,
     _proxynova_comb_lookup,
     enrich_email,
@@ -29,15 +28,6 @@ def _mock_shared_client(get=None, post=None, get_side_effect=None, post_side_eff
     return client
 
 
-LC_OK = {
-    "success": True,
-    "found": 3,
-    "result": [
-        {"source": {"name": "BreachA", "breach_date": "2022-06"}, "fields": ["email", "password"]},
-        {"source": {"name": "BreachB", "breach_date": "2023-01"}, "fields": ["email", "name"]},
-    ],
-}
-
 XON_OK = {
     "breaches": [
         {"name": "BreachA", "breach_date": "2022-06", "exposed_data": ["Emails", "Passwords"]},
@@ -46,47 +36,6 @@ XON_OK = {
 }
 
 PN_OK = {"records": [{"email": "a@b.com", "password": "x"}, {"email": "a@b.com", "password": "y"}]}
-
-
-class TestLeakCheckLookup:
-    @pytest.fixture(autouse=True)
-    def _patch_leakcheck_key(self):
-        with patch("app.backend.config.settings") as m:
-            m.leakcheck_api_key = "real-key-40-chars-minimum-length-required"
-            yield
-
-    @pytest.mark.asyncio
-    async def test_success(self):
-        with patch("app.backend.enrichment._get_http_client", return_value=_mock_shared_client(get=httpx.Response(200, json=LC_OK))):
-            result = await _leakcheck_lookup("a@b.com")
-        assert result is not None
-        assert result.breach_count == 3
-        assert "BreachA" in result.breach_names
-        assert result.most_recent_breach == "2023-01"
-        assert "password" in result.exposed_data_types
-        assert result.source == "leakcheck"
-
-    @pytest.mark.asyncio
-    async def test_no_key(self):
-        with patch("app.backend.config.settings") as m:
-            m.leakcheck_api_key = ""
-            result = await _leakcheck_lookup("a@b.com")
-        assert result is None
-
-    @pytest.mark.asyncio
-    async def test_no_breaches(self):
-        with patch("app.backend.enrichment._get_http_client", return_value=_mock_shared_client(get=httpx.Response(404))):
-            result = await _leakcheck_lookup("a@b.com")
-        assert result is not None
-        assert result.breach_count == 0
-        assert result.breach_names == []
-        assert result.most_recent_breach == ""
-
-    @pytest.mark.asyncio
-    async def test_rate_limited(self):
-        with patch("app.backend.enrichment._get_http_client", return_value=_mock_shared_client(get=httpx.Response(429))):
-            result = await _leakcheck_lookup("a@b.com")
-        assert result is None
 
 
 class TestXposedOrNotLookup:
@@ -143,19 +92,8 @@ class TestProxyNovaCombLookup:
 
 
 class TestEnrichEmailMerge:
-    @pytest.fixture(autouse=True)
-    def _patch_leakcheck_key(self):
-        with patch("app.backend.config.settings") as m:
-            m.leakcheck_api_key = "real-key-40-chars-minimum-length-required"
-            yield m
-
     @pytest.mark.asyncio
     async def test_all_sources_ok(self):
-        lc = BreachInfo(
-            breach_count=2, breach_names=["BreachA", "BreachB"],
-            most_recent_breach="2023-01", exposed_data_types=["email", "password"],
-            source="leakcheck",
-        )
         xo = BreachInfo(
             breach_count=2, breach_names=["BreachA", "BreachC"],
             most_recent_breach="2022-06", exposed_data_types=["Emails", "Passwords"],
@@ -166,48 +104,21 @@ class TestEnrichEmailMerge:
             source="proxynova_comb_unofficial",
         )
         with (
-            patch("app.backend.enrichment._leakcheck_lookup", AsyncMock(return_value=lc)),
             patch("app.backend.enrichment._xposedornot_lookup", AsyncMock(return_value=xo)),
             patch("app.backend.enrichment._proxynova_comb_lookup", AsyncMock(return_value=pn)),
         ):
             result = await _enrich_email_direct("a@b.com")
         assert result.breach is not None
-        assert result.completeness["leakcheck"] == "ok"
         assert result.completeness["xposedornot"] == "ok"
         assert result.completeness["proxynova_comb"] == "ok"
-        assert result.breach.breach_count == 4  # A, B, C + proxynova_comb_1 deduped
+        assert result.breach.breach_count == 3  # A, C + proxynova_comb_1 deduped
         assert result.breach.source == "multiple"
-        assert result.breach.most_recent_breach == "2023-01"
-        assert "password" in [t.lower() for t in result.breach.exposed_data_types]
+        assert result.breach.most_recent_breach == "2022-06"
+        assert "passwords" in [t.lower() for t in result.breach.exposed_data_types]
 
     @pytest.mark.asyncio
-    async def test_leakcheck_missing_key(self, _patch_leakcheck_key):
-        _patch_leakcheck_key.leakcheck_api_key = ""
-        xo = BreachInfo(
-            breach_count=2, breach_names=["BreachA", "BreachC"],
-            most_recent_breach="2022-06", exposed_data_types=["Emails", "Passwords"],
-            source="xposedornot",
-        )
-        pn = BreachInfo(
-            breach_count=1, breach_names=["proxynova_comb_1"],
-            source="proxynova_comb_unofficial",
-        )
+    async def test_all_sources_fail(self):
         with (
-            patch("app.backend.enrichment._xposedornot_lookup", AsyncMock(return_value=xo)),
-            patch("app.backend.enrichment._proxynova_comb_lookup", AsyncMock(return_value=pn)),
-        ):
-            result = await _enrich_email_direct("a@b.com")
-        assert result.breach is not None
-        assert result.completeness["leakcheck"] == "not_configured"
-        assert result.completeness["xposedornot"] == "ok"
-        assert result.breach.breach_count == 3  # A, C + proxynova_comb_1
-        assert "BreachA" in result.breach.breach_names
-        assert "BreachC" in result.breach.breach_names
-
-    @pytest.mark.asyncio
-    async def test_all_three_fail(self):
-        with (
-            patch("app.backend.enrichment._leakcheck_lookup", AsyncMock(return_value=None)),
             patch("app.backend.enrichment._xposedornot_lookup", AsyncMock(return_value=None)),
             patch("app.backend.enrichment._proxynova_comb_lookup", AsyncMock(return_value=None)),
         ):
@@ -215,7 +126,6 @@ class TestEnrichEmailMerge:
         assert result.breach is not None
         assert result.breach.breach_count is None
         assert result.breach.source == "none"
-        assert result.completeness["leakcheck"] == "not_configured"
         assert result.completeness["xposedornot"] == "error"
         assert result.completeness["proxynova_comb"] == "unavailable"
 
@@ -226,13 +136,13 @@ class TestEnrichEmailMerge:
             breach_names=["A", "B"],
             most_recent_breach="2024-01",
             exposed_data_types=["Emails", "Passwords"],
-            source="leakcheck",
+            source="xposedornot",
         )
         assert br.breach_count == 5
         assert br.breach_names == ["A", "B"]
         assert br.most_recent_breach == "2024-01"
         assert br.exposed_data_types == ["Emails", "Passwords"]
-        assert br.source == "leakcheck"
+        assert br.source == "xposedornot"
 
     @pytest.mark.asyncio
     async def test_breach_count_none_when_all_fail(self):

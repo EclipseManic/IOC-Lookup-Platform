@@ -81,10 +81,10 @@ class ShodanAdapter(SourceAdapter):
 
         client = self._get_client()
         resp = await client.get(
-                "https://api.shodan.io/shodan/host/{0}".format(ioc_value),
-                headers={"Authorization": self.api_key},
-                timeout=15,
-            )
+            f"https://api.shodan.io/shodan/host/{ioc_value}",
+            params={"key": self.api_key},
+            timeout=15,
+        )
 
         if resp.status_code == 429:
             return NormalizedResult(

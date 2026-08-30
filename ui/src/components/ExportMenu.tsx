@@ -1,5 +1,5 @@
-import { useState } from "react";
-import type { LookupResponse } from "../services/api";
+import { useEffect, useRef, useState } from "react";
+import { apiHeaders, type LookupResponse } from "../services/api";
 import { showToast } from "./Toast";
 
 interface Props {
@@ -9,6 +9,20 @@ interface Props {
 export default function ExportMenu({ result }: Props) {
   const [open, setOpen] = useState(false);
   const [exporting, setExporting] = useState<string | null>(null);
+  const menuRef = useRef<HTMLDivElement>(null);
+  const triggerRef = useRef<HTMLButtonElement>(null);
+
+  useEffect(() => {
+    if (!open) return;
+    function onKey(e: KeyboardEvent) {
+      if (e.key === "Escape") {
+        setOpen(false);
+        triggerRef.current?.focus();
+      }
+    }
+    document.addEventListener("keydown", onKey);
+    return () => document.removeEventListener("keydown", onKey);
+  }, [open]);
 
   function downloadJSON() {
     const blob = new Blob([JSON.stringify(result, null, 2)], { type: "application/json" });
@@ -27,7 +41,7 @@ export default function ExportMenu({ result }: Props) {
     try {
       const res = await fetch("/api/export/csv", {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
+        headers: apiHeaders({ "Content-Type": "application/json" }),
         body: JSON.stringify({ ioc: result.input }),
       });
       if (!res.ok) throw new Error("CSV export failed");
@@ -52,7 +66,7 @@ export default function ExportMenu({ result }: Props) {
     try {
       const res = await fetch("/api/export/stix", {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
+        headers: apiHeaders({ "Content-Type": "application/json" }),
         body: JSON.stringify({ ioc: result.input }),
       });
       if (!res.ok) throw new Error("STIX export failed");
@@ -77,7 +91,7 @@ export default function ExportMenu({ result }: Props) {
     try {
       const res = await fetch("/api/export/misp", {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
+        headers: apiHeaders({ "Content-Type": "application/json" }),
         body: JSON.stringify({ ioc: result.input }),
       });
       if (!res.ok) throw new Error("MISP export failed");
@@ -103,7 +117,7 @@ export default function ExportMenu({ result }: Props) {
     try {
       const res = await fetch("/api/export/siem", {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
+        headers: apiHeaders({ "Content-Type": "application/json" }),
         body: JSON.stringify({ ioc: result.input, format: fmt }),
       });
       if (!res.ok) throw new Error(`${label} export failed`);
@@ -125,23 +139,26 @@ export default function ExportMenu({ result }: Props) {
   }
 
   function copySummary() {
-    navigator.clipboard.writeText(result.executive_summary);
+    navigator.clipboard.writeText(result.executive_summary || "No executive summary available for this IOC.");
     setOpen(false);
     showToast("Summary copied", "success");
   }
 
   function copyShareLink() {
-    const url = `${window.location.origin}/?ioc=${encodeURIComponent(result.input)}`;
+    const url = `${window.location.origin}/?page=lookup&ioc=${encodeURIComponent(result.input)}`;
     navigator.clipboard.writeText(url);
     setOpen(false);
     showToast("Share link copied", "success");
   }
 
   return (
-    <div className="relative">
+    <div className="relative" ref={menuRef}>
       <button
+        ref={triggerRef}
         onClick={() => setOpen(!open)}
         disabled={!!exporting}
+        aria-haspopup="menu"
+        aria-expanded={open}
         className="text-xs px-3 py-1.5 bg-bg-elevated border border-border rounded-md text-text-secondary hover:text-text-primary disabled:opacity-50 transition-colors"
       >
         {exporting ? `Exporting ${exporting}...` : "Export"}
@@ -149,7 +166,7 @@ export default function ExportMenu({ result }: Props) {
       {open && (
         <>
           <div className="fixed inset-0 z-10" onClick={() => setOpen(false)} />
-          <div className="absolute right-0 top-full mt-1 z-20 bg-bg-card border border-border rounded-lg shadow-xl py-1 min-w-[160px]">
+          <div className="absolute right-0 top-full mt-1 z-20 bg-bg-card border border-border rounded-lg shadow-xl py-1 min-w-[160px]" role="menu" aria-label="Export options">
             <button onClick={downloadJSON} className="w-full text-left px-3 py-1.5 text-xs text-text-secondary hover:text-text-primary hover:bg-bg-elevated transition-colors flex items-center gap-2">
               <svg className="w-3.5 h-3.5" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-4l-4 4m0 0l-4-4m4 4V4" /></svg>
               Download JSON
@@ -210,7 +227,7 @@ export function ExportTab({ result }: Props) {
           const a = document.createElement("a");
           a.href = url; a.download = `${result.normalized}-ioc-result.json`; a.click();
           URL.revokeObjectURL(url);
-        }} className="px-4 py-2 bg-accent text-white text-xs rounded-lg hover:bg-accent/90 transition-colors">
+        }} className="px-4 py-2 bg-accent text-[#06070d] text-xs rounded-lg hover:bg-accent/90 transition-colors">
           Download JSON
         </button>
       </div>
@@ -276,11 +293,11 @@ export function ExportTab({ result }: Props) {
         </div>
         <p className="text-xs text-text-secondary mb-3">Copy the executive summary or a shareable link to this result.</p>
         <div className="flex gap-2">
-          <button onClick={() => { navigator.clipboard.writeText(result.executive_summary); showToast("Summary copied", "success"); }}
+          <button onClick={() => { navigator.clipboard.writeText(result.executive_summary || "No executive summary available for this IOC."); showToast("Summary copied", "success"); }}
             className="px-4 py-2 bg-bg-elevated border border-border text-text-secondary text-xs rounded-lg hover:text-text-primary transition-colors">
             Copy Summary
           </button>
-          <button onClick={() => { const url = `${window.location.origin}/?ioc=${encodeURIComponent(result.input)}`; navigator.clipboard.writeText(url); showToast("Link copied", "success"); }}
+          <button onClick={() => { const url = `${window.location.origin}/?page=lookup&ioc=${encodeURIComponent(result.input)}`; navigator.clipboard.writeText(url); showToast("Link copied", "success"); }}
             className="px-4 py-2 bg-bg-elevated border border-border text-text-secondary text-xs rounded-lg hover:text-text-primary transition-colors">
             Copy Link
           </button>
@@ -306,7 +323,7 @@ function ExportButton({ label, action, result }: { label: string; action: Export
           const body = isSiem ? { ioc: result.input, format: action } : { ioc: result.input };
           const res = await fetch(endpoint, {
             method: "POST",
-            headers: { "Content-Type": "application/json" },
+            headers: apiHeaders({ "Content-Type": "application/json" }),
             body: JSON.stringify(body),
           });
           if (!res.ok) throw new Error("Export failed");
@@ -325,7 +342,7 @@ function ExportButton({ label, action, result }: { label: string; action: Export
         setLoading(false);
       }}
       disabled={loading}
-      className="px-4 py-2 bg-accent text-white text-xs rounded-lg hover:bg-accent/90 disabled:opacity-50 transition-colors"
+      className="px-4 py-2 bg-accent text-[#06070d] text-xs rounded-lg hover:bg-accent/90 disabled:opacity-50 transition-colors"
     >
       {loading ? "Downloading..." : label}
     </button>
