@@ -186,6 +186,69 @@ async def test_pipeline_runs_public_adapter_without_api_key(disable_cache_rate_l
 
 
 @pytest.mark.asyncio
+async def test_rate_limit_waiting_respects_the_retry_budget(disable_cache_rate_limit, monkeypatch):
+    """A rate-limited provider must not retry past its configured max_retries."""
+    from contextlib import asynccontextmanager
+
+    from app.backend.rate_limiter import RateLimitDecision
+
+    calls = []
+
+    class RateLimitedAdapter:
+        name = "VirusTotal"
+        supported_types = ["ipv4"]
+        public_without_key = True
+        api_key = ""
+        rate_limit = RateLimitConfig(requests_per_minute=4, max_retries=2, minimum_interval_seconds=0.01, max_backoff_seconds=0.02)
+
+        async def lookup(self, ioc_value, ioc_type):
+            calls.append(ioc_value)
+            return NormalizedResult(ioc=ioc_value, ioc_type=ioc_type, source=self.name, verdict="unknown")
+
+        def _check_circuit(self):
+            return True
+
+        def _record_success(self):
+            pass
+
+        def _record_failure(self):
+            pass
+
+    class AlwaysRateLimited:
+        def provider_slot(self, *args, **kwargs):
+            @asynccontextmanager
+            async def _cm():
+                yield None
+
+            return _cm()
+
+        async def wait_for_interval(self, *args, **kwargs):
+            return 0.0
+
+        async def acquire_provider(self, *args, **kwargs):
+            return RateLimitDecision(allowed=False, retry_after_seconds=0.01, reason="rate_limited")
+
+        async def acquire(self, *args, **kwargs):
+            return RateLimitDecision(allowed=False, retry_after_seconds=0.01, reason="rate_limited")
+
+    async def fake_enrich(value, ioc_type):
+        return EnrichmentData()
+
+    monkeypatch.setattr(pipeline_mod, "ADAPTERS", [RateLimitedAdapter()])
+    monkeypatch.setattr(pipeline_mod, "enrich", fake_enrich)
+    monkeypatch.setattr(pipeline_mod, "rate_limiter", AlwaysRateLimited())
+
+    task = await run_analysis("8.8.8.8")
+
+    assert task.status == "done"
+    assert calls == []
+    assert len(task.results) == 1
+    rate_limited = task.results[0]
+    assert rate_limited.execution_state == "rate_limited"
+    assert rate_limited.retry_count == 2
+
+
+@pytest.mark.asyncio
 async def test_password_input_is_hashed_before_pipeline_boundaries(disable_cache_rate_limit, monkeypatch):
     observed = []
 

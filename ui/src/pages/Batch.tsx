@@ -271,9 +271,10 @@ export default function Batch({
       clearTimeout(pollingRef.current);
       pollingRef.current = null;
     }
+    return pollingGenerationRef.current;
   }, []);
 
-  useEffect(() => stopPolling, [stopPolling]);
+  useEffect(() => () => { stopPolling(); }, [stopPolling]);
 
   useEffect(() => {
     if (!initialBatchId) return;
@@ -309,11 +310,11 @@ export default function Batch({
         if (generation !== pollingGenerationRef.current) return;
         setStatus(current);
         if (current.status === "cancelled") {
-          stopPolling();
+          const stoppedGeneration = stopPolling();
           setLoading(false);
           try {
             const cancelledResult = await getBatchResult(bid);
-            if (generation === pollingGenerationRef.current + 1) setResult(cancelledResult);
+            if (stoppedGeneration === pollingGenerationRef.current) setResult(cancelledResult);
           } catch {
             setBatchId(null);
             setStatus(null);
@@ -324,10 +325,10 @@ export default function Batch({
         if (current.status === "error") {
           stopPolling(); setLoading(false); setStatus(null); setBatchId(null); showToast(current.error || "Batch failed", "error"); return;
         }
-        if (current.status === "done") {
-          stopPolling();
+        if (current.status === "done" || current.status === "completed") {
+          const stoppedGeneration = stopPolling();
           const finalResult = await getBatchResult(bid);
-          if (generation !== pollingGenerationRef.current + 1) return;
+          if (stoppedGeneration !== pollingGenerationRef.current) return;
           setResult(finalResult);
           saveBatchHistory(finalResult);
           setLoading(false);

@@ -755,6 +755,43 @@ class TestCensysAdapter:
         assert r.status == "found"
         assert r.tags == ["active_ip"]
 
+    @pytest.mark.asyncio
+    async def test_request_carries_organization_id_header(self):
+        """The Platform API rejects requests without an organization ID (HTTP 422)."""
+        a = CensysAdapter()
+        a.api_key = "censys_valid_token"
+        a.organization_id = "org-123"
+        a._has_credentials = True
+        mock_class, _ = _mock_async_client(json_data={"result": {"resource": {"ip": "1.2.3.4"}}})
+        with patch("httpx.AsyncClient", mock_class):
+            await a.lookup("1.2.3.4", "ipv4")
+        client = mock_class.return_value
+        headers = client.get.call_args.kwargs["headers"]
+        assert headers["X-Organization-ID"] == "org-123"
+        assert headers["Accept"] == "application/vnd.censys.api.v3.host.v1+json"
+
+    @pytest.mark.asyncio
+    async def test_missing_organization_id_reports_config_gap(self):
+        a = CensysAdapter()
+        a.api_key = "censys_valid_token"
+        a.organization_id = ""
+        a._has_credentials = False
+        r = await a.lookup("1.2.3.4", "ipv4")
+        assert r.verdict == "unknown"
+        assert "censys_organization_id_missing" in r.tags
+
+    @pytest.mark.asyncio
+    async def test_422_is_not_reported_as_a_provider_outage(self):
+        a = CensysAdapter()
+        a.api_key = "censys_valid_token"
+        a.organization_id = "org-123"
+        a._has_credentials = True
+        mock_class, _ = _mock_async_client(status_code=422, json_data={})
+        with patch("httpx.AsyncClient", mock_class):
+            r = await a.lookup("1.2.3.4", "ipv4")
+        assert r.verdict == "error"
+        assert r.tags == ["http_422"]
+
 
 # ============================================================
 # IPinfo

@@ -624,6 +624,15 @@ async def run_analysis(
                                         wait_secs = min(wait_secs, max_wait)
                                         if time.monotonic() + wait_secs < deadline:
                                             limit_tag = decision.reason or "rate_limited"
+                                            if attempts >= max_retries:
+                                                final_result = _failure_result(
+                                                    normalized, ioc_type, adapter.name, "rate_limited", limit_tag,
+                                                    retry_count=attempts,
+                                                    retry_after=decision.retry_after_seconds,
+                                                    request_made=False,
+                                                    started=started,
+                                                )
+                                                break
                                             logger.info(
                                                 "Rate-limited on %s for %s — waiting %.1fs (attempt %s/%s)",
                                                 adapter.name, normalized, wait_secs, attempts + 1, max_retries,

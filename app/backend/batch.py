@@ -1108,6 +1108,8 @@ def consolidate_batch_results(batch: BatchTask) -> dict:
                     execution_health["rate_limited"] += 1
                 elif state in {"timeout", "aborted_due_to_ioc_deadline", "batch_deadline_exceeded"}:
                     execution_health["timeout"] += 1
+                    if state == "batch_deadline_exceeded":
+                        execution_health["batch_deadline_exceeded"] += 1
                 elif state != "success":
                     execution_health["errors"] += 1
                 if r_dict.get("cached"):
@@ -1142,5 +1144,7 @@ def consolidate_batch_results(batch: BatchTask) -> dict:
         "rate_limited_lookups": batch.rate_limited_lookups,
         "timeout_lookups": batch.timeout_lookups,
         "failed_lookups": batch.failed_lookups,
+        "not_applicable_lookups": execution_health.get("not_applicable", 0),
+        "batch_deadline_exceeded": execution_health.get("batch_deadline_exceeded", 0),
         "provider_health": [item.model_dump(mode="json") for item in batch.provider_health],
     }

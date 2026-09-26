@@ -121,6 +121,7 @@ class Settings(BaseSettings):
     alienvault_otx_api_key: str = Field("", validation_alias=AliasChoices("OTX_API_KEY", "ALIENVAULT_OTX_KEY"))
     shodan_api_key: str = Field("", alias="SHODAN_API_KEY")
     censys_api_key: str = Field("", alias="CENSYS_API_KEY")
+    censys_organization_id: str = Field("", alias="CENSYS_ORGANIZATION_ID")
     ipinfo_api_key: str = Field("", validation_alias=AliasChoices("IPINFO_API_KEY", "IPINFO_ACCESS_TOKEN"))
     etherscan_api_key: str = Field("", alias="ETHERSCAN_API_KEY")
     chainabuse_api_key: str = Field("", validation_alias=AliasChoices("CHAIN_BUSE_API", "CHAINABUSE_API_KEY", "CHAINABUSE_API"))

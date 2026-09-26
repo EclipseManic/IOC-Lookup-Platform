@@ -28,6 +28,40 @@ def test_not_found_unknown_and_health_failures_are_not_reputation_evidence():
     assert assessment.unknown_sources == ["ThreatFox"]
 
 
+def test_not_found_alone_is_not_complete_coverage_or_clean():
+    assessment = aggregate_evidence("325cdd043d594116ac783d779ebeab207883966ab4c41c7004cd41f59976700f", "sha256", [
+        result("VirusTotal", "unknown", ioc="325cdd04", ioc_type="sha256", status="not_found"),
+        result("MalwareBazaar", "unknown", ioc="325cdd04", ioc_type="sha256", status="not_found"),
+        result("ThreatFox", "unknown", ioc="325cdd04", ioc_type="sha256", status="not_found"),
+    ])
+    assert assessment.final_verdict == "unknown"
+    assert assessment.evidence_strength == 0.0
+    assert assessment.assessment_status == "partial"
+    assert assessment.needs_review is True
+    assert any("not-found" in reason for reason in assessment.review_reasons)
+
+
+def test_email_is_not_clean_when_breach_source_is_unavailable():
+    assessment = aggregate_evidence("billing-update@apple-security-check.com", "email", [
+        result("AbstractAPI", "unknown", ioc="billing-update@apple-security-check.com", ioc_type="email", tags=["no_api_key_configured"]),
+        result("Hunter.io", "suspicious", ioc="billing-update@apple-security-check.com", ioc_type="email", confidence="medium"),
+        result("Hudson Rock", "unknown", ioc="billing-update@apple-security-check.com", ioc_type="email", status="not_found"),
+        result("StopForumSpam", "unknown", ioc="billing-update@apple-security-check.com", ioc_type="email", status="not_found"),
+    ])
+    assert assessment.final_verdict != "not_breached"
+    assert assessment.needs_review is True
+    assert assessment.review_reasons
+
+
+def test_email_is_not_breached_when_every_source_answers():
+    assessment = aggregate_evidence("user@example.com", "email", [
+        result("AbstractAPI", "unknown", ioc="user@example.com", ioc_type="email", status="not_found"),
+        result("Hunter.io", "unknown", ioc="user@example.com", ioc_type="email", status="not_found"),
+    ])
+    assert assessment.final_verdict == "not_breached"
+    assert assessment.needs_review is False
+
+
 def test_infrastructure_context_does_not_raise_score_by_itself():
     assessment = aggregate_evidence("185.199.108.153", "ipv4", [
         result("Shodan", "unknown", tags=["ports:80,443", "org:Fastly"]),

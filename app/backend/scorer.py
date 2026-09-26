@@ -589,7 +589,7 @@ def aggregate_evidence(
             confidence = "high" if len(breach_observations) >= 2 or max_infections >= 3 else "medium"
             reason = f"Credential compromise detected: indicator appeared in breach databases or infostealer malware logs ({len(breach_observations)} source{'s' if len(breach_observations) != 1 else ''} flagged exposure)."
             status_val = "complete" if coverage >= 1.0 else "partial"
-        elif evaluated:
+        elif evaluated and not health_failures:
             classification = "not_breached"
             final_verdict = "not_breached"
             risk = 0.0
@@ -597,6 +597,17 @@ def aggregate_evidence(
             confidence = "high" if len(evaluated) >= 2 else "medium"
             reason = "No breach or infostealer exposure observed across evaluated credential intelligence feeds."
             status_val = "complete" if coverage >= 1.0 else "partial"
+        elif evaluated:
+            classification = "unknown"
+            final_verdict = "unknown"
+            risk = 0.0
+            score = 0.0
+            confidence = "low"
+            reason = (
+                f"{len(health_failures)} credential intelligence source{'s were' if len(health_failures) != 1 else ' was'} "
+                "unavailable, so a clean result cannot be confirmed from the sources that did answer."
+            )
+            status_val = "partial"
         else:
             classification = "unknown"
             final_verdict = "unknown"
@@ -623,11 +634,18 @@ def aggregate_evidence(
                 "expected_providers": len(applicable),
                 "evaluated_providers": len(evaluated),
                 "coverage": round(coverage, 4),
+                "unavailable_providers": len(health_failures),
             },
             provider_breakdown=observations, provider_health=_provider_health(list(chosen.values())), context=context,
             reason=reason, analyzed_at=datetime.now(timezone.utc),
-            needs_review=bool(breach_observations),
-            review_reasons=["Credential was detected in public breach data or infostealer logs; credential reset recommended."] if breach_observations else [],
+            needs_review=bool(breach_observations) or bool(health_failures),
+            review_reasons=(
+                ["Credential was detected in public breach data or infostealer logs; credential reset recommended."]
+                if breach_observations
+                else ["One or more credential intelligence sources were unavailable; absence of a finding is not confirmation of safety."]
+                if health_failures
+                else []
+            ),
         )
 
     if domain in {"infrastructure", "identity_reputation", "artifact_metadata"}:
@@ -808,7 +826,8 @@ def aggregate_evidence(
     provider_health = _provider_health(list(chosen.values()))
     health_failures = [o for o in observations if o.status not in {"success", "not_found", "not_applicable"}]
     deadline_aborts = [o for o in observations if o.status == "aborted_due_to_ioc_deadline"]
-    insufficient_coverage = coverage < 0.50
+    no_evidence = not positive and not clean and final_verdict in {"benign", "unknown", "harmless", "undetected", "context_only"}
+    insufficient_coverage = coverage < 0.50 or no_evidence
     if insufficient_coverage and final_verdict in {"benign", "unknown"}:
         analyst_review = analyst_review or final_verdict == "benign"
     needs_review = analyst_review or insufficient_coverage or bool(conflicting)
@@ -818,7 +837,11 @@ def aggregate_evidence(
     if final_verdict in {"malicious", "suspicious"} and corroboration < 2:
         review_reasons.append("High-risk assessment relies on limited independent evidence")
     if insufficient_coverage:
-        review_reasons.append("Applicable provider coverage is incomplete")
+        review_reasons.append(
+            "No provider returned usable threat evidence; not-found results are absence of data, not proof of safety"
+            if no_evidence
+            else "Applicable provider coverage is incomplete"
+        )
     if deadline_aborts:
         review_reasons.append("One or more providers were aborted at the IOC deadline")
     freshness_values = [evidence_freshness(r) for r in chosen.values() if _health_status(r)[0] in {"success", "not_found"}]

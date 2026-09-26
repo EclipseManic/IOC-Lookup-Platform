@@ -161,6 +161,29 @@ def test_consolidate_error_subtask_counts_as_error():
     assert out["summary"]["malicious"] == 0
 
 
+def test_consolidate_reports_not_applicable_and_deadline_counters():
+    from app.backend.adapters.base import NormalizedResult
+
+    bt = BatchTask("b3", ["8.8.8.8"])
+    t = _task("8.8.8.8", "unknown")
+    t.results = [
+        NormalizedResult(
+            ioc="8.8.8.8", ioc_type="ipv4", source="Censys",
+            verdict="unknown", execution_state="not_applicable", request_made=False,
+        ),
+        NormalizedResult(
+            ioc="8.8.8.8", ioc_type="ipv4", source="AlienVault OTX",
+            verdict="unknown", execution_state="batch_deadline_exceeded", request_made=False,
+        ),
+    ]
+    bt.subtasks = [t]
+    bt.completed = 1
+    out = consolidate_batch_results(bt)
+    assert out["not_applicable_lookups"] == 1
+    assert out["batch_deadline_exceeded"] == 1
+    assert out["execution_health"]["not_applicable"] == 1
+
+
 def test_batch_queue_emits_events_and_cleans_up():
     import asyncio
     from app.backend import batch as batch_mod

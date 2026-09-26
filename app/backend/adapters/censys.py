@@ -16,7 +16,8 @@ class CensysAdapter(SourceAdapter):
 
     def __init__(self):
         self.api_key = settings.censys_api_key
-        self._has_credentials = is_valid_api_key(self.api_key)
+        self.organization_id = settings.censys_organization_id
+        self._has_credentials = is_valid_api_key(self.api_key) and bool(self.organization_id)
 
     def _auth_header(self) -> str:
         if ":" in self.api_key:
@@ -31,11 +32,13 @@ class CensysAdapter(SourceAdapter):
 
         docs.censys.com (2026-07-28): the Platform API requires the vendor
         Accept header ``application/vnd.censys.api.v3.host.v1+json`` and
-        authenticates with a Personal Access Token.
+        authenticates with a Personal Access Token. The organization ID is
+        also mandatory; without it every request is rejected with HTTP 422.
         """
         return {
             "Authorization": self._auth_header(),
             "Accept": "application/vnd.censys.api.v3.host.v1+json",
+            "X-Organization-ID": self.organization_id,
         }
 
     def _check_credits(self) -> bool:
@@ -49,7 +52,7 @@ class CensysAdapter(SourceAdapter):
         if not self._has_credentials:
             return NormalizedResult(
                 ioc=ioc_value, ioc_type=ioc_type, source=self.name,
-                verdict="unknown", tags=["no_api_key_configured"],
+                verdict="unknown", tags=["no_api_key_configured" if not is_valid_api_key(self.api_key) else "censys_organization_id_missing"],
             )
 
         if not self._check_credits():
