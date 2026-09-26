@@ -1,23 +1,45 @@
-import { useState } from "react";
+import { useEffect, useState } from "react";
 
 const EXAMPLES = [
   ["IP: 8.8.8.8", "8.8.8.8"],
-  ["Domain: google.com", "google.com"],
+  ["Domain: eclipsemanic.me", "eclipsemanic.me"],
   ["CVE: Log4j", "CVE-2021-44228"],
-  ["BTC: WannaCry", "13AM4VW2dhxYgXeQepoHkHSQuy6NgaEb94"],
   ["Hash: WannaCry", "84c82835a5d21bbcf75a61706d8ab549"],
+  ["BTC: WannaCry", "13AM4VW2dhxYgXeQepoHkHSQuy6NgaEb94"],
   ["Pwned Password", "password"],
 ];
 const MAX_IOC_LENGTH = 2048;
+const CREDENTIAL_MARKERS = ["password", "passwd", "secret", "admin", "root", "qwerty", "letmein", "welcome", "login", "auth", "user"];
+
+function looksLikeCredential(value: string): boolean {
+  const input = value.trim().toLowerCase();
+  if (!input) return false;
+  if (/^(?:pass|password):/i.test(input)) return true;
+  if (/^(?:[a-f0-9]{32}|[a-f0-9]{40}|[a-f0-9]{64}|[a-f0-9]{128})$/.test(input)) return false;
+  if (/@|^[a-z0-9.-]+\.[a-z]{2,}$/.test(input)) {
+    return CREDENTIAL_MARKERS.some((marker) => input.includes(marker));
+  }
+  return /^[^\s]{4,128}$/.test(input) && /[A-Z]/.test(input) && /[a-z]/.test(input) && /[\d!@#$%^&*(),.?":{}|<>]/.test(input);
+}
+
+function refangIOC(text: string): string {
+  return text
+    .replace(/\bhxxps?:\/\//gi, (m) => (m.toLowerCase().startsWith("hxxps") ? "https://" : "http://"))
+    .replace(/\[\.\]/g, ".")
+    .replace(/\(\.\)/g, ".")
+    .replace(/\[dot\]/gi, ".")
+    .replace(/\[at\]/gi, "@")
+    .replace(/\(@\)/g, "@");
+}
 
 function detectType(value: string): string | null {
-  const input = value.trim();
+  const input = refangIOC(value.trim());
   if (!input) return null;
   if (/^CVE-\d{4}-\d{4,}$/i.test(input)) return "CVE Vulnerability";
   if (/^0x[a-f\d]{40}$/i.test(input)) return "Ethereum wallet";
   if (/^(?:\d{1,3}\.){3}\d{1,3}$/.test(input)) return "IPv4";
   // Anchored IPv6 - must be standalone, not embedded in a URL/domain
-  if (/^(?:[0-9a-f]{1,4}:){7}[0-9a-f]{1,4}$|^(?:[0-9a-f]{1,4}:)*::(?:[0-9a-f]{1,4}:)*[0-9a-f]{1,4}$|^::1$|^::$/i.test(input)) return "IPv6";
+  if (/^(?:[0-9a-f]{1,4}:){2,}[0-9a-f:]*$/i.test(input) || input === "::1") return "IPv6";
   if (/^[a-f\d]{32}$/i.test(input)) return "MD5 hash";
   if (/^[a-f\d]{40}$/i.test(input)) return "SHA-1 hash";
   if (/^[a-f\d]{64}$/i.test(input)) return "SHA-256 hash";
@@ -28,6 +50,7 @@ function detectType(value: string): string | null {
   if (/^(?:[13][a-km-zA-HJ-NP-Z1-9]{25,34}|bc1[a-z\d]{38,58})$/i.test(input)) return "Bitcoin wallet";
   if (/^AS\d+$/i.test(input)) return "Autonomous System (ASN)";
   if (/^(?:pass|password):/i.test(input)) return "Password / Credential";
+  if (/^(?:user|username):/i.test(input)) return "Username";
   return "Custom / Search";
 }
 
@@ -40,16 +63,26 @@ function validateIOC(value: string): string | null {
 export default function SearchBar({
   onSearch,
   initialValue = "",
+  initialType = "",
   disabled = false,
 }: {
   onSearch: (value: string, iocType?: string) => void;
   initialValue?: string;
+  initialType?: string;
   disabled?: boolean;
 }) {
   const [value, setValue] = useState(initialValue);
-  const [iocType, setIocType] = useState("auto");
+  const [iocType, setIocType] = useState(initialType === "password_sha1" ? "password" : initialType || "auto");
+  const [prehashed, setPrehashed] = useState(initialType === "password_sha1");
   const [showSecret, setShowSecret] = useState(false);
   const [error, setError] = useState<string | null>(null);
+
+  useEffect(() => {
+    setValue(initialValue);
+    setIocType(initialType === "password_sha1" ? "password" : initialType || "auto");
+    setPrehashed(initialType === "password_sha1");
+  }, [initialType, initialValue]);
+
   const detected = detectType(value);
   const isCredentialMode = iocType === "password" || detected === "Password / Credential";
 
@@ -67,25 +100,52 @@ export default function SearchBar({
       v = v.replace(/^(?:pass|password):/i, "").trim();
     }
 
-    // Zero-knowledge client-side SHA-1 hashing for credentials
-    // Plaintext password never leaves the browser over the wire!
-    if (iocType === "password" || isCredentialMode) {
-      try {
-        if (!/^[a-f0-9]{40}$/i.test(v) && window.crypto?.subtle) {
-          const encoder = new TextEncoder();
-          const data = encoder.encode(v);
-          const hashBuffer = await crypto.subtle.digest("SHA-1", data);
-          const hashArray = Array.from(new Uint8Array(hashBuffer));
-          const sha1 = hashArray.map((b) => b.toString(16).padStart(2, "0")).join("");
-          onSearch(sha1, "password");
-          return;
-        }
-      } catch (e) {
-        console.warn("Client hashing fallback to backend:", e);
-      }
-      onSearch(v, "password");
+    // If explicit user: or username: prefix, strip it and treat as username
+    if (/^(?:user|username):/i.test(v)) {
+      v = v.replace(/^(?:user|username):/i, "").trim();
+      onSearch(v, "username");
       return;
     }
+
+    if (iocType === "auto" && !isCredentialMode && looksLikeCredential(v)) {
+      setError("Select an IOC type or Password / Credential for ambiguous input");
+      return;
+    }
+
+    if (iocType === "auto" && detected === "Custom / Search") {
+      setError("Select an IOC type or Password / Credential for ambiguous input");
+      return;
+    }
+
+    if (iocType === "password" || isCredentialMode) {
+      if (prehashed) {
+        if (!/^[a-f0-9]{40}$/i.test(v)) {
+          setError("Prehashed password must be a 40-character SHA-1 digest");
+          return;
+        }
+        onSearch(v.toLowerCase(), "password_sha1");
+        return;
+      }
+      if (!window.crypto?.subtle) {
+        setError("Secure password hashing is unavailable in this browser");
+        return;
+      }
+      try {
+        const encoder = new TextEncoder();
+        const data = encoder.encode(v);
+        const hashBuffer = await window.crypto.subtle.digest("SHA-1", data);
+        const hashArray = Array.from(new Uint8Array(hashBuffer));
+        const sha1 = hashArray.map((b) => b.toString(16).padStart(2, "0")).join("");
+        onSearch(sha1, "password_sha1");
+        return;
+      } catch {
+        setError("Secure password hashing is unavailable in this browser");
+      }
+      return;
+    }
+
+    // Auto-refang defanged URLs, IPs, domains, and emails
+    v = refangIOC(v);
 
     if (iocType === "auto") {
       onSearch(v);
@@ -129,8 +189,9 @@ export default function SearchBar({
               type={isCredentialMode && !showSecret ? "password" : "text"}
               value={value}
               onChange={(event) => {
-                setValue(event.target.value);
-                if (error) setError(null);
+                 setValue(event.target.value);
+                 setPrehashed(false);
+                 if (error) setError(null);
               }}
               onKeyDown={(event) => event.key === "Enter" && handleSubmit()}
               placeholder={
@@ -150,11 +211,12 @@ export default function SearchBar({
           <select
             aria-label="IOC type"
             value={iocType}
-            onChange={(event) => setIocType(event.target.value)}
+             onChange={(event) => { setIocType(event.target.value); setPrehashed(false); }}
             disabled={disabled}
             className="rounded-xl border border-border bg-bg-secondary px-3 py-3 text-xs font-medium text-text-secondary sm:w-44 disabled:opacity-50"
           >
             <option value="auto">Auto detect</option>
+            <option value="username">👤 Username</option>
             <option value="password">🔑 Password / Credential</option>
             <option value="ipv4">IPv4 Address</option>
             <option value="ipv6">IPv6 Address</option>
@@ -195,8 +257,9 @@ export default function SearchBar({
           <button
             key={example}
             onClick={() => {
-              setValue(example);
-              setError(null);
+               setValue(example);
+               setPrehashed(false);
+               setError(null);
               if (example === "password") {
                 setIocType("password");
                 // Don't call onSearch directly - let user click "Analyze Indicator"

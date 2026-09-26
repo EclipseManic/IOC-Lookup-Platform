@@ -7,15 +7,16 @@ from app.backend.adapters.base import NormalizedResult, RateLimitConfig, SourceA
 
 class StopForumSpamAdapter(SourceAdapter):
     name = "StopForumSpam"
-    supported_types = ["email"]
+    supported_types = ["email", "username"]
     public_without_key = True
     rate_limit = RateLimitConfig(requests_per_minute=30)
 
     async def lookup(self, ioc_value: str, ioc_type: str) -> NormalizedResult:
         client = self._get_client()
+        param_key = "username" if ioc_type == "username" else "email"
         response = await client.get(
             "https://api.stopforumspam.org/api",
-            params={"email": ioc_value, "json": ""},
+            params={param_key: ioc_value, "json": ""},
             timeout=15,
         )
         if response.status_code == 429:
@@ -27,7 +28,7 @@ class StopForumSpamAdapter(SourceAdapter):
         if inspect.isawaitable(data):
             data = await data
         data = data if isinstance(data, dict) else {}
-        info = data.get("email") if isinstance(data.get("email"), dict) else {}
+        info = data.get(param_key) if isinstance(data.get(param_key), dict) else {}
         appears = int(info.get("appears", 0) or 0)
         frequency = int(info.get("frequency", 0) or 0)
         confidence = float(info.get("confidence", 0) or 0)

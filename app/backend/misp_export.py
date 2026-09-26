@@ -39,16 +39,22 @@ def _misp_id(prefix: str = "") -> str:
 
 
 def _tag_from_verdict(verdict: str) -> str:
-    m = {"malicious": "tlp:red", "suspicious": "tlp:amber", "clean": "tlp:green", "unknown": "tlp:white"}
-    return m.get(verdict, "tlp:white")
+    if verdict in {"malicious", "breached", "compromised", "critical", "high"}:
+        return "tlp:red"
+    if verdict in {"suspicious", "medium", "low"}:
+        return "tlp:amber"
+    if verdict in {"clean", "benign", "not_breached", "harmless", "whitelisted"}:
+        return "tlp:green"
+    return "tlp:white"
 
 
 def build_misp_event(response: dict) -> dict:
     ioc_value = response.get("normalized", response.get("input", ""))
     ioc_type = response.get("ioc_type", "unknown")
     composite = response.get("composite", {})
-    score = composite.get("score", 0)
-    verdict = composite.get("verdict", "unknown")
+    assessment = response.get("final_assessment") or {}
+    score = assessment.get("normalized_score", composite.get("score", 0))
+    verdict = assessment.get("final_verdict", composite.get("verdict", "unknown"))
     results = response.get("results", [])
     enrichment = response.get("enrichment", {})
 
@@ -146,6 +152,13 @@ def build_misp_event(response: dict) -> dict:
             })
         objects.append(whois_obj)
 
+    tags = [_tag_from_verdict(verdict)]
+    if assessment:
+        tags.extend([
+            f"ioc-platform:assessment_domain:{assessment.get('assessment_domain', 'unknown')}",
+            f"ioc-platform:final_verdict:{assessment.get('final_verdict', 'unknown')}",
+        ])
+
     event = {
         "Event": {
             "id": event_id,
@@ -155,9 +168,9 @@ def build_misp_event(response: dict) -> dict:
             "analysis": 2,
             "timestamp": _ts(),
             "date": datetime.now(timezone.utc).strftime("%Y-%m-%d"),
-            "threat_level_id": 1 if verdict == "malicious" else 2 if verdict == "suspicious" else 4,
+            "threat_level_id": 1 if verdict in {"malicious", "breached", "compromised", "critical", "high"} else 2 if verdict in {"suspicious", "medium", "low"} else 4,
             "distribution": 3,
-            "Tag": [{"name": _tag_from_verdict(verdict)}],
+            "Tag": [{"name": tag} for tag in tags],
             "Attribute": attributes,
             "Object": objects,
         }

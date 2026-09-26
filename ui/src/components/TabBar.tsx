@@ -1,9 +1,17 @@
 import { useRef } from "react";
 
-const TABS = ["Providers", "Enrichment", "Evidence", "Raw Data", "Relationships", "Export"] as const;
+const TABS = ["Investigation", "Enrichment", "Relationships", "Evidence", "Raw Data", "Export"] as const;
 export type TabName = (typeof TABS)[number];
 
-export default function TabBar({ active, onChange }: { active: TabName; onChange: (tab: TabName) => void }) {
+export default function TabBar({
+  active,
+  onChange,
+  badges,
+}: {
+  active: TabName;
+  onChange: (tab: TabName) => void;
+  badges?: Partial<Record<TabName, number | string>>;
+}) {
   const listRef = useRef<HTMLDivElement>(null);
 
   function handleKeyDown(e: React.KeyboardEvent) {
@@ -21,31 +29,41 @@ export default function TabBar({ active, onChange }: { active: TabName; onChange
   return (
     <div
       ref={listRef}
-      className="flex gap-1 border-b border-border"
+      className="flex gap-1 border-b border-border overflow-x-auto scrollbar-thin"
       role="tablist"
       aria-label="Result sections"
       onKeyDown={handleKeyDown}
     >
-      {TABS.map((tab) => (
-        <button
-          key={tab}
-          onClick={() => onChange(tab)}
-          role="tab"
-          aria-selected={active === tab}
-          aria-controls="result-panel"
-          tabIndex={active === tab ? 0 : -1}
-          className={`px-4 py-2 text-sm font-medium transition-colors relative ${
-            active === tab
-              ? "text-accent"
-              : "text-text-secondary hover:text-text-primary"
-          }`}
-        >
-          {tab}
-          {active === tab && (
-            <span className="absolute bottom-0 left-0 right-0 h-0.5 bg-accent rounded-full" />
-          )}
-        </button>
-      ))}
+      {TABS.map((tab) => {
+        const badge = badges?.[tab];
+        return (
+          <button
+            key={tab}
+            onClick={() => onChange(tab)}
+            role="tab"
+            aria-selected={active === tab}
+            aria-controls="result-panel"
+            tabIndex={active === tab ? 0 : -1}
+            className={`px-4 py-2.5 text-xs font-semibold uppercase tracking-wider transition-colors relative flex items-center gap-1.5 shrink-0 ${
+              active === tab
+                ? "text-accent"
+                : "text-text-secondary hover:text-text-primary"
+            }`}
+          >
+            <span>{tab}</span>
+            {badge !== undefined && badge !== null && badge !== 0 && (
+              <span className={`rounded-full px-1.5 py-0.2 text-[10px] font-mono ${
+                active === tab ? "bg-accent/20 text-accent font-bold" : "bg-bg-elevated text-text-secondary"
+              }`}>
+                {badge}
+              </span>
+            )}
+            {active === tab && (
+              <span className="absolute bottom-0 left-0 right-0 h-0.5 bg-accent rounded-full shadow-[0_0_8px_rgba(56,189,248,0.6)]" />
+            )}
+          </button>
+        );
+      })}
     </div>
   );
 }

@@ -21,6 +21,7 @@ def _dispatched_types() -> list[str]:
     types = set()
     for adapter in ADAPTERS:
         types.update(adapter.supported_types)
+    types.discard("password")  # Extended indicator handled via HIBP k-anonymity protocol
     return sorted(types)
 
 

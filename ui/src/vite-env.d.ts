@@ -1,5 +1,6 @@
 interface ImportMetaEnv {
-  readonly VITE_API_KEY?: string;
+  readonly VITE_PORT?: string;
+  readonly VITE_PROXY_TARGET?: string;
 }
 
 interface ImportMeta {

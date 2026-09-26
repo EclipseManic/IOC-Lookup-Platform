@@ -49,11 +49,6 @@ class BlockchainInfoAdapter(SourceAdapter):
                 verdict="unknown", tags=["rate_limited"], http_status=429,
                 retry_after_seconds=retry_after_seconds(limited),
             )
-        if all(item.status_code == 404 for item in responses):
-            return NormalizedResult(
-                ioc=ioc_value, ioc_type=ioc_type, source=self.name,
-                verdict="unknown", status="not_found", tags=["not_found"], http_status=404,
-            )
         payloads = {}
         for name, response in (("balance", balance_response), ("address", address_response)):
             if isinstance(response, Exception):
@@ -63,12 +58,36 @@ class BlockchainInfoAdapter(SourceAdapter):
                     payloads[name] = response.json()
                 except Exception:
                     payloads[name] = {"error": "malformed_response"}
+
+        if all(item.status_code in (400, 404) for item in responses):
+            return NormalizedResult(
+                ioc=ioc_value, ioc_type=ioc_type, source=self.name,
+                verdict="unknown", status="not_found", tags=["not_found"], http_status=404,
+                raw_data=payloads,
+            )
+
         balance_payload = payloads.get("balance", {})
         address_payload = payloads.get("address", {})
         if not isinstance(balance_payload, dict):
             balance_payload = {}
         if not isinstance(address_payload, dict):
             address_payload = {}
+
+        # If both payloads returned errors, or address is explicitly invalid / not found
+        msg = f"{balance_payload.get('message', '')} {address_payload.get('message', '')}".lower()
+        if (balance_payload.get("error") and address_payload.get("error")) or "invalid" in msg or "not found" in msg:
+            return NormalizedResult(
+                ioc=ioc_value, ioc_type=ioc_type, source=self.name,
+                verdict="unknown", status="not_found", tags=["not_found"],
+                raw_data=payloads,
+            )
+
+        if ioc_value not in balance_payload and "address" not in address_payload:
+            return NormalizedResult(
+                ioc=ioc_value, ioc_type=ioc_type, source=self.name,
+                verdict="unknown", status="not_found", tags=["not_found"],
+                raw_data=payloads,
+            )
         balance_record = balance_payload.get(ioc_value) if isinstance(balance_payload.get(ioc_value), dict) else balance_payload
         transactions = address_payload.get("txs", []) if isinstance(address_payload.get("txs"), list) else []
         final_balance = address_payload.get("final_balance", balance_record.get("final_balance", 0) if isinstance(balance_record, dict) else 0) or 0

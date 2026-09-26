@@ -5,9 +5,10 @@ real adapter instances whose HTTP clients are mocked, then verify
 the full flow: classify -> query (3-4 sources) -> enrich -> score ->
 composite verdict.
 """
+import hashlib
 import json
 import sys
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import AsyncMock
 
 import httpx
 import pytest
@@ -19,7 +20,7 @@ from app.backend.adapters.abuse_ipdb import AbuseIPDBAdapter
 from app.backend.adapters.grey_noise import GreyNoiseAdapter
 from app.backend.adapters.threatfox import ThreatFoxAdapter
 from app.backend.adapters.virus_total import VirusTotalAdapter
-from app.backend.adapters.base import NormalizedResult, RateLimitConfig
+from app.backend.adapters.base import EnrichmentData, NormalizedResult, RateLimitConfig
 from app.backend.pipeline import run_analysis
 
 
@@ -182,3 +183,47 @@ async def test_pipeline_runs_public_adapter_without_api_key(disable_cache_rate_l
     assert task.status == "done"
     assert task.results[0].source == "Public Source"
     assert "public_result" in task.results[0].tags
+
+
+@pytest.mark.asyncio
+async def test_password_input_is_hashed_before_pipeline_boundaries(disable_cache_rate_limit, monkeypatch):
+    observed = []
+
+    class PasswordAdapter:
+        name = "HIBP Pwned Passwords"
+        supported_types = ["password"]
+        public_without_key = True
+        api_key = ""
+        rate_limit = RateLimitConfig(requests_per_minute=100)
+
+        async def lookup(self, ioc_value, ioc_type):
+            observed.append(ioc_value)
+            return NormalizedResult(
+                ioc=ioc_value,
+                ioc_type=ioc_type,
+                source=self.name,
+                verdict="unknown",
+            )
+
+        def _check_circuit(self):
+            return True
+
+        def _record_success(self):
+            pass
+
+        def _record_failure(self):
+            pass
+
+    async def fake_enrich(value, ioc_type):
+        return EnrichmentData()
+
+    monkeypatch.setattr(pipeline_mod, "ADAPTERS", [PasswordAdapter()])
+    monkeypatch.setattr(pipeline_mod, "enrich", fake_enrich)
+
+    task = await run_analysis("S3cret!", ioc_type_override="password")
+    digest = hashlib.sha1(b"S3cret!").hexdigest()
+
+    assert observed == [digest]
+    assert task.ioc_value == digest
+    assert task.normalized == digest
+    assert "S3cret!" not in json.dumps(task.to_dict())

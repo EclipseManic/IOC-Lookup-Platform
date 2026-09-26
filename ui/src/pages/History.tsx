@@ -1,9 +1,27 @@
 import { useCallback, useEffect, useState } from "react";
-import { deleteRecentIOC, getRecentIOCs, getSavedBatches, deleteSavedBatch, type RecentIOC, type SavedBatch } from "../services/api";
+import { deleteRecentIOC, getRecentIOCs, getBatchesFromServer, deleteBatchFromServer, getSavedBatches, deleteSavedBatch, type RecentIOC, type SavedBatch } from "../services/api";
 import { showToast } from "../components/Toast";
 import type { NavigateEvent } from "../App";
 import { timeAgo } from "../lib/timeAgo";
 import Modal from "../components/Modal";
+
+const VERDICT_COLORS: Record<string, string> = {
+  malicious: "text-red-400 bg-red-500/15 border-red-500/30",
+  suspicious: "text-amber-400 bg-amber-500/15 border-amber-500/30",
+  clean: "text-emerald-400 bg-emerald-500/15 border-emerald-500/30",
+  unknown: "text-slate-400 bg-slate-500/15 border-slate-500/30",
+  error: "text-rose-300 bg-rose-500/10 border-rose-500/20",
+};
+
+function VerdictBadge({ label, count }: { label: string; count: number }) {
+  if (count === 0) return null;
+  const color = VERDICT_COLORS[label] ?? VERDICT_COLORS.unknown;
+  return (
+    <span className={`inline-flex items-center gap-1 text-[10px] font-semibold px-1.5 py-0.5 rounded border ${color}`}>
+      {count} {label}
+    </span>
+  );
+}
 
 export default function History() {
   const [items, setItems] = useState<RecentIOC[]>([]);
@@ -14,16 +32,40 @@ export default function History() {
   const [typeFilter, setTypeFilter] = useState("");
   const [confirmOpen, setConfirmOpen] = useState(false);
 
-  const load = useCallback(() => {
+  const load = useCallback(async () => {
     setLoading(true);
     setLoadError(null);
-    getRecentIOCs()
-      .then((data) => { setItems(data); setBatches(getSavedBatches()); })
-      .catch((e: Error) => { setLoadError(e.message); setItems([]); })
-      .finally(() => setLoading(false));
+    try {
+      const [iocs, serverBatches] = await Promise.all([
+        getRecentIOCs(),
+        getBatchesFromServer(),
+      ]);
+      const localBatches = getSavedBatches();
+      const map = new Map<string, SavedBatch>();
+      for (const b of localBatches) {
+        if (b && b.batch_id) {
+          const raw = b as unknown as Record<string, unknown>;
+          const legacyResult = (raw.result ?? b.result) as SavedBatch["result"];
+          const summary = b.summary || (legacyResult?.summary as Record<string, number> | undefined) || {};
+          map.set(b.batch_id, { ...b, summary, result: legacyResult });
+        }
+      }
+      for (const b of serverBatches) {
+        if (b && b.batch_id) {
+          map.set(b.batch_id, b);
+        }
+      }
+      setItems(iocs);
+      setBatches(Array.from(map.values()));
+    } catch (e: unknown) {
+      setLoadError(e instanceof Error ? e.message : String(e));
+      setItems([]);
+    } finally {
+      setLoading(false);
+    }
   }, []);
 
-  useEffect(load, [load]);
+  useEffect(() => { load(); }, [load]);
 
   function clearAll() {
     setConfirmOpen(false);
@@ -37,6 +79,17 @@ export default function History() {
     deleteRecentIOC(id)
       .then(load)
       .catch((err: Error) => showToast(err.message, "error"));
+  }
+
+  async function removeBatch(batchId: string) {
+    try {
+      await deleteBatchFromServer(batchId);
+      deleteSavedBatch(batchId);
+      setBatches((prev) => prev.filter((b) => b.batch_id !== batchId));
+      showToast("Batch removed", "success");
+    } catch (error: unknown) {
+      showToast(error instanceof Error ? error.message : "Failed to remove batch", "error");
+    }
   }
 
   function copyValue(value: string, e: React.MouseEvent) {
@@ -129,10 +182,94 @@ export default function History() {
         </select>
       </div>
 
-      {batches.length > 0 && <section className="mb-6 rounded-xl border border-accent/20 bg-accent/5 p-4">
-        <div className="mb-3 flex items-center justify-between"><div><h3 className="text-sm font-semibold">Batch scans</h3><p className="mt-0.5 text-xs text-text-secondary">Completed scans saved on this device. Select one to reopen its full report.</p></div><span className="rounded-full bg-accent/10 px-2 py-1 text-[10px] font-semibold text-accent">{batches.length}</span></div>
-        <div className="space-y-2">{batches.map((batch) => <div key={batch.batch_id} className="flex items-center gap-3 rounded-lg border border-border bg-bg-card px-3 py-3"><div className="min-w-0 flex-1"><div className="text-sm font-semibold">Batch scan <span className="font-mono text-xs text-text-secondary">#{batch.batch_id}</span></div><div className="mt-1 text-xs text-text-secondary">{batch.completed}/{batch.total} IOCs · {new Date(batch.created_at).toLocaleString()}</div></div><button type="button" onClick={() => window.dispatchEvent(new CustomEvent<NavigateEvent>("navigate", { detail: { page: "lookup", tool: "batch", batchId: batch.batch_id } }))} className="rounded-md bg-accent px-3 py-1.5 text-xs font-semibold text-[#06070d] hover:bg-accent/90">Open scan</button><button type="button" onClick={() => { deleteSavedBatch(batch.batch_id); setBatches(getSavedBatches()); }} className="rounded-md border border-border px-2 py-1.5 text-xs text-text-secondary hover:border-red-400/50 hover:text-red-300" aria-label={`Delete batch ${batch.batch_id}`}>Remove</button></div>)}</div>
-      </section>}
+      {batches.length > 0 && (
+        <section className="mb-6 rounded-xl border border-accent/20 bg-accent/5 p-4">
+          <div className="mb-3 flex items-center justify-between">
+            <div>
+              <h3 className="text-sm font-semibold">Batch Scans</h3>
+              <p className="mt-0.5 text-xs text-text-secondary">
+                Historical batch scans persisted on the server. Select one to reopen its full report.
+              </p>
+            </div>
+            <span className="rounded-full bg-accent/10 px-2 py-1 text-[10px] font-semibold text-accent">
+              {batches.length}
+            </span>
+          </div>
+          <div className="space-y-2">
+            {batches.map((batch) => {
+              const summary = batch.summary || {};
+              return (
+                <div
+                  key={batch.batch_id}
+                  className="flex items-center gap-3 rounded-lg border border-border bg-bg-card px-3 py-3"
+                >
+                  <div className="min-w-0 flex-1">
+                    <div className="text-sm font-semibold">
+                      Batch scan{" "}
+                      <span className="font-mono text-xs text-text-secondary">
+                        #{batch.batch_id}
+                      </span>
+                    </div>
+                    <div className="mt-1 flex flex-wrap items-center gap-1.5">
+                      <span className="text-xs text-text-secondary">
+                        {batch.completed}/{batch.total} IOCs
+                      </span>
+                      <VerdictBadge label="malicious" count={summary.malicious ?? 0} />
+                      <VerdictBadge label="suspicious" count={summary.suspicious ?? 0} />
+                      <VerdictBadge label="clean" count={summary.clean ?? 0} />
+                      <VerdictBadge label="unknown" count={summary.unknown ?? 0} />
+                      <VerdictBadge label="error" count={summary.error ?? 0} />
+                    </div>
+                    <div className="mt-1 text-[10px] text-text-secondary">
+                      {batch.created_at ? new Date(batch.created_at).toLocaleString() : "—"}
+                    </div>
+                  </div>
+
+                  <button
+                    type="button"
+                    onClick={() =>
+                      window.dispatchEvent(
+                        new CustomEvent<NavigateEvent>("navigate", {
+                          detail: { page: "lookup", tool: "batch", batchId: batch.batch_id, batchResult: batch.result ?? undefined },
+                        })
+                      )
+                    }
+                    className="rounded-md bg-accent px-3 py-1.5 text-xs font-semibold text-[#06070d] hover:bg-accent/90"
+                  >
+                    Open scan
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() =>
+                      window.dispatchEvent(
+                        new CustomEvent<NavigateEvent>("navigate", {
+                          detail: {
+                            page: "lookup",
+                            tool: "batch",
+                            batchId: batch.batch_id,
+                            autoRescan: true,
+                          },
+                        })
+                      )
+                    }
+                    className="rounded-md border border-accent/40 bg-accent/10 px-3 py-1.5 text-xs font-semibold text-accent hover:bg-accent/20"
+                  >
+                    Re-scan
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => removeBatch(batch.batch_id)}
+                    className="rounded-md border border-border px-2 py-1.5 text-xs text-text-secondary hover:border-red-400/50 hover:text-red-300"
+                    aria-label={`Delete batch ${batch.batch_id}`}
+                  >
+                    Remove
+                  </button>
+                </div>
+              );
+            })}
+          </div>
+        </section>
+      )}
 
       <div className="space-y-2">
         {filtered.map(item => (
@@ -140,11 +277,31 @@ export default function History() {
             key={item.id}
             role="button"
             tabIndex={0}
-            onClick={() => { window.dispatchEvent(new CustomEvent<NavigateEvent>("navigate", { detail: { page: "lookup", ioc: item.value } })); }}
+            onClick={() => {
+              window.dispatchEvent(new CustomEvent<NavigateEvent>("navigate", {
+                detail: {
+                  page: "lookup",
+                  ioc: item.value,
+                  iocType: item.ioc_type === "password" ? "password_sha1" : item.ioc_type,
+                  historyId: item.id,
+                  isHistorical: true,
+                  createdAt: item.created_at ?? undefined,
+                },
+              }));
+            }}
             onKeyDown={(e) => {
               if (e.key === "Enter" || e.key === " ") {
                 e.preventDefault();
-                window.dispatchEvent(new CustomEvent<NavigateEvent>("navigate", { detail: { page: "lookup", ioc: item.value } }));
+                window.dispatchEvent(new CustomEvent<NavigateEvent>("navigate", {
+                  detail: {
+                    page: "lookup",
+                    ioc: item.value,
+                    iocType: item.ioc_type === "password" ? "password_sha1" : item.ioc_type,
+                    historyId: item.id,
+                    isHistorical: true,
+                    createdAt: item.created_at ?? undefined,
+                  },
+                }));
               }
             }}
             className="flex items-center gap-3 px-4 py-2.5 bg-bg-card border border-border rounded-lg hover:bg-bg-elevated transition-colors cursor-pointer focus:outline-none focus:border-accent"
@@ -165,12 +322,14 @@ export default function History() {
               {item.verdict && (
                 <span className={
                   "text-xs font-medium px-2 py-0.5 rounded " +
-                  (item.verdict === "malicious" ? "text-verdict-malicious bg-verdict-malicious/10" :
+                  (item.verdict === "malicious" || item.verdict === "compromised" ? "text-verdict-malicious bg-verdict-malicious/10" :
+                   item.verdict === "breached" ? "text-rose-400 bg-rose-500/10 border border-rose-500/30" :
+                   item.verdict === "not_breached" ? "text-emerald-400 bg-emerald-500/10 border border-emerald-500/30" :
                    item.verdict === "suspicious" ? "text-verdict-suspicious bg-verdict-suspicious/10" :
-                   item.verdict === "clean" ? "text-verdict-clean bg-verdict-clean/10" :
+                   item.verdict === "clean" || item.verdict === "benign" ? "text-verdict-clean bg-verdict-clean/10" :
                    "text-verdict-unknown bg-verdict-unknown/10")
                 }>
-                  {item.verdict}
+                  {item.verdict.replace(/_/g, " ")}
                 </span>
               )}
               <button

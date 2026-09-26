@@ -1,11 +1,9 @@
-import asyncio
 import json
 import logging
 import logging.config
 import logging.handlers
 import queue
 import re
-import sys
 from contextvars import ContextVar
 from datetime import datetime, timezone
 from typing import Optional
@@ -15,10 +13,16 @@ from app.backend.config import settings
 _correlation_id: ContextVar[Optional[str]] = ContextVar("correlation_id", default=None)
 
 _SENSITIVE_PATTERNS = [
-    (re.compile(r'(api[_-]?key|apikey|secret|token|password|auth[_-]?key|jwt[_-]?secret)\s*[:=]\s*["\']?([^"\'&\s]+)', re.IGNORECASE), r'\1=****'),
-    (re.compile(r'(Authorization|X-API-Key|Bearer)\s*:\s*(\w+\s+)?\S+', re.IGNORECASE), r'\1: ****'),
+    (re.compile(r'(["\']?(?:api[_-]?key|apikey|secret|token|password|auth[ _-]?key|jwt[_-]?secret)["\']?)\s*[:=]\s*["\']?([^"\'&\s,}]+)', re.IGNORECASE), r'\1=****'),
+    (re.compile(r'(Authorization|X-API-Key|Auth-Key|Bearer)\s*:\s*(\w+\s+)?\S+', re.IGNORECASE), r'\1: ****'),
     (re.compile(r'https?://[^:]+:[^@]+@'), 'https://****:****@'),
 ]
+
+
+def _redact_text(value: str) -> str:
+    for pattern, replacement in _SENSITIVE_PATTERNS:
+        value = pattern.sub(replacement, value)
+    return value
 
 
 class SensitiveDataFilter(logging.Filter):
@@ -45,7 +49,7 @@ class JSONFormatter(logging.Formatter):
             "timestamp": ts,
             "level": record.levelname,
             "logger": record.name,
-            "message": record.getMessage(),
+            "message": _redact_text(record.getMessage()),
             "module": record.module,
             "function": record.funcName,
             "line": record.lineno,
@@ -53,7 +57,7 @@ class JSONFormatter(logging.Formatter):
         if correlation_id:
             entry["correlation_id"] = correlation_id
         if record.exc_info and record.exc_info[0]:
-            entry["exception"] = self.formatException(record.exc_info)
+            entry["exception"] = _redact_text(self.formatException(record.exc_info))
         return json.dumps(entry, default=str)
 
 
@@ -118,7 +122,6 @@ def _install_queue_listener() -> None:
 def configure_logging():
     global _configured
     log_level_str = settings.log_level.upper()
-    log_level = getattr(logging, log_level_str, logging.INFO)
 
     config = {
         "version": 1,

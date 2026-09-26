@@ -33,7 +33,7 @@ def _sync_windows_env():
             while True:
                 try:
                     name, val, _ = winreg.EnumValue(key, i)
-                    if isinstance(val, str) and val.strip():
+                    if isinstance(val, str) and val.strip() and name not in os.environ:
                         os.environ[name] = val.strip()
                     i += 1
                 except OSError:
@@ -116,7 +116,8 @@ class Settings(BaseSettings):
     hybridanalysis_api_key: str = Field("", alias="HA_API_KEY")
 
     greynoise_api_key: str = Field("", alias="GREYNOISE_API_KEY")
-    emailrep_api_key: str = Field("", alias="EMAILREP_API_KEY")
+    abstractapi_api_key: str = Field("", validation_alias=AliasChoices("ABSTRACTAPI_API_KEY", "ABSTRACT_API_KEY"))
+    hunterio_api_key: str = Field("", validation_alias=AliasChoices("HUNTERIO_API_KEY", "HUNTER_IO_API_KEY", "HUNTER_API_KEY"))
     alienvault_otx_api_key: str = Field("", validation_alias=AliasChoices("OTX_API_KEY", "ALIENVAULT_OTX_KEY"))
     shodan_api_key: str = Field("", alias="SHODAN_API_KEY")
     censys_api_key: str = Field("", alias="CENSYS_API_KEY")
@@ -131,13 +132,17 @@ class Settings(BaseSettings):
     fail_fast_missing_keys: bool = Field(False, alias="FAIL_FAST_MISSING_KEYS")
     host: str = Field("127.0.0.1", alias="HOST")
     port: int = Field(8000, alias="PORT")
+    allow_network_bind: bool = Field(False, alias="ALLOW_NETWORK_BIND")
     disable_auto_open: bool = Field(False, alias="DISABLE_AUTO_OPEN")
 
     scoring_override_min_weight: float = Field(OVERRIDE_MIN_MALICIOUS_WEIGHT, alias="SCORING_OVERRIDE_MIN_WEIGHT")
     scoring_override_count_high: int = Field(MALICIOUS_OVERRIDE_COUNT_HIGH, alias="SCORING_OVERRIDE_COUNT_HIGH")
     scoring_override_count_medium: int = Field(MALICIOUS_OVERRIDE_COUNT_MEDIUM, alias="SCORING_OVERRIDE_COUNT_MEDIUM")
     cors_origins: str = Field("http://localhost:8000,http://127.0.0.1:8000,http://localhost:5173", alias="CORS_ORIGINS")
+    trusted_hosts: str = Field("", alias="TRUSTED_HOSTS")
     base_url: str = Field("", alias="BASE_URL")
+    require_network_tls: bool = Field(True, alias="REQUIRE_NETWORK_TLS")
+    allow_global_feedback: bool = Field(False, alias="ALLOW_GLOBAL_FEEDBACK")
     cache_dir: str = Field("", alias="CACHE_DIR")
     app_name: str = "IOC Platform"
     debug: bool = False
@@ -149,15 +154,20 @@ class Settings(BaseSettings):
     network_timeout_seconds: float = Field(15.0, alias="NETWORK_TIMEOUT_SECONDS")
     batch_semaphore_limit: int = Field(10, alias="BATCH_SEMAPHORE_LIMIT")
     max_batch_iocs: int = Field(100, alias="MAX_BATCH_IOCS")
+    max_concurrent_lookups: int = Field(4, alias="MAX_CONCURRENT_LOOKUPS")
+    max_pending_lookups: int = Field(32, alias="MAX_PENDING_LOOKUPS")
     enable_active_port_scan: bool = Field(False, alias="ENABLE_ACTIVE_PORT_SCAN")
     enable_url_content_fetch: bool = Field(False, alias="ENABLE_URL_CONTENT_FETCH")
+    enable_public_url_submission: bool = Field(False, alias="ENABLE_PUBLIC_URL_SUBMISSION")
     webhooks_enabled: bool = Field(False, alias="WEBHOOKS_ENABLED")
+    webhook_secret_key: str = Field("", alias="WEBHOOK_SECRET_KEY")
     enabled_sources: str = Field("", alias="ENABLED_SOURCES")
     history_retention_days: int = Field(30, alias="HISTORY_RETENTION_DAYS")
     lookup_rate_limit_per_minute: int = Field(30, alias="LOOKUP_RATE_LIMIT_PER_MINUTE")
     lookup_rate_window: int = Field(60, alias="LOOKUP_RATE_WINDOW")
     lookup_global_rate_limit_per_minute: int = Field(300, alias="LOOKUP_GLOBAL_RATE_LIMIT_PER_MINUTE")
     trust_proxy: bool = Field(False, alias="TRUST_PROXY")
+    trusted_proxy_hosts: str = Field("", alias="TRUSTED_PROXY_HOSTS")
 
     def __init__(self, **values):
         if "database_url" in values:
@@ -212,6 +222,10 @@ class Settings(BaseSettings):
     def _validate_required(self):
         if not self.database_url:
             raise ValueError("DATABASE_URL is required — set it in .env or environment")
+        if self.max_concurrent_lookups < 1 or self.max_pending_lookups < 1:
+            raise ValueError("Lookup concurrency and pending limits must be positive")
+        if self.batch_semaphore_limit < 1 or self.max_batch_iocs < 1:
+            raise ValueError("Batch limits must be positive")
         if self.fail_fast_missing_keys:
             from app.backend.adapters.base import is_valid_api_key
 
@@ -225,8 +239,20 @@ class Settings(BaseSettings):
                     "FAIL_FAST_MISSING_KEYS is enabled but the following API keys are "
                     f"missing or placeholders: {', '.join(missing)}"
                 )
-        if not _is_loopback_host(self.host) and not self.api_keys.strip():
-            raise ValueError("API_KEYS is required when HOST is not a loopback address")
+        if not _is_loopback_host(self.host) and not self.allow_network_bind:
+            raise ValueError("ALLOW_NETWORK_BIND=true is required for non-loopback binding")
+        if self.allow_network_bind:
+            api_keys = [key.strip() for key in self.api_keys.split(",") if key.strip()]
+            if not api_keys:
+                raise ValueError("API_KEYS is required when ALLOW_NETWORK_BIND=true")
+            if any(len(key) < 16 for key in api_keys):
+                raise ValueError("Network API keys must be at least 16 characters")
+            if self.require_network_tls and not self.base_url.lower().startswith("https://"):
+                raise ValueError("BASE_URL must use HTTPS when network binding is enabled")
+        if self.webhooks_enabled and not self.webhook_secret_key.strip():
+            raise ValueError("WEBHOOK_SECRET_KEY is required when webhooks are enabled")
+        if self.trust_proxy and not self.trusted_proxy_hosts.strip():
+            raise ValueError("TRUSTED_PROXY_HOSTS is required when TRUST_PROXY is enabled")
         return self
 
 
@@ -255,7 +281,8 @@ _API_KEY_FIELDS = (
     "shodan_api_key",
     "censys_api_key",
     "ipinfo_api_key",
-    "emailrep_api_key",
+    "abstractapi_api_key",
+    "hunterio_api_key",
 )
 
 

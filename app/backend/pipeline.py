@@ -1,6 +1,8 @@
 import asyncio
 import ipaddress
+import json
 import random
+import re
 import threading
 import time
 import uuid
@@ -12,11 +14,12 @@ import httpx
 
 from app.backend.cache import TASK_TTL, CacheLayer, cache_key, cache_ttl
 from app.backend.config import settings
-from app.backend.http_client import get_client, get_timeout
+from app.backend.http_client import get_client
 from app.backend.rate_limiter import RateLimiter
 from app.backend.adapters.cve_org import CveOrgAdapter
 from app.backend.adapters.hashlookup import HashlookupAdapter
-from app.backend.adapters.emailrep_io import EmailRepIOAdapter
+from app.backend.adapters.abstract_api import AbstractAPIAdapter
+from app.backend.adapters.hunter_io import HunterIOAdapter
 from app.backend.adapters.team_cymru import TeamCymruAdapter
 from app.backend.adapters.nvd import NvdAdapter
 from app.backend.adapters.abuse_ipdb import AbuseIPDBAdapter
@@ -24,10 +27,12 @@ from app.backend.adapters.alienvault_otx import AlienVaultOTXAdapter
 from app.backend.adapters.base import (
     CompositeScore,
     EnrichmentData,
+    InfostealerIntel,
     IOCAssessment,
     LookupResponse,
     NormalizedResult,
     ProviderHealth,
+    WebPreviewInfo,
 )
 from app.backend.adapters.censys import CensysAdapter
 from app.backend.adapters.grey_noise import GreyNoiseAdapter
@@ -49,7 +54,7 @@ from app.backend.adapters.filescan import FileScanAdapter
 from app.backend.adapters.blockchain_info import BlockchainInfoAdapter
 from app.backend.adapters.hudson_rock import HudsonRockAdapter
 from app.backend.adapters.hibp import HIBPAdapter
-from app.backend.classifier import SUPPORTED_IOC_TYPES, classify_ioc, is_search_based, normalize_ioc, refang
+from app.backend.classifier import SUPPORTED_IOC_TYPES, is_password_digest, normalize_ioc, password_digest
 from app.backend.domain_router import route_assessment_domain
 from app.backend.evidence import normalize_provider_result
 from app.backend.provider_capabilities import build_provider_plan
@@ -85,7 +90,8 @@ def _init_adapters():
         CensysAdapter(),
         IPinfoAdapter(),
         StopForumSpamAdapter(),
-        EmailRepIOAdapter(),
+        AbstractAPIAdapter(),
+        HunterIOAdapter(),
         TeamCymruAdapter(),
         CveOrgAdapter(),
         NvdAdapter(),
@@ -123,6 +129,7 @@ class AnalysisTask:
     stages: list[StageInfo] = field(default_factory=list)
     ioc_value: str = ""
     ioc_type: str = ""
+    password_prehashed: bool = False
     normalized: str = ""
     assessment_domain: str = "ioc_reputation"
     provider_plan: list[dict] = field(default_factory=list)
@@ -151,6 +158,7 @@ class AnalysisTask:
             "stages": [{"name": s.name, "status": s.status, "message": s.message, "progress": s.progress} for s in self.stages],
             "ioc_value": self.ioc_value,
             "ioc_type": self.ioc_type,
+            "password_prehashed": self.password_prehashed,
             "normalized": self.normalized,
             "assessment_domain": self.assessment_domain,
             "provider_plan": self.provider_plan,
@@ -183,6 +191,7 @@ class AnalysisTask:
             stages=stages,
             ioc_value=data.get("ioc_value", ""),
             ioc_type=data.get("ioc_type", ""),
+            password_prehashed=data.get("password_prehashed", False),
             normalized=data.get("normalized", ""),
             assessment_domain=data.get("assessment_domain", "ioc_reputation"),
             provider_plan=data.get("provider_plan", []),
@@ -196,6 +205,25 @@ class AnalysisTask:
             error=data.get("error"),
             created_at=data.get("created_at", time.time()),
         )
+
+
+def task_response_payload(task: AnalysisTask) -> dict:
+    return LookupResponse(
+        input=task.ioc_value,
+        task_id=task.task_id,
+        normalized=task.normalized or task.ioc_value,
+        ioc_type=task.ioc_type or "unknown",
+        password_prehashed=task.password_prehashed or (
+            task.ioc_type == "password" and bool(re.fullmatch(r"[a-f0-9]{40}", task.normalized or "", re.IGNORECASE))
+        ),
+        composite=task.composite or CompositeScore(),
+        final_assessment=task.final_assessment,
+        provider_health=task.provider_health,
+        enrichment=task.enrichment or EnrichmentData(),
+        results=task.results,
+        relationships=task.relationships,
+        executive_summary=task.executive_summary,
+    ).model_dump(mode="json")
 
 
 _tasks: dict[str, AnalysisTask] = {}
@@ -342,6 +370,7 @@ async def run_analysis(
     ioc_type_override: str | None = None,
     ioc_deadline: float | None = None,
     bypass_cache: bool = False,
+    password_prehashed: bool = False,
 ) -> AnalysisTask:
     tid = task_id or uuid.uuid4().hex[:12]
     configured_deadline = ioc_deadline if ioc_deadline is not None else getattr(settings, "ioc_deadline_seconds", PIPELINE_TIMEOUT)
@@ -364,7 +393,8 @@ async def run_analysis(
         StageInfo("Censys"),
         StageInfo("IPinfo"),
         StageInfo("StopForumSpam"),
-        StageInfo("EmailRep.io"),
+        StageInfo("AbstractAPI"),
+        StageInfo("Hunter.io"),
         StageInfo("Team Cymru"),
         StageInfo("Hashlookup"),
         StageInfo("CVE Intelligence"),
@@ -372,7 +402,25 @@ async def run_analysis(
         StageInfo("Scoring & Relations"),
     ]
 
-    task = AnalysisTask(task_id=tid, ioc_value=ioc_value, stages=stages, status="pending")
+    normalized_info = normalize_ioc(ioc_value, expected_type=ioc_type_override)
+    normalized = normalized_info.value
+    ioc_type = ioc_type_override or normalized_info.ioc_type
+    if ioc_type == "password" and password_prehashed and not is_password_digest(normalized):
+        password_prehashed = False
+    if ioc_type == "password" and normalized:
+        safe_ioc_value = password_digest(normalized, already_digest=password_prehashed)
+    elif normalized_info.valid:
+        safe_ioc_value = normalized
+    else:
+        safe_ioc_value = ""
+
+    task = AnalysisTask(
+        task_id=tid,
+        ioc_value=safe_ioc_value,
+        stages=stages,
+        status="pending",
+        password_prehashed=password_prehashed,
+    )
 
     with _dict_lock:
         _tasks[tid] = task
@@ -387,16 +435,14 @@ async def run_analysis(
         await _update_stage(task, "Classify & Normalize", "running", "Normalizing IOC value")
         await _emit_stage_event(task, "Classify & Normalize", "running", "Normalizing IOC value")
 
-        normalized_info = normalize_ioc(ioc_value, expected_type=ioc_type_override)
-        normalized = normalized_info.value
         if not normalized:
             raise ValueError("Empty IOC after normalization")
-
-        ioc_type = ioc_type_override or normalized_info.ioc_type
         if ioc_type not in SUPPORTED_IOC_TYPES:
             raise ValueError(f"Unsupported IOC type: {ioc_type}")
         if ioc_type_override and ioc_type not in normalized_info.candidate_types:
             raise ValueError(f"IOC value does not validate as {ioc_type}")
+        if ioc_type == "password":
+            normalized = password_digest(normalized, already_digest=password_prehashed)
         task.ioc_type = ioc_type
         task.normalized = normalized
         task.assessment_domain = route_assessment_domain(ioc_type, normalized).domain
@@ -436,6 +482,7 @@ async def run_analysis(
                     task.progress = 100.0
                     _unregister_running(tid)
                     return task
+
             except ValueError:
                 pass
 
@@ -566,6 +613,33 @@ async def run_analysis(
                                         from app.backend.rate_limiter import RateLimitDecision
                                         decision = RateLimitDecision(allowed, reason="rate_limited" if not allowed else "")
                                     if not decision.allowed:
+                                        # ── Adaptive rate-limit waiting ─────
+                                        # Instead of immediately failing, wait
+                                        # for the rate-limit window to expire
+                                        # and then retry the provider call.
+                                        wait_secs = decision.retry_after_seconds or float(
+                                            getattr(adapter.rate_limit, "minimum_interval_seconds", 15.0)
+                                        )
+                                        max_wait = float(getattr(adapter.rate_limit, "max_backoff_seconds", 60.0))
+                                        wait_secs = min(wait_secs, max_wait)
+                                        if time.monotonic() + wait_secs < deadline:
+                                            limit_tag = decision.reason or "rate_limited"
+                                            logger.info(
+                                                "Rate-limited on %s for %s — waiting %.1fs (attempt %s/%s)",
+                                                adapter.name, normalized, wait_secs, attempts + 1, max_retries,
+                                            )
+                                            await _update_stage(
+                                                task, stage_name, "running",
+                                                f"Rate-limited — waiting {wait_secs:.0f}s…",
+                                            )
+                                            await _emit_stage_event(
+                                                task, stage_name, "running",
+                                                f"Rate-limited — waiting {wait_secs:.0f}s…",
+                                            )
+                                            await asyncio.sleep(wait_secs)
+                                            attempts += 1
+                                            continue  # retry the while loop
+                                        # Deadline would be exceeded — give up.
                                         limit_tag = decision.reason or "rate_limited"
                                         final_result = _failure_result(
                                             normalized, ioc_type, adapter.name, "rate_limited", limit_tag,
@@ -632,7 +706,7 @@ async def run_analysis(
                                 await asyncio.sleep(delay)
                                 continue
                         break
-                    except httpx.TimeoutException as ex:
+                    except httpx.TimeoutException:
                         final_result = _failure_result(
                             normalized, ioc_type, adapter.name, "timeout", "timeout",
                             retry_count=attempts, request_made=True, started=started,
@@ -644,7 +718,7 @@ async def run_analysis(
                                 await asyncio.sleep(delay)
                                 continue
                         break
-                    except (httpx.RequestError, ConnectionError, OSError) as ex:
+                    except (httpx.RequestError, ConnectionError, OSError):
                         final_result = _failure_result(
                             normalized, ioc_type, adapter.name, "error", "request_error",
                             retry_count=attempts, request_made=True, started=started,
@@ -683,9 +757,14 @@ async def run_analysis(
                     result.cached, result.http_status,
                 )
                 # Cache successful answers, including not_found answers.  A
-                # health failure is never cached because it is not an IOC
-                # observation and could poison future coverage.
-                if cache is not None and result.execution_state in {"success", "not_found"}:
+                # health failure or rate-limit or error is NEVER cached because it
+                # is not valid IOC intelligence and would poison future scans.
+                _is_error_result = (
+                    result.execution_state not in {"success", "not_found"}
+                    or bool(getattr(result, "error", None))
+                    or any(t in (result.tags or []) for t in ("error", "rate_limited", "timeout", "circuit_breaker", "failed", "service_unavailable"))
+                )
+                if cache is not None and not _is_error_result:
                     ttl = int(getattr(adapter.rate_limit, "cache_ttl_seconds", None) or cache_ttl(adapter.name, ioc_type))
                     cache_now = datetime.now(timezone.utc)
                     result.cache_key = ck
@@ -731,13 +810,18 @@ async def run_analysis(
                     if cached is not None:
                         result = NormalizedResult(**cached)
                         # Older cache entries may have been written before
-                        # execution states were explicit.  Never reuse a
-                        # health failure (especially a stale rate-limit
-                        # marker) as if it were intelligence.
-                        if result.execution_state not in {"success", "not_found"}:
+                        # execution states were explicit. Never reuse an error,
+                        # rate-limit, or health failure. Purge it from cache
+                        # and run a fresh live scan instead.
+                        cached_is_error = (
+                            result.execution_state not in {"success", "not_found"}
+                            or bool(getattr(result, "error", None))
+                            or any(t in (result.tags or []) for t in ("error", "rate_limited", "timeout", "circuit_breaker", "failed", "service_unavailable"))
+                        )
+                        if cached_is_error:
                             await cache.delete(ck)
                             cached = None
-                        else:
+                        elif not cached_stale:
                             if "cached" not in result.tags:
                                 result.tags = list(result.tags or []) + ["cached"]
                             result.cached = True
@@ -754,23 +838,45 @@ async def run_analysis(
                                 if cache_reference.tzinfo is None:
                                     cache_reference = cache_reference.replace(tzinfo=timezone.utc)
                                 result.cache_age = max(0.0, (result.retrieved_at - cache_reference).total_seconds())
-                            result.freshness_class = "historical" if cached_stale or (result.cache_age is not None and result.cache_age > 90 * 86400) else "cached"
-                            result.stale = cached_stale or bool(result.expires_at and result.retrieved_at > result.expires_at)
-                            if result.stale:
-                                result.cache_status = "stale"
+                            result.freshness_class = "cached"
+                            result.stale = False
                             result.cache_metadata.cached = True
                             result.cache_metadata.cache_key = ck
                             result.cache_metadata.cache_age = result.cache_age
                             result.cache_metadata.retrieved_at = result.retrieved_at
-                            result.cache_metadata.freshness_class = result.freshness_class
-                            result.cache_metadata.stale = result.stale
-                            result.cache_metadata.status = "stale" if result.stale else "cached"
+                            result.cache_metadata.freshness_class = "cached"
+                            result.cache_metadata.stale = False
+                            result.cache_metadata.status = "cached"
                             result_map[adapter.name] = result
                             await _update_stage(task, stage_name, "done", f"{adapter.name} (cached)", 1.0)
                             await _emit_stage_event(task, stage_name, "done", f"{adapter.name} (cached)", 1.0)
                             await _emit_result_event(task, result)
                             return
                     await _execute()
+                    if cached is not None and cached_stale:
+                        live_res = result_map.get(adapter.name)
+                        if live_res and live_res.execution_state in {"error", "timeout", "rate_limited"}:
+                            stale_res = NormalizedResult(**cached)
+                            if "cached" not in stale_res.tags:
+                                stale_res.tags = list(stale_res.tags or []) + ["cached"]
+                            stale_res.cached = True
+                            stale_res.cache_status = "stale"
+                            stale_res.freshness_class = "historical"
+                            stale_res.stale = True
+                            stale_res.retrieved_at = datetime.now(timezone.utc)
+                            cache_reference = stale_res.cache_created_at or stale_res.observed_at
+                            if cache_reference is not None:
+                                if cache_reference.tzinfo is None:
+                                    cache_reference = cache_reference.replace(tzinfo=timezone.utc)
+                                stale_res.cache_age = max(0.0, (stale_res.retrieved_at - cache_reference).total_seconds())
+                            stale_res.cache_metadata.cached = True
+                            stale_res.cache_metadata.cache_key = ck
+                            stale_res.cache_metadata.cache_age = stale_res.cache_age
+                            stale_res.cache_metadata.retrieved_at = stale_res.retrieved_at
+                            stale_res.cache_metadata.freshness_class = "historical"
+                            stale_res.cache_metadata.stale = True
+                            stale_res.cache_metadata.status = "stale"
+                            result_map[adapter.name] = stale_res
             else:
                 await _execute()
 
@@ -851,6 +957,71 @@ async def run_analysis(
                 enrichment.analysis_notes.append(
                     "Supporting sources were selected, but none returned a usable result."
                 )
+
+            # --- Propagate Structured Intelligence from Adapter Results ---
+            if task.enrichment is not None:
+                for r in task.results:
+                    # 1. urlscan.io -> WebPreviewInfo
+                    if r.source == "urlscan.io" and isinstance(r.raw_data, dict):
+                        wp_raw = r.raw_data.get("web_preview")
+                        if wp_raw and isinstance(wp_raw, dict) and not task.enrichment.web_preview:
+                            try:
+                                scan_uuid = wp_raw.get("scan_uuid")
+                                proxied_url = f"/api/screenshot?scan_id={scan_uuid}" if scan_uuid else None
+                                task.enrichment.web_preview = WebPreviewInfo(
+                                    screenshot_url=proxied_url,
+                                    page_title=wp_raw.get("page_title"),
+                                    server=wp_raw.get("server"),
+                                    language=wp_raw.get("language"),
+                                    domain_age_days=wp_raw.get("domain_age_days"),
+                                    tls_issuer=wp_raw.get("tls_issuer"),
+                                    tls_valid_days=wp_raw.get("tls_valid_days"),
+                                    asn_name=wp_raw.get("asn_name"),
+                                    detected_brands=wp_raw.get("detected_brands", []) or [],
+                                    detected_technologies=wp_raw.get("detected_technologies", []) or [],
+                                    mime_type=wp_raw.get("mime_type"),
+                                    scan_uuid=scan_uuid,
+                                )
+                            except Exception as exc:
+                                logger.debug("Failed to construct WebPreviewInfo: %s", exc)
+
+                    # 2. Hudson Rock -> InfostealerIntel
+                    if r.source == "Hudson Rock" and isinstance(r.raw_data, dict):
+                        if not task.enrichment.infostealer:
+                            try:
+                                families_raw = r.raw_data.get("stealer_families", {})
+                                families_dict = families_raw if isinstance(families_raw, dict) else {}
+                                dates_list = r.raw_data.get("dates_compromised", [])
+                                date_range = f"{dates_list[0]} to {dates_list[-1]}" if dates_list else None
+                                task.enrichment.infostealer = InfostealerIntel(
+                                    total_employee_compromises=r.raw_data.get("total_infections", 0) or 0,
+                                    total_client_compromises=r.raw_data.get("total_user_services", 0) or 0,
+                                    top_corporate_services=r.raw_data.get("top_corporate_services", []) or [],
+                                    top_external_services=r.raw_data.get("top_external_services", []) or [],
+                                    stealer_families=families_dict,
+                                    password_strength_weak_pct=r.raw_data.get("password_strength_weak_pct"),
+                                    password_strength_strong_pct=r.raw_data.get("password_strength_strong_pct"),
+                                    total_compromised_urls=r.raw_data.get("total_compromised_urls"),
+                                    date_range=date_range,
+                                )
+                            except Exception as exc:
+                                logger.debug("Failed to construct InfostealerIntel: %s", exc)
+
+                    # 3. AbuseIPDB -> abuse_reports
+                    if r.source == "AbuseIPDB" and isinstance(r.raw_data, dict):
+                        reports = r.raw_data.get("reports", []) or []
+                        if reports and not task.enrichment.abuse_reports:
+                            task.enrichment.abuse_reports = reports[:20]
+
+                    # 4. AlienVault OTX -> malware_urls & associated_hashes
+                    if r.source == "AlienVault OTX" and isinstance(r.raw_data, dict):
+                        mal_urls = r.raw_data.get("malware_urls", []) or []
+                        if mal_urls and not task.enrichment.malware_urls:
+                            task.enrichment.malware_urls = mal_urls[:25]
+                        assoc_hashes = r.raw_data.get("associated_hashes", []) or []
+                        if assoc_hashes and not task.enrichment.associated_hashes:
+                            task.enrichment.associated_hashes = assoc_hashes[:15]
+
             await _update_stage(task, "Enrichment", "done", "Enrichment complete", 1.0)
             await _emit_stage_event(task, "Enrichment", "done", "Enrichment complete", 1.0)
 
@@ -919,13 +1090,16 @@ async def run_analysis(
             relationship_keys: set[str] = set()
             for r in task.results:
                 for rel_ioc, rel_type in r.related_iocs:
-                    fingerprint = f"{normalized}|{rel_ioc.strip().lower()}|{rel_type.lower()}"
+                    rel_ioc_clean = str(rel_ioc).strip()
+                    if not rel_ioc_clean or rel_ioc_clean.lower() in {"other", "unknown", "none", "n/a", "null"}:
+                        continue
+                    fingerprint = f"{normalized}|{rel_ioc_clean.lower()}|{rel_type.lower()}"
                     if fingerprint in relationship_keys:
                         continue
                     relationship_keys.add(fingerprint)
                     relationships.append({
                         "source_ioc": normalized,
-                        "target_ioc": rel_ioc,
+                        "target_ioc": rel_ioc_clean,
                         "relationship": rel_type,
                         "via_source": r.source,
                         "confidence": "medium",
@@ -970,11 +1144,10 @@ async def run_analysis(
             await _emit_done_event(task)
 
     except asyncio.CancelledError:
-        task.status = "error"
-        task.error = "Analysis cancelled (client disconnected)"
+        task.status = "cancelled"
+        task.error = "Analysis cancelled"
         task.progress = 100.0
-        logger.warning("Analysis %s cancelled (client disconnected)", tid)
-        await _emit_error_event(task, "Analysis", "Analysis cancelled (client disconnected)")
+        logger.info("Analysis %s cancelled", tid)
         await _emit_done_event(task)
     except Exception as e:
         task.status = "error"
@@ -992,6 +1165,51 @@ async def run_analysis(
                     {"task_id": tid},
                     TASK_TTL,
                 )
+
+    if task.status == "done" and task.normalized:
+        try:
+            from app.backend.database import async_session, upsert_lookup_result
+            from app.backend.models import IOC
+            from sqlalchemy import select
+            async with async_session() as session:
+                val = task.normalized
+                ioc_type = task.ioc_type or "unknown"
+                existing = await session.execute(select(IOC).where(IOC.value == val))
+                ioc_obj = existing.scalar_one_or_none()
+                if not ioc_obj:
+                    ioc_obj = IOC(value=val, ioc_type=ioc_type)
+                    session.add(ioc_obj)
+                    await session.flush()
+                score = getattr(task.composite, "score", 0.0) if task.composite else 0.0
+                verdict = getattr(task.composite, "verdict", "unknown") if task.composite else "unknown"
+                confidence = getattr(task.composite, "confidence", "low") if task.composite else "low"
+                await upsert_lookup_result(
+                    session,
+                    ioc_id=ioc_obj.id,
+                    task_id=tid,
+                    composite_score=score,
+                    composite_verdict=verdict,
+                    composite_confidence=confidence,
+                    full_response=json.dumps(task_response_payload(task), default=str),
+                    source_count=len(task.results),
+                )
+        except Exception as exc:
+            logger.debug("Failed to auto-persist task %s to SQLite: %s", tid, exc)
+
+    if task.status == "done" and task.normalized:
+        try:
+            from app.backend.webhooks import queue_lookup_dispatch
+
+            assessment = task.final_assessment
+            verdict = (
+                assessment.final_verdict
+                if assessment is not None
+                else getattr(task.composite, "verdict", "unknown")
+            )
+            score = getattr(task.composite, "score", 0.0) if task.composite else 0.0
+            await queue_lookup_dispatch(tid, task.normalized, verdict, score)
+        except Exception as exc:
+            logger.debug("Webhook completion dispatch skipped for task %s: %s", tid, exc)
 
     _unregister_running(tid)
     return task

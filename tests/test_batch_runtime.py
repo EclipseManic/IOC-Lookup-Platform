@@ -189,5 +189,5 @@ def test_consolidate_results_and_relationships():
 
     out = batch_mod.consolidate_batch_results(bt)
     assert out["summary"]["malicious"] == 1
-    assert out["results"][0]["_ioc"] == "8.8.8.8"
+    assert out["results"][0].get("ioc") == "8.8.8.8"
     assert len(out["relationships"]) == 1

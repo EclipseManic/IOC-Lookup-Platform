@@ -25,8 +25,9 @@ IOC coverage, whether it is public or key-backed, and whether its configured
 credential came from `.env` or the process environment. Secret values are never
 returned.
 
-The current source set includes 21 provider adapters, plus public enrichment
+The current source set includes 28 provider adapters, plus public enrichment
 services used for context:
+
 
 | Source | Free/public behavior | IOC coverage |
 |---|---|---|
@@ -48,6 +49,7 @@ services used for context:
 | MalwareBazaar | API key required by the current endpoint | MD5/SHA-1/SHA-256 |
 | ThreatFox | API key required by the current endpoint | IPs, domains, URLs, hashes |
 | VirusTotal, AbuseIPDB, OTX, Tria.ge, Hybrid Analysis, Censys | Optional API keys | Type-specific coverage shown in `/api/sources` |
+| AbstractAPI, Hunter.io, Team Cymru | Optional API keys or public enrichment | Type-specific coverage shown in `/api/sources` |
 
 Public context is not a clean verdict. If no reputation provider covers an IOC,
 the result is explicitly marked as contextual/enrichment-only. Source errors,
@@ -72,6 +74,19 @@ Copy-Item .env.example .env
 python run.py
 ```
 
+The application runs the Alembic migration to `head` during startup. To inspect or
+perform migrations explicitly, use `python -m alembic upgrade head`; use a
+separate `DATABASE_URL` when testing migrations. Startup refuses to adopt an
+unversioned SQLite file whose existing tables are missing required columns, and
+`alembic downgrade` refuses to run once batch records exist, because that step
+would drop batch history and `lookup_results.batch_id` associations. Back up the
+database file before any downgrade attempt.
+
+```powershell
+$env:DATABASE_URL="sqlite+aiosqlite:///./data/ioc_platform.db"
+python -m alembic upgrade head
+```
+
 The browser opens at `http://127.0.0.1:8000/`. Press `Ctrl+C` in the terminal to stop the tool.
 
 The included UI build is ready to use. Node.js is needed only when changing frontend source code:
@@ -84,7 +99,7 @@ npm run build
 
 ## Configure intelligence sources
 
-**Empty `.env` is normal.** This is a single-user local tool — credentials are read from **system environment variables first** (never stored on disk). `.env` is only an optional fallback.
+**Empty `.env` is normal.** This is a single-user local tool — credentials are read from **system environment variables first** (never stored on disk). `.env` is only an optional fallback. Keep `HOST=127.0.0.1`; if another device must reach the service, set `ALLOW_NETWORK_BIND=true`, use a strong `API_KEYS` value, and set an HTTPS `BASE_URL` behind a trusted TLS reverse proxy.
 
 ```powershell
 # Recommended: set keys in your shell (PowerShell)
@@ -124,13 +139,24 @@ Additional app-level settings:
 
 | Variable | Purpose |
 |---|---|
-| `API_KEYS` | Only needed if you bind `HOST` outside loopback |
+| `API_KEYS` | Required when network binding is enabled; use strong random keys |
+| `ALLOW_NETWORK_BIND` | Must be `true` for an explicit non-loopback bind; keep `false` locally |
+| `BASE_URL` | Required HTTPS URL when network binding is enabled |
+| `REQUIRE_NETWORK_TLS` | Defaults to `true`; keep TLS enforcement enabled for remote use |
+| `TRUST_PROXY` | Trust forwarded headers only behind a controlled proxy |
+| `TRUSTED_PROXY_HOSTS` | Required when `TRUST_PROXY=true`; comma-separated proxy peer addresses |
+| `TRUSTED_HOSTS` | Optional comma-separated host allowlist for local or reverse-proxy access |
+| `ALLOW_GLOBAL_FEEDBACK` | Keep `false` in network mode unless global analyst feedback is intentional |
 | `FAIL_FAST_MISSING_KEYS` | Set to `true` to reject startup when required provider keys are missing or placeholders |
+| `REDIS_URL` | Optional shared cache/rate-limit backend; unset uses local files/in-process limits |
+| `WEBHOOK_SECRET_KEY` | Required when `WEBHOOKS_ENABLED=true`; encrypts stored delivery secrets |
+| `ENABLE_PUBLIC_URL_SUBMISSION` | Explicit opt-in for active urlscan submissions |
+| `ENABLE_URL_CONTENT_FETCH` | Explicit opt-in for remote URL content enrichment |
 
 Summary:
 
-- 15 third-party provider keys are supported in `app/backend/config.py` (including `EMAILREP_API_KEY`)
-- 1 enrichment-only key is supported: `NVD_API_KEY`
+- Provider keys are resolved from the environment before `.env`; see `.env.example` for the complete list.
+- HIBP password lookups use the k-anonymity range API and do not require a key.
 - Host-artifact types (`mutex`, `named_pipe`, `registry_key`, `service_name`, `ssdeep`) now query Hybrid Analysis / Tria.ge search when keys are present, otherwise show structural enrichment as `context only`.
 - The sample `.env` ships empty — add keys to system env or `.env` as you prefer.
 
@@ -150,7 +176,9 @@ The local SQLite database is stored at `data/ioc_platform.db`. Cached task and a
 Backend:
 
 ```powershell
+python -m pip install -r requirements-dev.txt
 python -m pytest -q
+pip-audit -r requirements.txt
 ```
 
 Frontend:
@@ -169,9 +197,11 @@ npm run build
 | `POST` | `/api/lookup` | Start analysis |
 | `GET` | `/api/tasks/{task_id}` | Read task progress |
 | `GET` | `/api/tasks/{task_id}/result` | Read completed results |
+| `POST` | `/api/tasks/{task_id}/cancel` | Cancel a running analysis |
 | `GET` | `/api/recent` | Lookup history |
 | `GET/POST` | `/api/investigations` | Investigation cases |
 | `POST` | `/api/batch` | Batch analysis |
+| `POST` | `/api/batch/{batch_id}/cancel` | Cancel a running batch |
 | `POST` | `/api/export/stix` | STIX export |
 | `POST` | `/api/export/misp` | MISP export |
 | `POST` | `/api/export/siem` | SIEM export |

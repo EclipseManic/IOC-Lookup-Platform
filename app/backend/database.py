@@ -1,13 +1,17 @@
 import asyncio
+import os
+import subprocess
+import sys
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
-from sqlalchemy import event, select, delete
+from sqlalchemy import event, inspect, select, delete, text
 from sqlalchemy.exc import OperationalError
+from sqlalchemy import create_engine
 from sqlalchemy.ext.asyncio import create_async_engine, async_sessionmaker, AsyncSession
 
 from app.backend.config import settings
-from app.backend.models import Base, IOC, LookupResult
+from app.backend.models import Base, IOC, InvestigationIOC, IOCFeedback, LookupResult
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
 
@@ -55,9 +59,75 @@ def _set_sqlite_pragma(dbapi_connection, connection_record):
 async_session = async_sessionmaker(engine, class_=AsyncSession, expire_on_commit=True)
 
 
+def _adopt_unversioned_sqlite() -> bool:
+    if not _db_url.startswith("sqlite+aiosqlite"):
+        return False
+    sync_engine = create_engine(_db_url.replace("+aiosqlite", ""))
+    try:
+        with sync_engine.connect() as connection:
+            inspector = inspect(connection)
+            tables = set(inspector.get_table_names())
+            if not {"iocs", "lookup_results", "investigation_iocs", "investigations"} <= tables:
+                return False
+            if "alembic_version" in tables:
+                versions = connection.execute(text("SELECT version_num FROM alembic_version")).fetchall()
+                if versions:
+                    return False
+            problems: list[str] = []
+            for table in Base.metadata.sorted_tables:
+                if table.name not in tables:
+                    continue
+                columns = {column["name"] for column in inspector.get_columns(table.name)}
+                for column in table.columns:
+                    if column.nullable or column.server_default is not None:
+                        continue
+                    if column.name not in columns:
+                        problems.append(f"{table.name} missing required column {column.name}")
+            if problems:
+                raise RuntimeError(
+                    "Refusing to adopt unversioned SQLite database with an incompatible schema: "
+                    + "; ".join(problems)
+                )
+        Base.metadata.create_all(sync_engine)
+        with sync_engine.begin() as connection:
+            connection.execute(
+                text(
+                    "CREATE TABLE IF NOT EXISTS alembic_version "
+                    "(version_num VARCHAR(32) NOT NULL, CONSTRAINT alembic_version_pkc PRIMARY KEY (version_num))"
+                )
+            )
+            connection.execute(text("DELETE FROM alembic_version"))
+            connection.execute(
+                text("INSERT INTO alembic_version (version_num) VALUES (:revision)"),
+                {"revision": "a1f96ea838ee"},
+            )
+        return True
+    finally:
+        sync_engine.dispose()
+
+
 async def init_db():
-    async with engine.begin() as conn:
-        await conn.run_sync(Base.metadata.create_all)
+    if ":memory:" in settings.database_url:
+        async with engine.begin() as conn:
+            await conn.run_sync(Base.metadata.create_all)
+        return
+
+    def upgrade() -> None:
+        _adopt_unversioned_sqlite()
+        environment = os.environ.copy()
+        environment["DATABASE_URL"] = settings.database_url
+        result = subprocess.run(
+            [sys.executable, "-m", "alembic", "upgrade", "head"],
+            cwd=PROJECT_ROOT,
+            env=environment,
+            capture_output=True,
+            text=True,
+        )
+        if result.returncode:
+            detail = result.stderr.strip() or result.stdout.strip()
+            raise RuntimeError(f"Database migration failed: {detail}")
+
+    await asyncio.to_thread(upgrade)
 
 
 async def get_db():
@@ -73,6 +143,7 @@ _SQLITE_LOCKED_MESSAGES = (
     "database table is locked",
     "attempt to write a readonly database",
     "disk I/O error",
+    "unable to open database file",
 )
 
 
@@ -104,6 +175,56 @@ async def retry_sqlite_commit(session: AsyncSession, *, attempts: int = 3, delay
             await asyncio.sleep(delay * attempt)
 
 
+async def upsert_lookup_result(
+    session: AsyncSession,
+    *,
+    ioc_id: int,
+    task_id: str,
+    composite_score: float,
+    composite_verdict: str,
+    composite_confidence: str,
+    full_response: str,
+    source_count: int,
+    batch_id: str | None = None,
+) -> None:
+    values = {
+        "ioc_id": ioc_id,
+        "task_id": task_id,
+        "composite_score": composite_score,
+        "composite_verdict": composite_verdict,
+        "composite_confidence": composite_confidence,
+        "full_response": full_response,
+        "source_count": source_count,
+    }
+    if batch_id is not None:
+        values["batch_id"] = batch_id
+    if session.get_bind().dialect.name == "sqlite":
+        from sqlalchemy.dialects.sqlite import insert as sqlite_insert
+
+        update_values = {
+            key: value for key, value in values.items() if key not in {"task_id", "batch_id"}
+        }
+        if batch_id is not None:
+            update_values["batch_id"] = batch_id
+        statement = sqlite_insert(LookupResult).values(**values)
+        await session.execute(
+            statement.on_conflict_do_update(
+                index_elements=["task_id"],
+                set_=update_values,
+            )
+        )
+    else:
+        result = await session.execute(select(LookupResult).where(LookupResult.task_id == task_id))
+        row = result.scalar_one_or_none()
+        if row is None:
+            session.add(LookupResult(**values))
+        else:
+            for key, value in values.items():
+                if key != "task_id":
+                    setattr(row, key, value)
+    await retry_sqlite_commit(session)
+
+
 async def cleanup_old_lookups(days: int | None = None) -> int:
     """Delete lookup results older than ``HISTORY_RETENTION_DAYS``.
 
@@ -119,14 +240,23 @@ async def cleanup_old_lookups(days: int | None = None) -> int:
 
     async with async_session() as session:
         result = await session.execute(
-            delete(LookupResult).where(LookupResult.created_at < cutoff)
+            delete(LookupResult).where(
+                LookupResult.created_at < cutoff,
+                LookupResult.batch_id.is_(None),
+            )
         )
         deleted += result.rowcount or 0
-        # Prune IOCs that are no longer referenced by any lookup result.
-        referenced = select(LookupResult.ioc_id).distinct()
+
+        lookup_references = select(LookupResult.ioc_id).distinct()
+        investigation_references = select(InvestigationIOC.ioc_id).distinct()
+        feedback_references = select(IOCFeedback.ioc_value).distinct()
+        batch_references = select(LookupResult.ioc_id).where(LookupResult.batch_id.is_not(None)).distinct()
         stale_iocs = (
             select(IOC.id)
-            .where(IOC.id.not_in(referenced))
+            .where(IOC.id.not_in(lookup_references))
+            .where(IOC.id.not_in(investigation_references))
+            .where(IOC.id.not_in(batch_references))
+            .where(IOC.value.not_in(feedback_references))
         )
         ioc_rows = (await session.execute(stale_iocs)).scalars().all()
         if ioc_rows:

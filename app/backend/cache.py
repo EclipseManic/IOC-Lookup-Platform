@@ -276,9 +276,16 @@ class CacheLayer:
             self._local.clear()
             return
         try:
-            await r.flushdb()
+            keys = []
+            for pattern in ("cache:*", "task:*", "ratelimit:*"):
+                async for key in r.scan_iter(match=pattern):
+                    keys.append(key)
+            if keys:
+                await r.delete(*keys)
         except Exception:
             self._local.clear()
+
+
 
     async def close(self):
         if self._redis is not None:
@@ -305,7 +312,8 @@ CACHE_TTL = {
     "Tor Exit": 3600,
     "Censys": 3600,
     "IPinfo": 3600,
-    "EmailRep.io": 3600,
+    "AbstractAPI": 3600,
+    "Hunter.io": 3600,
     "Team Cymru": 3600,
     "cve.org": 3600,
     "NVD": 3600,

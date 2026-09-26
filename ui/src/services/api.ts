@@ -1,5 +1,35 @@
 const API_BASE = "/api";
-const DEFAULT_TIMEOUT_MS = 15_000;
+const DEFAULT_TIMEOUT_MS = 30_000;
+const API_KEY_STORAGE = "ioc-platform-api-key";
+export const AUTH_REQUIRED_EVENT = "ioc-auth-required";
+let runtimeApiKey = "";
+
+if (typeof window !== "undefined") {
+  try {
+    runtimeApiKey = window.sessionStorage.getItem(API_KEY_STORAGE) ?? "";
+  } catch {
+    runtimeApiKey = "";
+  }
+}
+
+export function setRuntimeApiKey(value: string): void {
+  runtimeApiKey = value.trim();
+  try {
+    window.sessionStorage.setItem(API_KEY_STORAGE, runtimeApiKey);
+  } catch {
+    return;
+  }
+}
+
+export function clearRuntimeApiKey(): void {
+  runtimeApiKey = "";
+  try {
+    window.sessionStorage.removeItem(API_KEY_STORAGE);
+  } catch {
+    return;
+  }
+}
+
 
 export class ApiError extends Error {
   status: number;
@@ -17,15 +47,14 @@ interface RequestOptions extends RequestInit {
   timeoutMs?: number;
 }
 
-/** Add the optional deployment API key to every browser-originated API call. */
 export function apiHeaders(headers: HeadersInit = {}): Headers {
   const result = new Headers(headers);
-  const apiKey = import.meta.env.VITE_API_KEY?.trim();
-  if (apiKey && !result.has("X-API-Key")) {
-    result.set("X-API-Key", apiKey);
+  if (runtimeApiKey && !result.has("X-API-Key")) {
+    result.set("X-API-Key", runtimeApiKey);
   }
   return result;
 }
+
 
 async function request<T>(path: string, options: RequestOptions = {}): Promise<T> {
   const { timeoutMs = DEFAULT_TIMEOUT_MS, ...init } = options;
@@ -39,6 +68,9 @@ async function request<T>(path: string, options: RequestOptions = {}): Promise<T
       signal: controller.signal,
     });
     if (!res.ok) {
+      if (res.status === 401 && typeof window !== "undefined") {
+        window.dispatchEvent(new Event(AUTH_REQUIRED_EVENT));
+      }
       let detail: string | undefined;
       try {
         const body = await res.json();
@@ -60,6 +92,30 @@ async function request<T>(path: string, options: RequestOptions = {}): Promise<T
   }
 }
 
+export async function fetchProtectedImage(path: string): Promise<string> {
+  const controller = new AbortController();
+  const timer = window.setTimeout(() => controller.abort(), DEFAULT_TIMEOUT_MS);
+  const url = path.startsWith("/api/") ? path : `${API_BASE}${path}`;
+  try {
+    const res = await fetch(url, { headers: apiHeaders(), signal: controller.signal });
+    if (!res.ok) {
+      if (res.status === 401 && typeof window !== "undefined") {
+        window.dispatchEvent(new Event(AUTH_REQUIRED_EVENT));
+      }
+      throw new ApiError(`Image request failed: ${res.status}`, res.status);
+    }
+    return URL.createObjectURL(await res.blob());
+  } catch (err) {
+    if (err instanceof DOMException && err.name === "AbortError") {
+      throw new ApiError("Image request timed out", 0, "timeout");
+    }
+    throw err;
+  } finally {
+    window.clearTimeout(timer);
+  }
+}
+
+
 export interface StageInfo {
   name: string;
   status: string;
@@ -78,6 +134,8 @@ export interface TaskResponse {
 
 export interface NormalizedResult {
   ioc: string;
+  task_id?: string;
+
   ioc_type: string;
   assessment_domain?: string;
   domain_classification?: string | null;
@@ -152,20 +210,36 @@ export interface GeoIPInfo {
   country?: string;
   country_code?: string;
   city?: string;
+  region?: string;
+  timezone?: string;
   asn?: string;
   asn_name?: string;
   isp?: string;
   org?: string;
   latitude?: number;
   longitude?: number;
+  is_vpn?: boolean;
+  is_tor?: boolean;
+  is_proxy?: boolean;
+  is_datacenter?: boolean;
+  is_anycast?: boolean;
 }
 
 export interface WhoisInfo {
   registrar?: string;
   creation_date?: string;
   expiration_date?: string;
+  updated_date?: string;
+  nameservers?: string[];
+  status_codes?: string[];
+  registrant_country?: string;
+  dnssec?: string;
+  domain_age_days?: number;
+  is_newly_registered?: boolean;
   abuse_email?: string;
   org?: string;
+  privacy_protected?: boolean;
+  fallback_tier_used?: number;
 }
 
 export interface DNSInfo {
@@ -247,6 +321,51 @@ export interface EmailSecurityInfo {
   dmarc: string;
 }
 
+export interface HostIntelligence {
+  open_ports: number[];
+  port_services: Record<number, string>;
+  unpatched_cves: string[];
+  cpes: string[];
+  tags: string[];
+  hostnames: string[];
+  source: string;
+}
+
+export interface WebPreviewInfo {
+  screenshot_url?: string;
+  page_title?: string;
+  server?: string;
+  language?: string;
+  domain_age_days?: number;
+  tls_issuer?: string;
+  tls_valid_days?: number;
+  asn_name?: string;
+  detected_brands: string[];
+  detected_technologies: string[];
+  mime_type?: string;
+  scan_uuid?: string;
+}
+
+export interface InfostealerIntel {
+  total_employee_compromises: number;
+  total_client_compromises: number;
+  top_corporate_services: string[];
+  top_external_services: string[];
+  stealer_families: Record<string, number>;
+  password_strength_weak_pct?: number;
+  password_strength_strong_pct?: number;
+  total_compromised_urls?: number;
+  date_range?: string;
+}
+
+export interface AbuseReport {
+  reported_at: string;
+  reporter_country?: string;
+  comment?: string;
+  categories: string[];
+  category_names: string[];
+}
+
 export interface EnrichmentData {
   geoip?: GeoIPInfo;
   open_ports: number[];
@@ -266,6 +385,13 @@ export interface EnrichmentData {
   relationships: Relationship[];
   completeness: Record<string, string>;
   analysis_notes?: string[];
+  host_intel?: HostIntelligence;
+  web_preview?: WebPreviewInfo;
+  infostealer?: InfostealerIntel;
+  abuse_reports?: AbuseReport[];
+  hosting_ip_intel?: Record<string, unknown>;
+  malware_urls?: string[];
+  associated_hashes?: string[];
 }
 
 export interface SourceWeight {
@@ -344,6 +470,8 @@ export interface EvidenceObservation {
 
 export interface IOCAssessment {
   ioc: string;
+  task_id?: string;
+
   normalized_ioc?: string | null;
   ioc_type: string;
   assessment_domain?: string;
@@ -432,8 +560,11 @@ export interface Relationship {
 
 export interface LookupResponse {
   input: string;
+  task_id?: string;
   normalized: string;
+
   ioc_type: string;
+  password_prehashed?: boolean;
   composite: CompositeScore;
   final_assessment?: IOCAssessment | null;
   provider_health?: ProviderHealth[];
@@ -533,6 +664,10 @@ export async function getTaskResult(taskId: string): Promise<LookupResponse> {
   }
 }
 
+export async function cancelTask(taskId: string): Promise<{ task_id: string; status: string }> {
+  return request(`/tasks/${taskId}/cancel`, { method: "POST" });
+}
+
 // --- Batch ---
 
 export interface BatchSubtask {
@@ -580,11 +715,12 @@ export interface BatchResultSummary {
 }
 
 export interface BatchResultItem extends NormalizedResult {
-  _ioc: string;
+  _ioc?: string;
 }
 
 export interface BatchResult {
   batch_id: string;
+  status?: string;
   total: number;
   completed: number;
   expected_lookups: number;
@@ -610,24 +746,42 @@ export interface SavedBatch {
   batch_id: string;
   total: number;
   completed: number;
-  created_at: string;
-  result: BatchResult;
+  created_at?: string | null;
+  summary?: Record<string, number>;
+  result?: BatchResult;
 }
 
+/**
+ * Fetch batch history from the backend SQLite database.
+ * Falls back to empty array on error.
+ */
+export async function getBatchesFromServer(): Promise<SavedBatch[]> {
+  try {
+    return await request<SavedBatch[]>("/batches");
+  } catch {
+    return [];
+  }
+}
+
+/**
+ * @deprecated Batches are now auto-persisted server-side on completion.
+ * This function is kept for backward compatibility but is a no-op.
+ */
+export function saveBatchHistory(_result: BatchResult): void {
+  // No-op: server persists batches in SQLite automatically.
+}
+
+/**
+ * Delete a batch from the server database.
+ */
+export async function deleteBatchFromServer(batchId: string): Promise<void> {
+  await request(`/batch/${batchId}`, { method: "DELETE" });
+}
+
+// Legacy localStorage compat — kept for smooth migration
 const SAVED_BATCHES_KEY = "ioc-platform.batch-history.v1";
 export function getSavedBatches(): SavedBatch[] {
   try { return JSON.parse(localStorage.getItem(SAVED_BATCHES_KEY) || "[]") as SavedBatch[]; } catch { return []; }
-}
-export function saveBatchHistory(result: BatchResult): void {
-  const existing = getSavedBatches().filter((item) => item.batch_id !== result.batch_id);
-  const saved: SavedBatch = { batch_id: result.batch_id, total: result.total, completed: result.completed, created_at: new Date().toISOString(), result };
-  try {
-    localStorage.setItem(SAVED_BATCHES_KEY, JSON.stringify([saved, ...existing].slice(0, 25)));
-  } catch {
-    // Large provider payloads can exceed browser storage. Retain a useful
-    // recent index rather than making a completed batch look unsuccessful.
-    try { localStorage.setItem(SAVED_BATCHES_KEY, JSON.stringify([saved, ...existing].slice(0, 5))); } catch { /* storage is optional */ }
-  }
 }
 export function deleteSavedBatch(batchId: string): void {
   localStorage.setItem(SAVED_BATCHES_KEY, JSON.stringify(getSavedBatches().filter((item) => item.batch_id !== batchId)));
@@ -639,6 +793,10 @@ export async function startBatch(iocs: string[]): Promise<{ batch_id: string; to
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ iocs }),
   });
+}
+
+export async function cancelBatch(batchId: string): Promise<{ batch_id: string; status: string }> {
+  return request(`/batch/${batchId}/cancel`, { method: "POST" });
 }
 
 export async function getBatchStatus(batchId: string): Promise<BatchStatus> {
@@ -806,6 +964,92 @@ export async function getRecentIOCs(): Promise<RecentIOC[]> {
   return request<RecentIOC[]>("/recent");
 }
 
+export async function getRecentIOCResult(id: number): Promise<LookupResponse> {
+  return request<LookupResponse>(`/recent/${id}/result`);
+}
+
+export async function getStoredLookup(ioc: string): Promise<LookupResponse | null> {
+  try {
+    return await request<LookupResponse>(`/lookup/stored?ioc=${encodeURIComponent(ioc)}`);
+  } catch (err) {
+    if (err instanceof ApiError && err.status === 404) return null;
+    throw err;
+  }
+}
+
+export async function getBatchIOCResult(batchId: string, ioc: string): Promise<LookupResponse> {
+  return request<LookupResponse>(`/batch/${batchId}/ioc/${encodeURIComponent(ioc)}`);
+}
+
+export function buildLookupResponseFromBatch(
+  iocValue: string,
+  iocType: string,
+  assessment?: IOCAssessment,
+  results: BatchResultItem[] = [],
+  relationships: Relationship[] = [],
+  providerHealth: ProviderHealth[] = [],
+  taskId?: string
+): LookupResponse {
+
+  const norm = assessment?.normalized_ioc || iocValue;
+  const composite: CompositeScore = {
+    score: assessment?.normalized_score ?? 0,
+    verdict: assessment?.final_verdict ?? "unknown",
+    confidence: assessment?.confidence ?? "low",
+    sources_contributing: results.length,
+    source_breakdown: results.map((r) => ({
+      name: r.source,
+      weight: r.raw_score ?? 0,
+      verdict: r.verdict,
+      score: r.raw_score ?? null,
+      confidence: r.confidence ?? null,
+    })),
+  };
+
+  const enrichment: EnrichmentData = {
+    open_ports: [],
+    redirect_chain: [],
+    url_preview: {},
+    extra: {},
+    relationships: relationships.filter((rel) => rel.source_ioc === norm || rel.target_ioc === norm),
+    completeness: {},
+  };
+
+  for (const r of results) {
+    if (r.source === "urlscan.io" && r.raw_data?.web_preview) {
+      enrichment.web_preview = r.raw_data.web_preview as WebPreviewInfo;
+    }
+    if (r.source === "Hudson Rock" && r.raw_data) {
+      enrichment.infostealer = {
+        total_employee_compromises: (r.raw_data.total_infections as number) || 0,
+        total_client_compromises: (r.raw_data.total_user_services as number) || 0,
+        top_corporate_services: (r.raw_data.top_corporate_services as string[]) || [],
+        top_external_services: (r.raw_data.top_external_services as string[]) || [],
+        stealer_families: (r.raw_data.stealer_families as Record<string, number>) || {},
+      };
+    }
+    if (r.source === "AbuseIPDB" && Array.isArray(r.raw_data?.reports)) {
+      enrichment.abuse_reports = r.raw_data.reports as AbuseReport[];
+    }
+  }
+
+  return {
+    input: iocValue,
+    task_id: taskId ?? results.find((item) => item.task_id)?.task_id,
+
+    normalized: norm,
+    ioc_type: iocType || assessment?.ioc_type || "unknown",
+    password_prehashed: (iocType === "password" || iocType === "password_sha1" || assessment?.ioc_type === "password"),
+    composite,
+    final_assessment: assessment || null,
+    provider_health: providerHealth,
+    enrichment,
+    results: results,
+    relationships: relationships.filter((rel) => rel.source_ioc === norm || rel.target_ioc === norm),
+    executive_summary: assessment?.reason || `Batch analysis record for ${iocValue}.`,
+  };
+}
+
 export async function saveLookup(value: string, iocType?: string, taskId?: string): Promise<void> {
   await request<void>("/save", {
     method: "POST",
@@ -829,11 +1073,11 @@ export interface FeedbackInfo {
   created_at: string | null;
 }
 
-export async function submitFeedback(ioc: string, feedback: FeedbackValue, note?: string): Promise<FeedbackInfo> {
+export async function submitFeedback(ioc: string, feedback: FeedbackValue, note?: string, iocType?: string): Promise<FeedbackInfo> {
   return request<FeedbackInfo>("/feedback", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ ioc, feedback, note: note || null }),
+    body: JSON.stringify({ ioc, feedback, note: note || null, ...(iocType ? { ioc_type: iocType } : {}) }),
   });
 }
 

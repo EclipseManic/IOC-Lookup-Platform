@@ -141,7 +141,7 @@ def test_context_assessment_is_partial_when_a_supported_provider_fails():
         NormalizedResult(
             ioc="person@example.com",
             ioc_type="email",
-            source="EmailRep.io",
+            source="Hunter.io",
             execution_state="success",
             status="found",
             verdict="unknown",
@@ -174,7 +174,7 @@ def test_not_applicable_plan_rows_do_not_make_healthy_reputation_partial():
         NormalizedResult(
             ioc="8.8.8.8",
             ioc_type="ipv4",
-            source="EmailRep.io",
+            source="Hunter.io",
             verdict="unknown",
             status="not_applicable",
             execution_state="not_applicable",
@@ -295,3 +295,92 @@ def test_provider_quota_reservation_does_not_leak_tokens_when_denied():
         await limiter.close()
 
     asyncio.run(exercise())
+
+
+def test_credential_breached_verdict():
+    results = [
+        NormalizedResult(
+            ioc="compromised@example.com",
+            ioc_type="email",
+            source="Hudson Rock",
+            execution_state="success",
+            status="found",
+            verdict="malicious",
+            tags=["infostealer_compromised", "infections:3"],
+            reports_count=3,
+        ),
+    ]
+    assessment = aggregate_evidence(results[0].ioc, results[0].ioc_type, results)
+    assert assessment.assessment_domain == "identity_reputation"
+    assert assessment.final_verdict == "breached"
+    assert assessment.classification == "breached"
+    assert assessment.normalized_score > 0
+    assert assessment.needs_review is True
+
+
+def test_credential_not_breached_verdict():
+    results = [
+        NormalizedResult(
+            ioc="clean@example.com",
+            ioc_type="email",
+            source="Hudson Rock",
+            execution_state="success",
+            status="not_found",
+            verdict="clean",
+            tags=[],
+            reports_count=0,
+        ),
+    ]
+    assessment = aggregate_evidence(results[0].ioc, results[0].ioc_type, results)
+    assert assessment.assessment_domain == "identity_reputation"
+    assert assessment.final_verdict == "not_breached"
+    assert assessment.classification == "not_breached"
+    assert assessment.normalized_score == 0.0
+
+
+def test_public_dns_resolver_dampening():
+    results = [
+        NormalizedResult(
+            ioc="1.1.1.1",
+            ioc_type="ipv4",
+            source="VirusTotal",
+            execution_state="success",
+            status="found",
+            verdict="clean",
+            detection_count=0,
+            total_engines=90,
+        ),
+        NormalizedResult(
+            ioc="1.1.1.1",
+            ioc_type="ipv4",
+            source="AbuseIPDB",
+            execution_state="success",
+            status="found",
+            verdict="clean",
+            reports_count=0,
+        ),
+        NormalizedResult(
+            ioc="1.1.1.1",
+            ioc_type="ipv4",
+            source="Hudson Rock",
+            execution_state="success",
+            status="found",
+            verdict="suspicious",
+            tags=["infostealer_compromised", "infections:2"],
+            reports_count=2,
+        ),
+    ]
+    assessment = aggregate_evidence("1.1.1.1", "ipv4", results)
+    assert assessment.final_verdict in {"benign", "clean"}
+    assert assessment.normalized_score == 0.0
+
+
+def test_threatfox_boundary_matching():
+    from app.backend.adapters.threatfox import _matches_target_ioc
+    # Substring in URL query parameter or path should NOT match
+    assert _matches_target_ioc("https://phish.net/?site=cloudflare.com", "cloudflare.com", "domain") is False
+    assert _matches_target_ioc("https://malicious.ru/login/cloudflare.com/index.html", "cloudflare.com", "domain") is False
+    # Subdomain, exact domain, or domain with port SHOULD match
+    assert _matches_target_ioc("https://sub.cloudflare.com/login", "cloudflare.com", "domain") is True
+    assert _matches_target_ioc("cloudflare.com:443", "cloudflare.com", "domain") is True
+    assert _matches_target_ioc("cloudflare.com", "cloudflare.com", "domain") is True

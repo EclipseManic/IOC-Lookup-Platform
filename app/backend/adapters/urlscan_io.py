@@ -1,7 +1,6 @@
 import asyncio
+import json
 import time
-
-import httpx
 
 from app.backend.adapters.base import NormalizedResult, RateLimitConfig, SourceAdapter, is_valid_api_key, retry_after_seconds
 from app.backend.config import settings
@@ -14,7 +13,7 @@ class UrlScanIOAdapter(SourceAdapter):
     name = "urlscan.io"
     supported_types = ["domain", "url"]
     public_without_key = True
-    rate_limit = RateLimitConfig(requests_per_minute=10)
+    rate_limit = RateLimitConfig(requests_per_minute=10, max_retries=1, timeout_seconds=10.0)
     SCAN_POLL_ATTEMPTS = 7
     SCAN_POLL_DELAY = 2.0
 
@@ -58,9 +57,10 @@ class UrlScanIOAdapter(SourceAdapter):
     async def lookup(self, ioc_value: str, ioc_type: str) -> NormalizedResult:
         client = self._get_client()
         headers = {"API-Key": self.api_key} if is_valid_api_key(self.api_key) else {}
+        query_value = json.dumps(ioc_value, ensure_ascii=False)
         resp = await client.get(
                 "https://urlscan.io/api/v1/search/",
-                params={"q": f'page.{ioc_type}:"{ioc_value}"', "size": 5},
+                params={"q": f"page.{ioc_type}:{query_value}", "size": 5},
                 headers=headers or None,
                 timeout=15,
             )
@@ -110,6 +110,19 @@ class UrlScanIOAdapter(SourceAdapter):
         page_asns = set()
         screenshot_url = ""
 
+        # Rich page metadata for WebPreviewInfo
+        page_title = ""
+        page_server = ""
+        page_language = ""
+        domain_age_days: int | None = None
+        tls_issuer = ""
+        tls_valid_days: int | None = None
+        page_asn_name = ""
+        detected_brands: list[str] = []
+        detected_technologies: list[str] = []
+        page_mime_type = ""
+        result_scan_uuid = ""
+
         for entry in results:
             if not isinstance(entry, dict):
                 continue
@@ -119,18 +132,69 @@ class UrlScanIOAdapter(SourceAdapter):
                 page = {}
 
             dom = page.get("domain", "")
-            if dom: page_domains.add(dom)
+            if dom:
+                page_domains.add(dom)
             ip = page.get("ip", "")
-            if ip: page_ips.add(ip)
+            if ip:
+                page_ips.add(ip)
             country = page.get("country", "")
-            if country: page_countries.add(country)
+            if country:
+                page_countries.add(country)
             asn = page.get("asn", "")
-            if asn: page_asns.add(asn)
+            if asn:
+                page_asns.add(asn)
             server = page.get("server", "")
-            if server: all_tags.add(f"server: {server}")
+            if server:
+                all_tags.add(f"server: {server}")
+                if not page_server:
+                    page_server = server
 
             if not screenshot_url:
                 screenshot_url = entry.get("screenshot", "") or page.get("screenshot", "") or ""
+
+            # Extract rich page metadata from the first result
+            if not page_title:
+                page_title = page.get("title", "") or ""
+            if not page_language:
+                page_language = page.get("language", "") or ""
+            if domain_age_days is None:
+                age = page.get("domainAgeDays")
+                if age is not None:
+                    try:
+                        domain_age_days = int(age)
+                    except (ValueError, TypeError):
+                        pass
+            if not tls_issuer:
+                tls_issuer = page.get("tlsIssuer", "") or ""
+            if tls_valid_days is None:
+                tvd = page.get("tlsValidDays")
+                if tvd is not None:
+                    try:
+                        tls_valid_days = int(tvd)
+                    except (ValueError, TypeError):
+                        pass
+            if not page_asn_name:
+                page_asn_name = page.get("asnname", "") or ""
+            if not page_mime_type:
+                page_mime_type = page.get("mimeType", "") or ""
+
+            # Capture scan UUID from the task for screenshot proxying
+            task = entry.get("task", {})
+            if isinstance(task, dict) and not result_scan_uuid:
+                result_scan_uuid = task.get("uuid", "") or ""
+
+            # Extract brand detection from verdicts
+            result_entry = entry.get("result", {})
+            if isinstance(result_entry, dict):
+                brands_data = result_entry.get("verdicts", {}).get("overall", {}).get("brands", [])
+                if isinstance(brands_data, list):
+                    for brand in brands_data:
+                        if isinstance(brand, str) and brand not in detected_brands:
+                            detected_brands.append(brand)
+                        elif isinstance(brand, dict):
+                            bname = brand.get("name", "")
+                            if bname and bname not in detected_brands:
+                                detected_brands.append(bname)
 
             lists_data = entry.get("lists", {})
             if isinstance(lists_data, dict):
@@ -148,11 +212,9 @@ class UrlScanIOAdapter(SourceAdapter):
                         if cn:
                             all_tags.add(f"cert_cn:{cn}")
 
-            result_entry = entry.get("result", {})
-            if isinstance(result_entry, dict):
-                overall = result_entry.get("verdicts", {}).get("overall", {})
-            else:
-                overall = {}
+            if not isinstance(result_entry, dict):
+                result_entry = {}
+            overall = result_entry.get("verdicts", {}).get("overall", {})
             if not overall:
                 overall = entry.get("verdicts", {}).get("overall", {})
             if overall.get("malicious"):
@@ -166,7 +228,6 @@ class UrlScanIOAdapter(SourceAdapter):
             if isinstance(cats, list):
                 all_categories.update(cats)
 
-            task = entry.get("task", {})
             if isinstance(task, dict):
                 url = task.get("url", "")
                 if url and url.lower() != ioc_value.lower():
@@ -176,7 +237,7 @@ class UrlScanIOAdapter(SourceAdapter):
             if score:
                 samples.append(f"Score: {score}")
 
-            submitted = task.get("time")
+            submitted = task.get("time") if isinstance(task, dict) else None
             if submitted:
                 try:
                     from datetime import datetime
@@ -211,7 +272,7 @@ class UrlScanIOAdapter(SourceAdapter):
 
         scan_uuid = None
         scan_completed = False
-        if not has_cached_results and is_valid_api_key(self.api_key):
+        if not has_cached_results and is_valid_api_key(self.api_key) and settings.enable_public_url_submission:
             scan_uuid = await self._submit_scan(ioc_value)
         if scan_uuid:
             all_tags.add("active_scan_submitted")
@@ -241,6 +302,8 @@ class UrlScanIOAdapter(SourceAdapter):
                     screenshot_url = active.get("screenshot") or active.get("page", {}).get("screenshot", "")
                 if screenshot_url:
                     report_url = f"https://urlscan.io/result/{scan_uuid}/"
+                if not result_scan_uuid:
+                    result_scan_uuid = scan_uuid
 
         if not is_malicious and not has_cached_results and not scan_completed:
             return NormalizedResult(
@@ -263,5 +326,21 @@ class UrlScanIOAdapter(SourceAdapter):
             source_link=report_url,
             reports_count=total,
             samples=samples[:10],
-            raw_data=data,
+            raw_data={
+                **data,
+                "web_preview": {
+                    "screenshot_url": screenshot_url,
+                    "page_title": page_title,
+                    "server": page_server,
+                    "language": page_language,
+                    "domain_age_days": domain_age_days,
+                    "tls_issuer": tls_issuer,
+                    "tls_valid_days": tls_valid_days,
+                    "asn_name": page_asn_name,
+                    "detected_brands": detected_brands,
+                    "detected_technologies": detected_technologies,
+                    "mime_type": page_mime_type,
+                    "scan_uuid": result_scan_uuid,
+                },
+            },
         )

@@ -1,8 +1,6 @@
 from datetime import datetime
-
 import re
-
-import httpx
+from urllib.parse import urlparse
 
 from app.backend.adapters.base import NormalizedResult, RateLimitConfig, SourceAdapter, is_valid_api_key, retry_after_seconds
 from app.backend.config import settings
@@ -19,6 +17,43 @@ _JUNK_REPORTERS = ("lenny_3bo", "test", "tester", "junk")
 _MIN_CONFIDENCE_LEVEL = 50
 
 
+def _matches_target_ioc(entry_ioc: str, target_ioc: str, ioc_type: str) -> bool:
+    if not entry_ioc:
+        return False
+    entry_ioc = entry_ioc.strip().lower()
+    target = target_ioc.strip().lower()
+    if entry_ioc == target:
+        return True
+
+    if ioc_type == "domain":
+        host = entry_ioc
+        if "://" in entry_ioc:
+            parsed = urlparse(entry_ioc)
+            host = parsed.hostname or entry_ioc
+        elif ":" in entry_ioc:
+            host = entry_ioc.split(":")[0]
+        host = host.strip("/")
+        return host == target or host.endswith("." + target)
+
+    if ioc_type in ("ipv4", "ipv6"):
+        host = entry_ioc
+        if "://" in entry_ioc:
+            parsed = urlparse(entry_ioc)
+            host = parsed.hostname or entry_ioc
+        elif ":" in entry_ioc and ioc_type == "ipv4":
+            host = entry_ioc.split(":")[0]
+        host = host.strip("/")
+        return host == target
+
+    if ioc_type in {"md5", "sha1", "sha256"}:
+        return entry_ioc == target
+
+    if ioc_type == "url":
+        return entry_ioc.rstrip("/").lower() == target.rstrip("/").lower()
+
+    return False
+
+
 def _is_junk_entry(entry: dict) -> bool:
     tags = entry.get("tags", "")
     if isinstance(tags, str):
@@ -27,7 +62,11 @@ def _is_junk_entry(entry: dict) -> bool:
         tag_list = [str(t).strip().lower() for t in tags]
     else:
         tag_list = []
-    if any(marker in tag for tag in tag_list for marker in _JUNK_TAG_MARKERS):
+    if any(
+        re.search(rf"(?:^|[^a-z0-9]){re.escape(marker)}(?:$|[^a-z0-9])", tag)
+        for tag in tag_list
+        for marker in _JUNK_TAG_MARKERS
+    ):
         return True
     reporter = str(entry.get("reporter", "")).lower()
     if any(r in reporter for r in _JUNK_REPORTERS):
@@ -54,11 +93,11 @@ class ThreatFoxAdapter(SourceAdapter):
         if is_valid_api_key(self.api_key):
             headers["Auth-Key"] = self.api_key
         resp = await client.post(
-                "https://threatfox-api.abuse.ch/api/v1/",
-                json={"query": "search_ioc", "search_term": ioc_value},
-                headers=headers or None,
-                timeout=15,
-            )
+            "https://threatfox-api.abuse.ch/api/v1/",
+            json={"query": "search_ioc", "search_term": ioc_value},
+            headers=headers or None,
+            timeout=15,
+        )
 
         if resp.status_code == 429:
             return NormalizedResult(
@@ -84,7 +123,8 @@ class ThreatFoxAdapter(SourceAdapter):
         if qs != "ok" or not data.get("data"):
             return NormalizedResult(
                 ioc=ioc_value, ioc_type=ioc_type, source=self.name,
-                verdict="unknown", raw_score=0.0, status="not_found",
+                verdict="unknown", raw_score=0.0, status="error",
+                tags=[f"query_status:{qs or 'missing'}"] if qs != "no_result" else ["not_found"],
             )
 
         entries = data["data"]
@@ -108,6 +148,10 @@ class ThreatFoxAdapter(SourceAdapter):
             if not isinstance(entry, dict):
                 continue
             if _is_junk_entry(entry):
+                junk_skipped += 1
+                continue
+            entry_ioc_str = str(entry.get("ioc", "")).strip()
+            if not _matches_target_ioc(entry_ioc_str, ioc_value, ioc_type):
                 junk_skipped += 1
                 continue
             kept += 1

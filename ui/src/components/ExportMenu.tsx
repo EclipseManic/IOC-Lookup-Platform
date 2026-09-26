@@ -1,9 +1,22 @@
 import { useEffect, useRef, useState } from "react";
-import { apiHeaders, type LookupResponse } from "../services/api";
+import { AUTH_REQUIRED_EVENT, apiHeaders, type LookupResponse } from "../services/api";
 import { showToast } from "./Toast";
 
 interface Props {
   result: LookupResponse;
+}
+
+function requireTaskId(result: LookupResponse): string {
+  if (!result.task_id) throw new Error("This snapshot has no server task ID");
+  return result.task_id;
+}
+
+function ensureExportResponse(response: Response, message: string): Response {
+  if (response.status === 401 && typeof window !== "undefined") {
+    window.dispatchEvent(new Event(AUTH_REQUIRED_EVENT));
+  }
+  if (!response.ok) throw new Error(message);
+  return response;
 }
 
 export default function ExportMenu({ result }: Props) {
@@ -42,9 +55,9 @@ export default function ExportMenu({ result }: Props) {
       const res = await fetch("/api/export/csv", {
         method: "POST",
         headers: apiHeaders({ "Content-Type": "application/json" }),
-        body: JSON.stringify({ ioc: result.input }),
+        body: JSON.stringify({ ioc: result.input, task_id: requireTaskId(result) }),
       });
-      if (!res.ok) throw new Error("CSV export failed");
+      ensureExportResponse(res, "CSV export failed");
       const text = await res.text();
       const blob = new Blob([text], { type: "text/csv" });
       const url = URL.createObjectURL(blob);
@@ -67,9 +80,9 @@ export default function ExportMenu({ result }: Props) {
       const res = await fetch("/api/export/stix", {
         method: "POST",
         headers: apiHeaders({ "Content-Type": "application/json" }),
-        body: JSON.stringify({ ioc: result.input }),
+        body: JSON.stringify({ ioc: result.input, task_id: requireTaskId(result) }),
       });
-      if (!res.ok) throw new Error("STIX export failed");
+      ensureExportResponse(res, "STIX export failed");
       const data = await res.json();
       const blob = new Blob([JSON.stringify(data, null, 2)], { type: "application/json" });
       const url = URL.createObjectURL(blob);
@@ -92,9 +105,9 @@ export default function ExportMenu({ result }: Props) {
       const res = await fetch("/api/export/misp", {
         method: "POST",
         headers: apiHeaders({ "Content-Type": "application/json" }),
-        body: JSON.stringify({ ioc: result.input }),
+        body: JSON.stringify({ ioc: result.input, task_id: requireTaskId(result) }),
       });
-      if (!res.ok) throw new Error("MISP export failed");
+      ensureExportResponse(res, "MISP export failed");
       const data = await res.json();
       const blob = new Blob([JSON.stringify(data, null, 2)], { type: "application/json" });
       const url = URL.createObjectURL(blob);
@@ -118,9 +131,9 @@ export default function ExportMenu({ result }: Props) {
       const res = await fetch("/api/export/siem", {
         method: "POST",
         headers: apiHeaders({ "Content-Type": "application/json" }),
-        body: JSON.stringify({ ioc: result.input, format: fmt }),
+        body: JSON.stringify({ ioc: result.input, task_id: requireTaskId(result), format: fmt }),
       });
-      if (!res.ok) throw new Error(`${label} export failed`);
+      ensureExportResponse(res, `${label} export failed`);
       const text = await res.text();
       const ext = fmt === "ecs" ? "ndjson" : "txt";
       const blob = new Blob([text], { type: "text/plain" });
@@ -145,7 +158,8 @@ export default function ExportMenu({ result }: Props) {
   }
 
   function copyShareLink() {
-    const url = `${window.location.origin}/?page=lookup&ioc=${encodeURIComponent(result.input)}`;
+    const type = result.password_prehashed ? "password_sha1" : result.ioc_type;
+    const url = `${window.location.origin}/?page=lookup&ioc=${encodeURIComponent(result.input)}&ioc_type=${encodeURIComponent(type)}`;
     navigator.clipboard.writeText(url);
     setOpen(false);
     showToast("Share link copied", "success");
@@ -320,13 +334,15 @@ function ExportButton({ label, action, result }: { label: string; action: Export
         try {
           const isSiem = SIEM_ACTIONS.includes(action);
           const endpoint = isSiem ? "/api/export/siem" : `/api/export/${action}`;
-          const body = isSiem ? { ioc: result.input, format: action } : { ioc: result.input };
+          const body = isSiem
+            ? { ioc: result.input, task_id: requireTaskId(result), format: action }
+            : { ioc: result.input, task_id: requireTaskId(result) };
           const res = await fetch(endpoint, {
             method: "POST",
             headers: apiHeaders({ "Content-Type": "application/json" }),
             body: JSON.stringify(body),
           });
-          if (!res.ok) throw new Error("Export failed");
+          ensureExportResponse(res, "Export failed");
           const ext = action === "csv" ? "csv" : isSiem ? "txt" : "json";
           const content = action === "csv" ? await res.text() : isSiem ? await res.text() : JSON.stringify(await res.json(), null, 2);
           const mime = action === "csv" ? "text/csv" : "application/json";

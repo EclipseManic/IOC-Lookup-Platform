@@ -115,7 +115,8 @@ class HybridAnalysisAdapter(SourceAdapter):
             # Fallback: parse term result directly
             return await self._parse_report(term_result, ioc_value, ioc_type, client)
 
-        resp = await client.get(
+        try:
+            resp = await client.get(
                 "https://hybrid-analysis.com/api/v2/search/hash",
                 params={"hash": ioc_value},
                 headers={
@@ -124,6 +125,17 @@ class HybridAnalysisAdapter(SourceAdapter):
                     "Accept": "application/json",
                 },
                 timeout=30,
+            )
+        except httpx.TimeoutException:
+            return NormalizedResult(
+                ioc=ioc_value, ioc_type=ioc_type, source=self.name,
+                verdict="error", execution_state="timeout", tags=["timeout"],
+            )
+        except (httpx.ConnectError, httpx.HTTPError) as exc:
+            logger.warning("Hybrid Analysis connection failed: %s", exc)
+            return NormalizedResult(
+                ioc=ioc_value, ioc_type=ioc_type, source=self.name,
+                verdict="error", execution_state="error", tags=["connection_error"],
             )
 
         if resp.status_code == 404:

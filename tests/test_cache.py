@@ -3,9 +3,6 @@ import sys
 sys.path.insert(0, ".")
 
 import asyncio
-import json
-import time
-
 from app.backend.cache import CACHE_TTL, CacheLayer, LocalFileCache, cache_key
 
 
@@ -175,6 +172,12 @@ class _FakeRedis:
         keys = [k for k in self.data if fnmatch.fnmatch(k, match)]
         return 0, keys
 
+    async def scan_iter(self, match="*"):
+        import fnmatch
+        for key in list(self.data):
+            if fnmatch.fnmatch(key, match):
+                yield key
+
     async def flushdb(self):
         self.data.clear()
         self.flushed = True
@@ -286,21 +289,23 @@ class TestCacheLayerRedisMode:
         layer._local = LocalFileCache(str(tmp_path))
 
         async def main():
-            await layer.set("a", {"v": 1}, ttl=100)
+            await layer.set("cache:a", {"v": 1}, ttl=100)
             await layer.clear()
-            assert layer._redis.flushed
-            assert await layer.get("a") is None
+            assert not layer._redis.flushed
+            assert layer._redis.data == {}
+            assert await layer.get("cache:a") is None
 
         asyncio.run(main())
 
         layer2 = CacheLayer()
         layer2._local = LocalFileCache(str(tmp_path))
 
-        class BrokenFlush:
-            async def flushdb(self):
+        class BrokenScan:
+            async def scan_iter(self, match="*"):
                 raise ConnectionError("down")
+                yield
 
-        layer2._redis = BrokenFlush()
+        layer2._redis = BrokenScan()
 
         async def main2():
             await layer2.set("b", {"v": 1}, ttl=100)

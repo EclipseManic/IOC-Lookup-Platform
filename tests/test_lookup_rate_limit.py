@@ -1,7 +1,6 @@
 import sys
 sys.path.insert(0, ".")
 
-import asyncio
 import pytest
 from httpx import ASGITransport, AsyncClient
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
@@ -32,7 +31,7 @@ async def client(tmp_path):
 
     app.dependency_overrides[get_db] = override_get_db
     transport = ASGITransport(app=app)
-    async with AsyncClient(transport=transport, base_url="http://test") as c:
+    async with AsyncClient(transport=transport, base_url="http://localhost") as c:
         yield c
     app.dependency_overrides.clear()
     await engine.dispose()
@@ -65,7 +64,7 @@ def _monkey_pipeline(monkeypatch):
     from app.backend import batch as batch_mod
     from app.backend import pipeline as pipeline_mod
 
-    async def fake_run_analysis(ioc_value, task_id=None, fp_override=False, ioc_type_override=None):
+    async def fake_run_analysis(ioc_value, task_id=None, fp_override=False, ioc_type_override=None, password_prehashed=False):
         task = _make_task(ioc_value)
         task.task_id = task_id or task.task_id
         if ioc_type_override:
@@ -115,15 +114,14 @@ async def test_lookup_not_rate_limited_when_limiter_none(client, monkeypatch):
     assert "task_id" in r.json()
 
 
-async def test_lookup_limiter_exception_fallback_allows_request(client, monkeypatch):
+async def test_lookup_limiter_exception_fails_closed(client, monkeypatch):
     class ExplodingLimiter:
         async def acquire(self, source, limit, window):
             raise RuntimeError("redis down")
 
     monkeypatch.setattr(main_mod, "get_rate_limiter", lambda: ExplodingLimiter())
     r = await client.post("/api/lookup", json={"ioc": "8.8.8.8"})
-    # Graceful fallback: allow request but log exception
-    assert r.status_code == 200
+    assert r.status_code == 503
 
 
 async def test_batch_polling_not_rate_limited_when_limiter_always_limited(client, monkeypatch):
@@ -169,6 +167,7 @@ async def test_lookup_xff_respected_when_trust_proxy(client, monkeypatch):
 
     monkeypatch.setattr(main_mod, "get_rate_limiter", lambda: CaptureLimiter())
     monkeypatch.setattr(settings, "trust_proxy", True)
+    monkeypatch.setattr(settings, "trusted_proxy_hosts", "127.0.0.1")
 
     r = await client.post("/api/lookup", json={"ioc": "8.8.8.8"}, headers={"X-Forwarded-For": "5.6.7.8, 1.1.1.1"})
     assert r.status_code == 200
@@ -210,6 +209,7 @@ async def test_lookup_x_real_ip_respected_when_trust_proxy(client, monkeypatch):
 
     monkeypatch.setattr(main_mod, "get_rate_limiter", lambda: CaptureLimiter())
     monkeypatch.setattr(settings, "trust_proxy", True)
+    monkeypatch.setattr(settings, "trusted_proxy_hosts", "127.0.0.1")
 
     r = await client.post("/api/lookup", json={"ioc": "8.8.8.8"}, headers={"X-Real-IP": "9.9.9.9"})
     assert r.status_code == 200
@@ -248,6 +248,7 @@ async def test_lookup_per_ip_isolation(client, monkeypatch):
     monkeypatch.setattr(settings, "lookup_rate_window", 60)
     monkeypatch.setattr(settings, "lookup_global_rate_limit_per_minute", 1000)
     monkeypatch.setattr(settings, "trust_proxy", True)
+    monkeypatch.setattr(settings, "trusted_proxy_hosts", "127.0.0.1")
     monkeypatch.setattr(main_mod, "get_rate_limiter", lambda: rl)
 
     # IP 1.1.1.1 gets 1 slot

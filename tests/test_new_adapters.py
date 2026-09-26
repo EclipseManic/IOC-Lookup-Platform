@@ -1,11 +1,17 @@
 import hashlib
 import pytest
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock
 
+from app.backend.adapters.threatfox import _matches_target_ioc
 from app.backend.adapters.hibp import HIBPAdapter
 from app.backend.adapters.hudson_rock import HudsonRockAdapter
 from app.backend.pipeline import ADAPTERS
-from app.backend.config import settings
+
+
+def test_threatfox_requires_exact_match_for_non_domain_iocs():
+    assert _matches_target_ioc("a" * 32, "b" * 32, "md5") is False
+    assert _matches_target_ioc("https://example.com/path", "https://other.example/path", "url") is False
+    assert _matches_target_ioc("a" * 32, "A" * 32, "md5") is True
 
 
 @pytest.mark.asyncio
@@ -58,39 +64,41 @@ async def test_hibp_adapter_invalid_type():
 
 
 @pytest.mark.asyncio
-async def test_hudson_rock_no_key():
+async def test_hudson_rock_keyless_public():
     adapter = HudsonRockAdapter()
-    adapter.api_key = ""
-    result = await adapter.lookup("test@example.com", "email")
+    assert adapter.public_without_key is True
+    result = await adapter.lookup("invalid", "unsupported_type")
     assert result.source == "Hudson Rock"
     assert result.verdict == "unknown"
-    assert "no_api_key_configured" in result.tags
 
 
 @pytest.mark.asyncio
 async def test_hudson_rock_with_compromise():
     adapter = HudsonRockAdapter()
-    adapter.api_key = "valid-test-key-1234"
     
     mock_resp = MagicMock()
     mock_resp.status_code = 200
     mock_resp.json.return_value = {
-        "data": [
+        "stealers": [
             {
                 "stealer_family": "RedLine",
-                "credentials_count": 5,
+                "computer_name": "DESKTOP-ABC",
+                "operating_system": "Windows 10",
+                "date_compromised": "2024-05-12T10:00:00Z",
             }
-        ]
+        ],
+        "stealerFamilies": {"RedLine": 1},
+        "total_corporate_services": 2,
+        "total_user_services": 3,
     }
     
     mock_client = AsyncMock()
-    mock_client.post.return_value = mock_resp
+    mock_client.get.return_value = mock_resp
     adapter.set_client(mock_client)
     
     result = await adapter.lookup("victim@example.com", "email")
     assert result.source == "Hudson Rock"
     assert result.verdict == "malicious"
-    assert result.confidence == "high"
     assert "infostealer_compromised" in result.tags
     assert "stealer:RedLine" in result.tags
 
@@ -98,20 +106,18 @@ async def test_hudson_rock_with_compromise():
 @pytest.mark.asyncio
 async def test_hudson_rock_clean():
     adapter = HudsonRockAdapter()
-    adapter.api_key = "valid-test-key-1234"
     
     mock_resp = MagicMock()
-    mock_resp.status_code = 200
-    mock_resp.json.return_value = {"data": []}
+    mock_resp.status_code = 404
     
     mock_client = AsyncMock()
-    mock_client.post.return_value = mock_resp
+    mock_client.get.return_value = mock_resp
     adapter.set_client(mock_client)
     
     result = await adapter.lookup("clean@example.com", "email")
     assert result.source == "Hudson Rock"
     assert result.verdict == "clean"
-    assert "no_infostealer_infection" in result.tags
+    assert "no_infostealer_compromise" in result.tags
 
 
 def test_adapters_registered_in_pipeline():

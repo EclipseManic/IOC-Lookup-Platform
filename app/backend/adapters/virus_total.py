@@ -10,7 +10,14 @@ from app.backend.config import settings
 class VirusTotalAdapter(SourceAdapter):
     name = "VirusTotal"
     supported_types = ["md5", "sha1", "sha256", "ipv4", "ipv6", "domain", "url"]
-    rate_limit = RateLimitConfig(requests_per_minute=4, requests_per_day=500)
+    rate_limit = RateLimitConfig(
+        requests_per_minute=4,
+        requests_per_day=500,
+        minimum_interval_seconds=0.0,
+        max_backoff_seconds=10.0,
+        max_retries=1,
+        concurrency_limit=2,
+    )
 
     def __init__(self):
         self.api_key = settings.virustotal_api_key

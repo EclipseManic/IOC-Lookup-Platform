@@ -79,7 +79,7 @@ class CveOrgAdapter(SourceAdapter):
                 value = desc.get("value", "")
                 if value:
                     cwe_values.append(value)
-        cwes = [w.split(":")[-1].strip() if ":" in w else w for w in cwe_values if w]
+        cwes = list(dict.fromkeys(w.split(":")[-1].strip() if ":" in w else w for w in cwe_values if w))
 
         references = [
             ref.get("url", "") for ref in (cna.get("references") or []) if ref.get("url")
@@ -110,6 +110,8 @@ class CveOrgAdapter(SourceAdapter):
 
         if state == "REJECTED":
             tags.append("rejected")
+
+        tags = list(dict.fromkeys(tags))
 
         # CVSS and CVE lifecycle state are vulnerability semantics.  They must
         # not be emitted as malicious/suspicious reputation verdicts.

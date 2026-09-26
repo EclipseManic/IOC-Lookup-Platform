@@ -1,20 +1,21 @@
 import asyncio
+import base64
 import hashlib
 import hmac
 import ipaddress
 import json
 import random
 import socket
+import time
 import uuid
-from datetime import datetime, timezone
 from typing import Optional
 from urllib.parse import urlparse
 
-import httpx
+from cryptography.fernet import Fernet, InvalidToken
 
 from app.backend.config import settings
 from app.backend.database import async_session, retry_sqlite_commit
-from app.backend.http_client import get_client
+from app.backend.http_client import get_client, resolve_public_url
 from app.backend.logger import get_logger
 from app.backend.models import Webhook as WebhookModel
 
@@ -28,6 +29,38 @@ _WEBHOOK_TIMEOUT = 10.0
 _MAX_PENDING_DISPATCH = 50
 
 _pending_dispatch: set[asyncio.Task] = set()
+
+
+def _secret_cipher() -> Fernet | None:
+    key_material = settings.webhook_secret_key.strip()
+    if not key_material:
+        return None
+    return Fernet(base64.urlsafe_b64encode(hashlib.sha256(key_material.encode()).digest()))
+
+
+def _protect_secret(secret: str | None) -> str | None:
+    if not secret:
+        return None
+    cipher = _secret_cipher()
+    if cipher is None:
+        raise ValueError("WEBHOOK_SECRET_KEY is required before storing a webhook secret")
+    return cipher.encrypt(secret.encode()).decode()
+
+
+def _unprotect_secret(value: str | None) -> str | None:
+    if not value:
+        return None
+    cipher = _secret_cipher()
+    if not cipher:
+        return None
+    if not value.startswith("gAAAA"):
+        logger.error("Legacy plaintext webhook secret rejected")
+        return None
+    try:
+        return cipher.decrypt(value.encode()).decode()
+    except InvalidToken:
+        logger.error("Webhook secret could not be decrypted")
+        return None
 
 
 def spawn_lookup_dispatch(task_id: str, ioc_value: str, verdict: str, score: float) -> Optional[asyncio.Task]:
@@ -80,10 +113,29 @@ async def shutdown_webhook_tasks():
     _pending_dispatch.clear()
 
 
+async def _resolve_hosts(host: str) -> list[ipaddress.IPv4Address | ipaddress.IPv6Address]:
+    loop = asyncio.get_running_loop()
+    infos = await loop.run_in_executor(
+        None,
+        socket.getaddrinfo,
+        host,
+        None,
+        0,
+        socket.AF_UNSPEC,
+        socket.SOCK_STREAM,
+    )
+    addresses: list[ipaddress.IPv4Address | ipaddress.IPv6Address] = []
+    for info in infos:
+        address = info[4][0]
+        parsed = ipaddress.ip_address(address.split("%", 1)[0])
+        if parsed not in addresses:
+            addresses.append(parsed)
+    return addresses
+
+
 async def _resolve_host(host: str) -> Optional[ipaddress.IPv4Address | ipaddress.IPv6Address]:
-    loop = asyncio.get_event_loop()
-    addr = await loop.run_in_executor(None, socket.gethostbyname, host)
-    return ipaddress.ip_address(addr)
+    addresses = await _resolve_hosts(host)
+    return addresses[0] if addresses else None
 
 
 async def _validate_webhook_url(url: str) -> Optional[str]:
@@ -93,16 +145,21 @@ async def _validate_webhook_url(url: str) -> Optional[str]:
     host = parsed.hostname
     if not host:
         return "Invalid webhook URL"
+    if parsed.username is not None or parsed.password is not None:
+        return "Webhook URL userinfo is not allowed"
     try:
-        ip = await _resolve_host(host)
-        if not ip.is_global:
+        addresses = await _resolve_hosts(host)
+        if not addresses or any(not address.is_global for address in addresses):
             return "Webhook URL must point to a public address"
     except Exception:
         return "Could not resolve webhook URL"
     return None
 
 
+
 async def add_webhook(url: str, events: Optional[list[str]] = None, secret: Optional[str] = None) -> dict:
+    if settings.webhooks_enabled and not secret:
+        raise ValueError("A per-webhook signing secret is required")
     err = await _validate_webhook_url(url)
     if err:
         raise ValueError(err)
@@ -113,7 +170,7 @@ async def add_webhook(url: str, events: Optional[list[str]] = None, secret: Opti
     wh_id = uuid.uuid4().hex[:12]
     events_str = json.dumps(events or _DEFAULT_EVENTS)
     async with async_session() as session:
-        wh = WebhookModel(id=wh_id, url=url, events=events_str, secret=secret)
+        wh = WebhookModel(id=wh_id, url=url, events=events_str, secret=_protect_secret(secret))
         session.add(wh)
         await retry_sqlite_commit(session)
         await session.refresh(wh)
@@ -131,21 +188,24 @@ async def remove_webhook(webhook_id: str) -> bool:
         return True
 
 
-async def list_webhooks() -> list[dict]:
+async def list_webhooks(include_secret: bool = False) -> list[dict]:
     async with async_session() as session:
         from sqlalchemy import select
         result = await session.execute(select(WebhookModel).order_by(WebhookModel.created_at))
         rows = result.scalars().all()
-        return [
-            {
-                "id": r.id,
-                "url": r.url,
-                "events": json.loads(r.events),
-                "has_secret": bool(r.secret),
-                "created_at": r.created_at.isoformat() if r.created_at else "",
+        targets = []
+        for row in rows:
+            target = {
+                "id": row.id,
+                "url": row.url,
+                "events": json.loads(row.events),
+                "has_secret": bool(row.secret),
+                "created_at": row.created_at.isoformat() if row.created_at else "",
             }
-            for r in rows
-        ]
+            if include_secret:
+                target["secret"] = _unprotect_secret(row.secret)
+            targets.append(target)
+        return targets
 
 
 def _sign_payload(payload: bytes, secret: str) -> str:
@@ -153,7 +213,7 @@ def _sign_payload(payload: bytes, secret: str) -> str:
 
 
 async def dispatch_event(event: str, data: dict):
-    targets = await list_webhooks()
+    targets = await list_webhooks(include_secret=True)
     if not targets:
         return
 
@@ -162,23 +222,45 @@ async def dispatch_event(event: str, data: dict):
         return
 
     client = get_client()
-    payload = json.dumps({"event": event, **data}).encode()
 
     for wh in wh_targets:
-        # Resolve again at delivery time to reduce the DNS-rebinding window
-        # between webhook registration and dispatch.
-        invalid_target = await _validate_webhook_url(wh["url"])
-        if invalid_target:
-            logger.warning("Skipping webhook %s: %s", wh["id"], invalid_target)
-            continue
-        headers = {"Content-Type": "application/json"}
         secret = wh.get("secret")
-        if secret:
-            headers["X-Webhook-Signature"] = _sign_payload(payload, secret)
+        if not secret:
+            logger.error("Skipping webhook %s because its signing secret is unavailable", wh["id"])
+            continue
+        pinned_target = await resolve_public_url(wh["url"], resolver=_resolve_hosts)
+        if pinned_target is None:
+            logger.warning("Skipping webhook %s: unsafe or unresolved target", wh["id"])
+            continue
+        pinned_url, pin_headers, extensions = pinned_target
+        event_id = uuid.uuid4().hex
+        timestamp = str(int(time.time()))
+        envelope = {
+            "event": event,
+            "event_id": event_id,
+            "timestamp": timestamp,
+            **data,
+        }
+        payload = json.dumps(envelope, sort_keys=True, separators=(",", ":")).encode()
+        headers = {
+            **pin_headers,
+            "Content-Type": "application/json",
+            "X-Webhook-Event": event,
+            "X-Webhook-Event-ID": event_id,
+            "X-Webhook-Timestamp": timestamp,
+            "X-Webhook-Signature": _sign_payload(timestamp.encode() + b"." + payload, secret),
+        }
 
         for attempt in range(_RETRY_ATTEMPTS):
             try:
-                resp = await client.post(wh["url"], content=payload, headers=headers, timeout=_WEBHOOK_TIMEOUT)
+                resp = await client.post(
+                    pinned_url,
+                    content=payload,
+                    headers=headers,
+                    timeout=_WEBHOOK_TIMEOUT,
+                    follow_redirects=False,
+                    extensions=extensions,
+                )
                 if resp.is_success:
                     break
                 logger.warning("Webhook %s attempt %d/%d returned %d", wh["id"], attempt + 1, _RETRY_ATTEMPTS, resp.status_code)

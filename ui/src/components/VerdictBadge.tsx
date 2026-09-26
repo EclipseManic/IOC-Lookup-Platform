@@ -1,9 +1,11 @@
 const VERDICT_COLORS: Record<string, string> = {
   malicious: "bg-red-500/10 text-red-400 border-red-500/30",
+  breached: "bg-rose-500/15 text-rose-400 border-rose-500/40 shadow-[0_0_8px_rgba(244,63,94,0.2)]",
   compromised: "bg-red-500/10 text-red-400 border-red-500/30",
   suspicious: "bg-amber-500/10 text-amber-400 border-amber-500/30",
   clean: "bg-green-500/10 text-green-400 border-green-500/30",
   benign: "bg-green-500/10 text-green-400 border-green-500/30",
+  not_breached: "bg-emerald-500/15 text-emerald-400 border-emerald-500/40 shadow-[0_0_8px_rgba(16,185,129,0.2)]",
   not_pwned: "bg-green-500/10 text-green-400 border-green-500/30",
   not_found: "bg-slate-500/10 text-slate-400 border-slate-500/30",
   not_applicable: "bg-cyan-500/10 text-cyan-300 border-cyan-500/30",

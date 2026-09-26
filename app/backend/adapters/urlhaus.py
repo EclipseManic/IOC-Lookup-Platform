@@ -1,6 +1,9 @@
 import httpx
 
 from app.backend.adapters.base import NormalizedResult, RateLimitConfig, SourceAdapter, is_valid_api_key
+from app.backend.logger import get_logger
+
+logger = get_logger("adapter.urlhaus")
 
 
 class URLHausAdapter(SourceAdapter):
@@ -24,23 +27,21 @@ class URLHausAdapter(SourceAdapter):
         client = self._get_client()
         try:
             resp = await client.post(url, data=data, headers=self._auth_headers(), timeout=15)
-        except httpx.ConnectError:
-            try:
-                async with httpx.AsyncClient(verify=False, timeout=15) as fb_client:
-                    resp = await fb_client.post(url, data=data, headers=self._auth_headers())
-            except Exception:
-                return {}
-        except Exception:
-            return {}
+        except httpx.RequestError as exc:
+            logger.debug("URLhaus request failed: %s", exc)
+            return {"query_status": "error", "error": "request_failed"}
+        except Exception as exc:
+            logger.debug("URLhaus request failed: %s", exc)
+            return {"query_status": "error", "error": "request_failed"}
 
         if resp.status_code == 429:
             return {"query_status": "rate_limited"}
         if resp.status_code != 200:
-            return {}
+            return {"query_status": "error", "error": f"http_{resp.status_code}"}
         try:
             return resp.json()
         except Exception:
-            return {}
+            return {"query_status": "error", "error": "malformed_response"}
 
     async def _query_host(self, ioc_value: str) -> dict:
         return await self._post("https://urlhaus-api.abuse.ch/v1/host/", {"host": ioc_value})
@@ -65,13 +66,21 @@ class URLHausAdapter(SourceAdapter):
         if not data:
             return NormalizedResult(
                 ioc=ioc_value, ioc_type=ioc_type, source=self.name,
-                verdict="unknown", raw_score=0.0, status="not_found",
+                verdict="unknown", raw_score=0.0, status="error",
+                tags=["request_error"],
             )
 
         if data.get("query_status") == "rate_limited":
             return NormalizedResult(
                 ioc=ioc_value, ioc_type=ioc_type, source=self.name,
                 verdict="unknown", tags=["rate_limited"],
+            )
+
+        if data.get("query_status") not in {"ok", "no_results"}:
+            return NormalizedResult(
+                ioc=ioc_value, ioc_type=ioc_type, source=self.name,
+                verdict="unknown", raw_score=0.0, status="error",
+                tags=["request_error"],
             )
 
         query_status = data.get("query_status", "")

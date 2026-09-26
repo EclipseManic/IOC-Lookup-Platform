@@ -78,6 +78,12 @@ function lookupStatus(assessment: IOCAssessment): { value: string; detail: strin
   if (assessment.assessment_status === "unavailable") {
     return { value: "UNAVAILABLE", detail: "No usable provider result was available", tone: "health" };
   }
+  if (assessment.assessment_status === "cancelled") {
+    return { value: "CANCELLED", detail: "Batch analysis was cancelled before completion", tone: "health" };
+  }
+  if (assessment.assessment_status === "error") {
+    return { value: "ERROR", detail: "IOC analysis failed before producing a verdict", tone: "health" };
+  }
   if (assessment.assessment_status === "batch_deadline_exceeded") {
     return { value: "BATCH DEADLINE", detail: "IOC was not started before the batch deadline", tone: "health" };
   }
@@ -377,14 +383,14 @@ export default function IocAssessmentCard({
 
   return (
     <article className="overflow-hidden rounded-xl border border-border bg-bg-card shadow-[0_10px_30px_rgba(0,0,0,0.18)]">
-      <div role="button" tabIndex={0} onClick={() => setExpanded((value) => !value)} onKeyDown={(event) => { if (event.key === "Enter" || event.key === " ") { event.preventDefault(); setExpanded((value) => !value); } }} aria-expanded={expanded} className="w-full cursor-pointer p-4 text-left hover:bg-bg-elevated/30">
+      <div className="w-full p-4 text-left">
         <div className="flex flex-wrap items-start justify-between gap-3">
           <div className="min-w-0 flex-1">
             <div className="mb-1 flex flex-wrap items-center gap-2 text-[10px] uppercase tracking-wider text-text-secondary"><span>{label(assessment.ioc_type)}</span><span>·</span><span>{status.value}</span></div>
             <div className="mt-1 text-[10px] uppercase tracking-wider text-text-secondary">Assessment domain: {label(domain)}</div>
             <div className="flex min-w-0 items-center gap-2"><span className="truncate font-mono text-sm sm:text-base" title={displayIoc}>{displayIoc}</span><CopyButton value={displayIoc} /></div>
           </div>
-          <div className="flex shrink-0 items-center gap-2"><VerdictBadge verdict={assessment.final_verdict} size="md" /><span className={`rounded-full border px-2 py-0.5 text-[10px] font-semibold uppercase ${toneClass(status.tone)}`}>{status.value}</span><span className="text-text-secondary">{expanded ? "Collapse" : "Expand"}</span></div>
+          <div className="flex shrink-0 items-center gap-2"><VerdictBadge verdict={assessment.final_verdict} size="md" /><span className={`rounded-full border px-2 py-0.5 text-[10px] font-semibold uppercase ${toneClass(status.tone)}`}>{status.value}</span><button type="button" onClick={() => setExpanded((value) => !value)} aria-expanded={expanded} className="text-text-secondary hover:text-text-primary">{expanded ? "Collapse" : "Expand"}</button></div>
         </div>
         <div className="mt-3 grid grid-cols-2 gap-2 md:grid-cols-4">
           <Metric label={isVulnerability ? "Vulnerability risk" : isNonReputation ? "Reputation" : "Risk score"} value={isNonReputation && !isVulnerability ? "Not applicable" : `${assessment.normalized_score.toFixed(0)}/100`} percent={isNonReputation && !isVulnerability ? undefined : assessment.normalized_score} tone={verdictTone} />

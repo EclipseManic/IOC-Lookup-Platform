@@ -21,7 +21,8 @@ VALID_KEYS = {
     "shodan_api_key": "a" * 40,
     "censys_api_key": "a" * 40,
     "ipinfo_api_key": "a" * 40,
-    "emailrep_api_key": "a" * 40,
+    "abstractapi_api_key": "a" * 32,
+    "hunterio_api_key": "a" * 40,
 }
 
 ALIAS_KEYS = {
@@ -39,7 +40,8 @@ ALIAS_KEYS = {
     "shodan_api_key": "SHODAN_API_KEY",
     "censys_api_key": "CENSYS_API_KEY",
     "ipinfo_api_key": "IPINFO_API_KEY",
-    "emailrep_api_key": "EMAILREP_API_KEY",
+    "abstractapi_api_key": "ABSTRACTAPI_API_KEY",
+    "hunterio_api_key": "HUNTERIO_API_KEY",
 }
 
 
@@ -82,13 +84,41 @@ def test_empty_database_url_raises():
         Settings(database_url="", _env_file=None)
 
 
-def test_non_loopback_host_requires_api_keys():
+def test_non_loopback_host_requires_explicit_opt_in():
+    with pytest.raises(ValueError, match="ALLOW_NETWORK_BIND"):
+        _settings(host="0.0.0.0", api_keys="test-key-123")
+
+
+def test_non_loopback_opt_in_still_requires_api_keys():
     with pytest.raises(ValueError, match="API_KEYS is required"):
-        _settings(host="0.0.0.0")
+        _settings(host="0.0.0.0", allow_network_bind=True)
 
 
-def test_non_loopback_host_with_api_keys_is_allowed():
-    assert _settings(host="0.0.0.0", api_keys="test-key-123").host == "0.0.0.0"
+def test_non_loopback_host_with_explicit_opt_in_and_api_keys_is_allowed():
+    settings = _settings(
+        host="0.0.0.0",
+        api_keys="test-key-1234567890",
+        allow_network_bind=True,
+        base_url="https://ioc.example.com",
+    )
+    assert settings.host == "0.0.0.0"
+
+
+def test_network_opt_in_requires_api_keys_on_loopback_host():
+    with pytest.raises(ValueError, match="API_KEYS is required"):
+        _settings(allow_network_bind=True, base_url="https://ioc.example.com")
+
+
+def test_network_opt_in_requires_https_base_url():
+    with pytest.raises(ValueError, match="BASE_URL must use HTTPS"):
+        _settings(allow_network_bind=True, api_keys="test-key-1234567890")
+
+
+def test_proxy_headers_require_explicit_peer_allowlist():
+    with pytest.raises(ValueError, match="TRUSTED_PROXY_HOSTS"):
+        _settings(trust_proxy=True)
+    settings = _settings(trust_proxy=True, trusted_proxy_hosts="127.0.0.1")
+    assert settings.trusted_proxy_hosts == "127.0.0.1"
 
 
 def test_source_allowlist_is_case_insensitive():

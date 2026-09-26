@@ -17,7 +17,7 @@ describe("EnrichmentPanel", () => {
 
     render(<EnrichmentPanel enrichment={enrichment} />);
 
-    expect(screen.getByText("Collection Status")).toBeTruthy();
+    expect(screen.getByText("Collection Completeness Audit")).toBeTruthy();
     expect(screen.getByText(/passive dns/)).toBeTruthy();
     expect(screen.getByText(/185\.199\.109\.153/)).toBeTruthy();
     expect(screen.getByText(/available/)).toBeTruthy();

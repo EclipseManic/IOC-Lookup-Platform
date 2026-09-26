@@ -534,7 +534,14 @@ class TestURLHausAdapter:
         assert "rate_limited" in r.tags
 
     @pytest.mark.asyncio
-    async def test_domain_lookup(self):
+    async def test_request_error_is_not_not_found(self):
+        a = URLHausAdapter()
+        mock_class, _ = _mock_async_client(raise_on=httpx.ConnectError("offline"))
+        with patch("httpx.AsyncClient", mock_class):
+            r = await a.lookup("https://evil.example", "url")
+        assert r.execution_state == "error"
+        assert "request_error" in r.tags
+
         """Domain type works the same as URL."""
         data = {
             "query_status": "ok",

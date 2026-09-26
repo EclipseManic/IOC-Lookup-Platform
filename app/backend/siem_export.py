@@ -27,7 +27,13 @@ def _ts() -> str:
 
 
 def _verdict_severity(verdict: str) -> int:
-    return {"malicious": 10, "suspicious": 6, "clean": 1, "unknown": 0}.get(verdict, 0)
+    if verdict in {"malicious", "breached", "compromised", "critical", "high"}:
+        return 10
+    if verdict in {"suspicious", "medium", "low"}:
+        return 6
+    if verdict in {"clean", "benign", "not_breached", "harmless", "whitelisted"}:
+        return 1
+    return 0
 
 
 def _escape_splunk(val: str) -> str:
@@ -40,8 +46,9 @@ def export_splunk(response: dict) -> str:
     ioc_value = response.get("normalized", response.get("input", ""))
     ioc_type = response.get("ioc_type", "unknown")
     composite = response.get("composite", {})
-    score = composite.get("score", 0)
-    verdict = composite.get("verdict", "unknown")
+    assessment = response.get("final_assessment") or {}
+    score = assessment.get("normalized_score", composite.get("score", 0))
+    verdict = assessment.get("final_verdict", composite.get("verdict", "unknown"))
     results = response.get("results", [])
 
     lines = []
@@ -55,14 +62,16 @@ def export_splunk(response: dict) -> str:
             f"ioc_type={_escape_splunk(ioc_type)}",
             f"verdict={_escape_splunk(r_verdict)}",
             f"composite_verdict={_escape_splunk(verdict)}",
+            f"assessment_domain={_escape_splunk(assessment.get('assessment_domain', 'ioc_reputation'))}",
+            f"final_assessment_verdict={_escape_splunk(assessment.get('final_verdict', verdict))}",
             f"raw_score={r_score or ''}",
             f"composite_score={score}",
             f"severity={_verdict_severity(r_verdict)}",
             f"confidence={_escape_splunk(r.get('confidence', ''))}",
             f"malware_family={_escape_splunk(r.get('malware_family', ''))}",
-            f"tags={';'.join(r.get('tags', []))}",
-            f"mitre_attck={';'.join(r.get('mitre_attck', []))}",
-            f"index=ioc_platform",
+            f"tags={_escape_splunk(';'.join(r.get('tags', [])))}",
+            f"mitre_attck={_escape_splunk(';'.join(r.get('mitre_attck', [])))}",
+            "index=ioc_platform",
             f"time={_ts()}",
         ]
         lines.append(" ".join(fields))
@@ -73,8 +82,9 @@ def export_ecs(response: dict) -> str:
     ioc_value = response.get("normalized", response.get("input", ""))
     ioc_type = response.get("ioc_type", "unknown")
     composite = response.get("composite", {})
-    score = composite.get("score", 0)
-    verdict = composite.get("verdict", "unknown")
+    assessment = response.get("final_assessment") or {}
+    score = assessment.get("normalized_score", composite.get("score", 0))
+    verdict = assessment.get("final_verdict", composite.get("verdict", "unknown"))
     results = response.get("results", [])
     enrichment = response.get("enrichment", {})
 
@@ -83,7 +93,12 @@ def export_ecs(response: dict) -> str:
         "@timestamp": _ts(),
         "event": {"kind": "enrichment", "category": ["threat"], "type": ["indicator"]},
         "threat": {"indicator": {"type": ioc_type, "name": ioc_value}},
-        "ioc_platform": {"composite_score": score, "composite_verdict": verdict},
+        "ioc_platform": {
+            "composite_score": score,
+            "composite_verdict": verdict,
+            "assessment_domain": assessment.get("assessment_domain", "ioc_reputation"),
+            "final_verdict": assessment.get("final_verdict", verdict),
+        },
     }
 
     geoip = enrichment.get("geoip", {})
@@ -129,8 +144,9 @@ def export_leef(response: dict) -> str:
     ioc_value = response.get("normalized", response.get("input", ""))
     ioc_type = response.get("ioc_type", "unknown")
     composite = response.get("composite", {})
-    score = composite.get("score", 0)
-    verdict = composite.get("verdict", "unknown")
+    assessment = response.get("final_assessment") or {}
+    score = assessment.get("normalized_score", composite.get("score", 0))
+    verdict = assessment.get("final_verdict", composite.get("verdict", "unknown"))
     results = response.get("results", [])
 
     lines = []
@@ -145,6 +161,8 @@ def export_leef(response: dict) -> str:
             ("source", src),
             ("verdict", r.get("verdict", "unknown")),
             ("compositeVerdict", verdict),
+            ("assessmentDomain", assessment.get("assessment_domain", "ioc_reputation")),
+            ("finalAssessmentVerdict", assessment.get("final_verdict", verdict)),
             ("compositeScore", str(score)),
             ("rawScore", str(r.get("raw_score", ""))),
             ("confidence", r.get("confidence", "")),

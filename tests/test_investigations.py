@@ -1,3 +1,4 @@
+import hashlib
 import sys
 
 sys.path.insert(0, ".")
@@ -31,18 +32,18 @@ async def client(tmp_path):
 
     app.dependency_overrides[get_db] = override_get_db
     transport = ASGITransport(app=app)
-    async with AsyncClient(transport=transport, base_url="http://test") as client:
+    async with AsyncClient(transport=transport, base_url="http://localhost") as client:
         yield client
     app.dependency_overrides.clear()
     await engine.dispose()
 
 
-async def _fake_task(ioc_value, fp_override=False, verdict="suspicious", score=45.0):
+async def _fake_task(ioc_value, fp_override=False, verdict="suspicious", score=45.0, ioc_type_override=None, password_prehashed=False):
     return AnalysisTask(
-        task_id="t1",
+        task_id=f"task-{hashlib.sha1(ioc_value.encode()).hexdigest()[:12]}",
         ioc_value=ioc_value,
         normalized=ioc_value,
-        ioc_type="ipv4",
+        ioc_type=ioc_type_override or "ipv4",
         status="done",
         progress=100.0,
         composite=CompositeScore(score=score, verdict=verdict, confidence="medium"),
@@ -104,6 +105,20 @@ async def test_add_ioc_is_idempotent(client, monkeypatch):
 
     detail = (await client.get(f"/api/investigations/{inv_id}")).json()
     assert len(detail["iocs"]) == 1
+
+
+@pytest.mark.asyncio
+async def test_add_ioc_rejects_untyped_host_artifact(client, monkeypatch):
+    from app.backend import main as main_mod
+
+    created = await client.post("/api/investigations", json={"name": "Ambiguous"})
+    inv_id = created.json()["id"]
+    monkeypatch.setattr(main_mod, "run_analysis", _fake_task)
+
+    response = await client.post(f"/api/investigations/{inv_id}/iocs", json={"ioc": "abcdefghijkl"})
+    assert response.status_code == 400
+    detail = await client.get(f"/api/investigations/{inv_id}")
+    assert detail.json()["iocs"] == []
 
 
 @pytest.mark.asyncio

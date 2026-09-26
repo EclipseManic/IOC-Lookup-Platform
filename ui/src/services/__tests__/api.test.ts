@@ -1,10 +1,12 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { lookupIOC, saveLookup } from "../api";
+import { clearRuntimeApiKey, lookupIOC, saveLookup, setRuntimeApiKey } from "../api";
+
 
 describe("lookupIOC", () => {
   afterEach(() => {
     vi.restoreAllMocks();
     vi.unstubAllEnvs();
+    clearRuntimeApiKey();
   });
 
   it.each(["d41d8cd98f00b204e9800998ecf8427e", "CVE-2024-3094"])(
@@ -40,8 +42,8 @@ describe("lookupIOC", () => {
     expect(options?.body).toBe(JSON.stringify({ ioc: "example.com", ioc_type: "domain", refresh: true }));
   });
 
-  it("adds the optional deployment API key to requests", async () => {
-    vi.stubEnv("VITE_API_KEY", "test-secret");
+  it("adds the session API key to requests", async () => {
+    setRuntimeApiKey("test-secret");
     const fetchMock = vi.spyOn(globalThis, "fetch").mockResolvedValue(
       new Response(JSON.stringify({ task_id: "task-auth", status: "pending" }), {
         status: 200,

@@ -23,6 +23,8 @@ from app.backend.enrichment import (
     _dns_lookup,
     _dns_txt_query,
     _favicon_hash,
+    _is_public_fetch_target,
+    _quick_port_scan,
 )
 
 
@@ -637,6 +639,9 @@ class TestWhoisWindowsFallback:
         from unittest.mock import MagicMock
 
         from app.backend import enrichment
+        from app.backend.config import settings
+
+        monkeypatch.setattr(settings, "virustotal_api_key", "")
 
         async def fake_raw_query(target, server=None):
             return None
@@ -675,3 +680,15 @@ async def test_url_fetching_is_disabled_by_default(monkeypatch):
 
 async def _resolved(value):
     return value
+
+
+@pytest.mark.asyncio
+async def test_active_port_scan_rejects_private_targets():
+    assert await _quick_port_scan("127.0.0.1") == []
+    assert await _quick_port_scan("192.168.1.10") == []
+    assert await _quick_port_scan("169.254.169.254") == []
+
+
+@pytest.mark.asyncio
+async def test_active_url_fetch_requires_https():
+    assert await _is_public_fetch_target("http://example.com/path") is False

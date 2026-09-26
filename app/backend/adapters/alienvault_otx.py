@@ -22,8 +22,8 @@ _TYPE_TO_SEGMENT = {
 class AlienVaultOTXAdapter(SourceAdapter):
     name = "AlienVault OTX"
     supported_types = ["ipv4", "ipv6", "domain", "url", "md5", "sha1", "sha256"]
-    public_without_key = True
-    rate_limit = RateLimitConfig(requests_per_minute=16, requests_per_day=1000)
+    public_without_key = False
+    rate_limit = RateLimitConfig(requests_per_minute=16, requests_per_day=1000, max_retries=1, timeout_seconds=10.0)
 
     def __init__(self):
         self.api_key = settings.alienvault_otx_api_key
@@ -34,7 +34,7 @@ class AlienVaultOTXAdapter(SourceAdapter):
         try:
             headers = {"X-OTX-API-KEY": self.api_key} if is_valid_api_key(self.api_key) else None
             resp = await self._get_client().get(
-                url, headers=headers, timeout=15,
+                url, headers=headers, timeout=10,
             )
             if resp.status_code == 200:
                 self._record_success()
@@ -75,7 +75,7 @@ class AlienVaultOTXAdapter(SourceAdapter):
             resp = await client.get(
                     f"https://otx.alienvault.com/api/v1/indicators/{segment}/{ioc_value}/reputation",
                     headers=headers,
-                    timeout=15,
+                    timeout=10,
                 )
         except httpx.TimeoutException:
             self._record_failure()
@@ -193,7 +193,10 @@ class AlienVaultOTXAdapter(SourceAdapter):
                         tags.append(f"whois_{key}:{str(val)[:80]}")
 
         extra_data = {}
-        if ioc_type == "ipv4":
+        malware_urls: list[str] = []
+        associated_hashes: list[str] = []
+
+        if ioc_type in ("ipv4", "ipv6"):
             geo_data = await self._sub_request(
                 f"https://otx.alienvault.com/api/v1/indicators/{segment}/{ioc_value}/geo"
             )
@@ -204,6 +207,33 @@ class AlienVaultOTXAdapter(SourceAdapter):
                         extra_data[key] = val
                 if extra_data.get("country_name") or extra_data.get("city"):
                     extra_data["geoip"] = True
+
+        # URL list sub-endpoint: malicious URLs hosted on/associated with this indicator
+        if ioc_type in ("ipv4", "ipv6", "domain"):
+            url_list_data = await self._sub_request(
+                f"https://otx.alienvault.com/api/v1/indicators/{segment}/{ioc_value}/url_list"
+            )
+            if url_list_data and isinstance(url_list_data, dict):
+                for entry in (url_list_data.get("url_list", []) or [])[:25]:
+                    if isinstance(entry, dict):
+                        url = entry.get("url", "")
+                        if url:
+                            malware_urls.append(url)
+
+        # Malware sub-endpoint: file hashes associated with this indicator
+        if ioc_type in ("ipv4", "ipv6", "domain"):
+            malware_data = await self._sub_request(
+                f"https://otx.alienvault.com/api/v1/indicators/{segment}/{ioc_value}/malware"
+            )
+            if malware_data and isinstance(malware_data, dict):
+                for entry in (malware_data.get("data", []) or [])[:10]:
+                    if isinstance(entry, dict):
+                        h = entry.get("hash", "")
+                        if h:
+                            associated_hashes.append(h)
+
+        # Analysis sub-endpoint: for IPs and file hashes
+        if ioc_type in ("ipv4", "ipv6", "md5", "sha1", "sha256"):
             analysis_data = await self._sub_request(
                 f"https://otx.alienvault.com/api/v1/indicators/{segment}/{ioc_value}/analysis"
             )
@@ -234,5 +264,10 @@ class AlienVaultOTXAdapter(SourceAdapter):
             malware_family=", ".join(sorted(all_families)) or None,
             mitre_attck=sorted(all_mitre),
             related_iocs=related,
-            raw_data={"api_response": data, **extra_data},
+            raw_data={
+                "api_response": data,
+                "malware_urls": malware_urls,
+                "associated_hashes": associated_hashes,
+                **extra_data,
+            },
         )

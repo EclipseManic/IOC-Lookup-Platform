@@ -39,8 +39,8 @@ class EtherscanAdapter(SourceAdapter):
             )
 
         client = self._get_client()
-        base = "https://api.etherscan.io/api"
-        common = {"address": ioc_value, "apikey": self.api_key}
+        base = "https://api.etherscan.io/v2/api"
+        common = {"address": ioc_value, "apikey": self.api_key, "chainid": 1}
         balance_request = client.get(
             base, params={"module": "account", "action": "balance", **common}, timeout=15,
         )
@@ -105,7 +105,13 @@ class EtherscanAdapter(SourceAdapter):
         )
         if not has_record:
             message = str(transaction_data.get("message") or balance_data.get("message") or "").lower()
-            if "invalid" in message or "not found" in message:
+            result_str = str(balance_data.get("result") or "").lower()
+            if "deprecated" in result_str or "invalid api key" in result_str or "unauthorized" in result_str:
+                return NormalizedResult(
+                    ioc=ioc_value, ioc_type=ioc_type, source=self.name,
+                    verdict="error", tags=["api_error"], raw_data=payloads,
+                )
+            if "invalid" in message or "not found" in message or "notok" in message or not (balance_data or transaction_data):
                 return NormalizedResult(
                     ioc=ioc_value, ioc_type=ioc_type, source=self.name,
                     verdict="unknown", status="not_found", raw_data=payloads,

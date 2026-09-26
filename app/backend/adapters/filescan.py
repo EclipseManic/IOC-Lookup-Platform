@@ -92,17 +92,29 @@ class FileScanAdapter(SourceAdapter):
             if isinstance(values, str):
                 values = [values]
             if isinstance(values, list):
-                tags.extend(str(item) for item in values if item)
+                for item in values:
+                    if not item:
+                        continue
+                    if isinstance(item, dict):
+                        tag_obj = item.get("tag") if isinstance(item.get("tag"), dict) else item
+                        name = tag_obj.get("name") or item.get("name")
+                        if name:
+                            tags.append(str(name).strip())
+                    else:
+                        tags.append(str(item).strip())
         family = record.get("malware_family") or record.get("family") or record.get("threat_name")
         if family:
             tags.append(f"family:{family}")
         behavior = record.get("behavior") or record.get("behaviour") or record.get("sandbox_summary")
         if behavior:
             tags.append("sandbox_behavior_available")
+        clean_tags = list(dict.fromkeys(tags))
+        provider_summary = f"FileScan verdict: {verdict.title()}" if verdict != "unknown" else "No conclusive threat detected"
         return NormalizedResult(
             ioc=ioc_value, ioc_type=ioc_type, source=self.name,
             verdict=verdict, raw_score=score, confidence=confidence,
-            tags=list(dict.fromkeys(tags)), malware_family=str(family) if family else None,
+            tags=clean_tags, malware_family=str(family) if family else None,
             categories=[str(item) for item in record.get("categories", [])] if isinstance(record.get("categories"), list) else [],
             raw_data=raw_data, source_link=f"https://www.filescan.io/scan?sha256={ioc_value}",
+            provider_summary=provider_summary,
         )

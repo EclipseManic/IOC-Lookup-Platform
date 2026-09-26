@@ -3,6 +3,7 @@ import ErrorBoundary from "./components/ErrorBoundary";
 import ToastContainer from "./components/Toast";
 import Landing from "./pages/Landing";
 import HomePage from "./pages/HomePage";
+import { AUTH_REQUIRED_EVENT, setRuntimeApiKey, type BatchResult, type LookupResponse } from "./services/api";
 
 export type Page = "home" | "lookup";
 export type Tool = "investigations" | "batch" | "history";
@@ -11,31 +12,42 @@ export interface NavigateEvent {
   page: Page;
   tool?: Tool | null;
   ioc?: string;
+  iocType?: string;
   batchId?: string;
+  batchResult?: BatchResult;
+  historyId?: number;
+  isHistorical?: boolean;
+  batchResultItem?: LookupResponse;
+  fromBatch?: boolean;
+  autoRescan?: boolean;
+  createdAt?: string;
 }
 
-const PRIMARY_TABS: { id: Page; label: string }[] = [
+const NAV_TABS: { id: string; label: string }[] = [
   { id: "home", label: "Home" },
-  { id: "lookup", label: "Lookup" },
-];
-
-const TOOL_TABS: { id: Tool | "lookup"; label: string }[] = [
   { id: "lookup", label: "Lookup" },
   { id: "investigations", label: "Investigations" },
   { id: "batch", label: "Batch" },
   { id: "history", label: "History" },
 ];
 
-const VALID_PAGES = new Set<string>(PRIMARY_TABS.map((n) => n.id));
+const VALID_PAGES = new Set<string>(["home", "lookup"]);
 const TOOL_IDS = new Set<string>(["investigations", "batch", "history"]);
-const PRIMARY_TAB_IDS = PRIMARY_TABS.map((t) => t.id);
-const TOOL_TAB_IDS = TOOL_TABS.map((t) => t.id);
+const NAV_TAB_IDS = NAV_TABS.map((t) => t.id);
 
 export interface RouteState {
   page: Page;
   tool: Tool | null;
   ioc: string;
+  iocType: string;
   batchId: string;
+  batchResult?: BatchResult;
+  historyId?: number;
+  isHistorical?: boolean;
+  batchResultItem?: LookupResponse;
+  fromBatch?: boolean;
+  autoRescan?: boolean;
+  createdAt?: string;
 }
 
 function parseLocation(): RouteState {
@@ -43,14 +55,15 @@ function parseLocation(): RouteState {
   const raw = params.get("page") ?? "";
   const toolRaw = params.get("tool") ?? "";
   const ioc = params.get("ioc") ?? "";
+  const iocType = params.get("ioc_type") ?? "";
   const batchId = params.get("batch") ?? "";
   // Back-compat: legacy `?page=batch`-style deep links map to a Lookup sub-tab.
   if (TOOL_IDS.has(raw)) {
-    return { page: "lookup", tool: raw as Tool, ioc, batchId };
+    return { page: "lookup", tool: raw as Tool, ioc, iocType, batchId };
   }
   const page: Page = VALID_PAGES.has(raw) ? (raw as Page) : "home";
   const tool: Tool | null = page === "lookup" && TOOL_IDS.has(toolRaw) ? (toolRaw as Tool) : null;
-  return { page, tool, ioc, batchId };
+  return { page, tool, ioc, iocType, batchId };
 }
 
 function useTabsKeyNav(list: readonly string[], active: string, onSelect: (id: string) => void) {
@@ -69,8 +82,49 @@ function useTabsKeyNav(list: readonly string[], active: string, onSelect: (id: s
   return { listRef, handleKeyDown };
 }
 
+function AuthPrompt({ onSubmit }: { onSubmit: (value: string) => void }) {
+  const [value, setValue] = useState("");
+
+  return (
+    <div className="fixed inset-0 z-[100] flex items-center justify-center bg-black/70 p-4">
+      <form
+        role="dialog"
+        aria-modal="true"
+        aria-labelledby="auth-prompt-title"
+        onSubmit={(event) => {
+          event.preventDefault();
+          if (value.trim()) onSubmit(value);
+        }}
+        className="w-full max-w-md rounded-xl border border-border bg-bg-card p-6 shadow-2xl"
+      >
+        <h2 id="auth-prompt-title" className="text-lg font-bold">Local API key required</h2>
+        <p className="mt-2 text-sm text-text-secondary">Enter the API_KEYS value configured for this local instance. It is kept only for this browser session.</p>
+        <input
+          type="password"
+          autoFocus
+          value={value}
+          onChange={(event) => setValue(event.target.value)}
+          aria-label="Local API key"
+          className="mt-4 w-full rounded-lg border border-border bg-bg-secondary px-3 py-2 text-sm outline-none focus:border-accent"
+        />
+        <div className="mt-4 flex justify-end">
+          <button type="submit" disabled={!value.trim()} className="rounded-lg bg-accent px-4 py-2 text-sm font-semibold text-[#06070d] disabled:opacity-50">Continue</button>
+        </div>
+      </form>
+    </div>
+  );
+}
+
 export default function App() {
-  const [{ page, tool, ioc, batchId }, setRoute] = useState(parseLocation);
+  const [route, setRoute] = useState<RouteState>(parseLocation);
+  const [authRequired, setAuthRequired] = useState(false);
+  const { page, tool, ioc, iocType, batchId, batchResult, historyId, isHistorical, batchResultItem, fromBatch, autoRescan, createdAt } = route;
+
+  useEffect(() => {
+    const handleAuthRequired = () => setAuthRequired(true);
+    window.addEventListener(AUTH_REQUIRED_EVENT, handleAuthRequired);
+    return () => window.removeEventListener(AUTH_REQUIRED_EVENT, handleAuthRequired);
+  }, []);
 
   useEffect(() => {
     if (document.activeElement?.closest('[role="tablist"]')) return;
@@ -87,14 +141,39 @@ export default function App() {
     return () => window.removeEventListener("popstate", onPopState);
   }, []);
 
-  const navigate = useCallback((next: Page, nextTool: Tool | null = null, iocValue = "", nextBatchId = "") => {
-    if (next === page && nextTool === tool && iocValue === ioc && nextBatchId === batchId) return;
+  const navigate = useCallback((
+    next: Page,
+    nextTool: Tool | null = null,
+    iocValue = "",
+    nextIocType = "",
+    nextBatchId = "",
+    extra?: {
+      historyId?: number;
+      isHistorical?: boolean;
+      batchResultItem?: LookupResponse;
+      batchResult?: BatchResult;
+      fromBatch?: boolean;
+      autoRescan?: boolean;
+      createdAt?: string;
+    }
+  ) => {
+    if (
+      next === page &&
+      nextTool === tool &&
+       iocValue === ioc &&
+       nextIocType === iocType &&
+       nextBatchId === batchId &&
+      !extra?.batchResultItem &&
+      !extra?.historyId &&
+      !extra?.autoRescan
+    ) return;
     const url = new URL(window.location.href);
     const params = url.searchParams;
     if (next === "home") {
       params.delete("page");
       params.delete("tool");
       params.delete("ioc");
+      params.delete("ioc_type");
       params.delete("batch");
     } else {
       params.set("page", "lookup");
@@ -103,28 +182,63 @@ export default function App() {
       } else {
         params.delete("tool");
       }
-      if (iocValue) {
-        params.set("ioc", iocValue);
-      } else {
-        params.delete("ioc");
-      }
-      if (nextBatchId) params.set("batch", nextBatchId); else params.delete("batch");
+       if (iocValue) {
+         params.set("ioc", iocValue);
+       } else {
+         params.delete("ioc");
+       }
+       if (nextIocType) {
+         params.set("ioc_type", nextIocType);
+       } else {
+         params.delete("ioc_type");
+       }
+       if (nextBatchId) params.set("batch", nextBatchId); else params.delete("batch");
     }
     window.history.pushState({}, "", url.toString());
-    setRoute({ page: next, tool: nextTool, ioc: iocValue, batchId: nextBatchId });
-  }, [batchId, ioc, page, tool]);
+    setRoute({
+      page: next,
+       tool: nextTool,
+       ioc: iocValue,
+       iocType: nextIocType,
+       batchId: nextBatchId,
+      historyId: extra?.historyId,
+      isHistorical: extra?.isHistorical,
+      batchResultItem: extra?.batchResultItem,
+      batchResult: extra?.batchResult,
+      fromBatch: extra?.fromBatch,
+      autoRescan: extra?.autoRescan,
+      createdAt: extra?.createdAt,
+    });
+  }, [batchId, ioc, iocType, page, tool]);
 
   useEffect(() => {
-    function onIocSync(e: Event) {
-      const value = (e as CustomEvent<{ value: string }>).detail?.value;
+     function onIocSync(e: Event) {
+       const detail = (e as CustomEvent<{ value: string; iocType?: string }>).detail;
+       const value = detail?.value;
+       const nextIocType = detail?.iocType ?? "";
       if (!value || page !== "lookup" || tool !== null) return;
-      setRoute((prev) => (prev.ioc === value ? prev : { ...prev, ioc: value }));
+      setRoute((prev) => (
+        prev.ioc === value && prev.iocType === nextIocType
+          ? prev
+          : {
+              ...prev,
+              ioc: value,
+              iocType: nextIocType,
+              historyId: undefined,
+              isHistorical: undefined,
+              batchResultItem: undefined,
+              fromBatch: undefined,
+              autoRescan: undefined,
+              createdAt: undefined,
+            }
+      ));
       const url = new URL(window.location.href);
       const params = url.searchParams;
       params.set("page", "lookup");
-      params.delete("tool");
-      params.set("ioc", value);
-      window.history.replaceState({}, "", url.toString());
+       params.delete("tool");
+       params.set("ioc", value);
+       if (nextIocType) params.set("ioc_type", nextIocType); else params.delete("ioc_type");
+       window.history.replaceState({}, "", url.toString());
     }
     window.addEventListener("ioc-sync", onIocSync);
     return () => window.removeEventListener("ioc-sync", onIocSync);
@@ -133,20 +247,33 @@ export default function App() {
   useEffect(() => {
     function handler(e: Event) {
       const d = (e as CustomEvent<NavigateEvent>).detail;
-      navigate(d.page, d.tool ?? null, d.ioc ?? "", d.batchId ?? "");
+       navigate(d.page, d.tool ?? null, d.ioc ?? "", d.iocType ?? "", d.batchId ?? "", {
+        historyId: d.historyId,
+        isHistorical: d.isHistorical,
+        batchResultItem: d.batchResultItem,
+        batchResult: d.batchResult,
+        fromBatch: d.fromBatch,
+        autoRescan: d.autoRescan,
+        createdAt: d.createdAt,
+      });
     }
     window.addEventListener("navigate", handler);
     return () => window.removeEventListener("navigate", handler);
   }, [navigate]);
 
   const activeTool: Tool | "lookup" | null = page === "lookup" ? (tool ?? "lookup") : null;
+  const activeNavId = page === "home" ? "home" : (activeTool ?? "lookup");
 
-  const primaryOnSelect = useCallback((id: string) => navigate(id as Page), [navigate]);
-  const toolOnSelect = useCallback((id: string) => {
-    navigate("lookup", id === "lookup" ? null : (id as Tool), ioc);
-  }, [navigate, ioc]);
-  const primaryKeys = useTabsKeyNav(PRIMARY_TAB_IDS, page, primaryOnSelect);
-  const toolKeys = useTabsKeyNav(TOOL_TAB_IDS, activeTool ?? "lookup", toolOnSelect);
+  const navOnSelect = useCallback((id: string) => {
+    if (id === "home") {
+      navigate("home");
+    } else if (id === "lookup") {
+       navigate("lookup", null, ioc, iocType);
+    } else {
+       navigate("lookup", id as Tool, ioc, iocType);
+    }
+  }, [navigate, ioc, iocType]);
+  const navKeys = useTabsKeyNav(NAV_TAB_IDS, activeNavId, navOnSelect);
 
   return (
     <div className="min-h-screen bg-bg-primary text-text-primary">
@@ -164,63 +291,34 @@ export default function App() {
           IOC Platform
         </a>
 
-        <div className="lg:absolute lg:left-1/2 lg:-translate-x-1/2 max-lg:flex-1 max-lg:flex max-lg:justify-center">
+        <div className="flex-1 flex justify-center">
           <div
-            ref={primaryKeys.listRef}
-            onKeyDown={primaryKeys.handleKeyDown}
-            className="inline-flex gap-1 p-1 bg-bg-card border border-border rounded-lg"
+            ref={navKeys.listRef}
+            onKeyDown={navKeys.handleKeyDown}
+            className="inline-flex flex-wrap gap-1 p-1 bg-bg-card border border-border rounded-lg"
             role="tablist"
-            aria-label="Primary pages"
+            aria-label="Navigation"
           >
-            {PRIMARY_TABS.map((tab) => (
-              <button
-                key={tab.id}
-                id={`tab-${tab.id}`}
-                onClick={() => navigate(tab.id)}
-                role="tab"
-                aria-selected={page === tab.id}
-                aria-controls={`page-${tab.id}`}
-                tabIndex={page === tab.id ? 0 : -1}
-                className={`px-4 py-1.5 text-sm font-medium rounded-md transition-colors ${
-                  page === tab.id
-                    ? "text-accent bg-bg-elevated shadow-[0_0_12px_rgba(250,204,21,0.25)]"
-                    : "text-text-secondary hover:text-text-primary"
-                }`}
-              >
-                {tab.label}
-              </button>
-            ))}
-          </div>
-        </div>
-
-        <div className="w-full lg:w-auto lg:ml-auto flex flex-wrap items-center gap-2">
-          <div
-            ref={toolKeys.listRef}
-            onKeyDown={toolKeys.handleKeyDown}
-            className="flex flex-wrap md:flex-nowrap gap-1 p-1 bg-bg-card border border-border rounded-lg"
-            role="tablist"
-            aria-label="Lookup tools"
-          >
-            {TOOL_TABS.map((tab) => (
-              <button
-                key={tab.id}
-                id={`tab-tool-${tab.id}`}
-                onClick={() => navigate("lookup", tab.id === "lookup" ? null : (tab.id as Tool), ioc)}
-                role="tab"
-                aria-selected={page === "lookup" && activeTool === tab.id}
-                aria-controls={page === "lookup" ? `panel-${tab.id}` : undefined}
-                tabIndex={
-                  page === "lookup" && activeTool === tab.id ? 0 : page === "home" && tab.id === "lookup" ? 0 : -1
-                }
-                className={`px-3 py-1.5 text-sm font-medium rounded-md transition-colors ${
-                  page === "lookup" && activeTool === tab.id
-                    ? "text-accent bg-bg-elevated shadow-[0_0_12px_rgba(250,204,21,0.25)]"
-                    : "text-text-secondary hover:text-text-primary"
-                }`}
-              >
-                {tab.label}
-              </button>
-            ))}
+            {NAV_TABS.map((tab) => {
+              const isActive = activeNavId === tab.id;
+              return (
+                <button
+                  key={tab.id}
+                  id={`tab-${tab.id}`}
+                  onClick={() => navOnSelect(tab.id)}
+                  role="tab"
+                  aria-selected={isActive}
+                  tabIndex={isActive ? 0 : -1}
+                  className={`px-3 py-1.5 text-sm font-medium rounded-md transition-colors ${
+                    isActive
+                      ? "text-accent bg-bg-elevated shadow-[0_0_12px_rgba(250,204,21,0.25)]"
+                      : "text-text-secondary hover:text-text-primary"
+                  }`}
+                >
+                  {tab.label}
+                </button>
+              );
+            })}
           </div>
         </div>
       </nav>
@@ -236,11 +334,32 @@ export default function App() {
         {page === "lookup" && (
           <div id="page-lookup" role="tabpanel" aria-labelledby="tab-lookup" tabIndex={-1} className="outline-none">
             <ErrorBoundary>
-              <HomePage initialValue={ioc} tool={tool} initialBatchId={batchId} />
+              <HomePage
+                 initialValue={ioc}
+                 initialType={iocType}
+                 tool={tool}
+                initialBatchId={batchId}
+                batchResult={batchResult}
+                historyId={historyId}
+                isHistorical={isHistorical}
+                batchResultItem={batchResultItem}
+                fromBatch={fromBatch}
+                autoRescan={autoRescan}
+                createdAt={createdAt}
+              />
             </ErrorBoundary>
           </div>
         )}
       </main>
+
+      {authRequired && (
+        <AuthPrompt
+          onSubmit={(value) => {
+            setRuntimeApiKey(value);
+            window.location.reload();
+          }}
+        />
+      )}
 
       <ToastContainer />
     </div>

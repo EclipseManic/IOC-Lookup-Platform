@@ -1,7 +1,9 @@
 import sys
 sys.path.insert(0, ".")
 
-from app.backend.batch import BatchTask, consolidate_batch_results, normalize_batch_iocs, parse_csv, parse_json, get_batch_queue
+import pytest
+
+from app.backend.batch import BatchTask, consolidate_batch_results, normalize_batch_iocs, normalize_batch_iocs_typed, parse_csv, parse_json, get_batch_queue
 from app.backend.adapters.base import CompositeScore
 from app.backend.pipeline import AnalysisTask
 
@@ -106,6 +108,32 @@ def test_normalize_batch_iocs_deduplicates_values():
     assert normalize_batch_iocs(["example.com", "example.com"]) == ["example.com"]
 
 
+def test_normalize_batch_rejects_ambiguous_credential_shapes():
+    with pytest.raises(ValueError, match="explicit type prefix"):
+        normalize_batch_iocs_typed(["user@example.com"])
+    assert normalize_batch_iocs_typed(["email:user@example.com"])[0][1] == "email"
+
+
+def test_normalize_batch_requires_explicit_host_artifact_types():
+    with pytest.raises(ValueError, match="explicit type prefix"):
+        normalize_batch_iocs_typed(["service_name_probe"])
+    assert normalize_batch_iocs_typed(["service_name:service_name_probe"])[0][1] == "service_name"
+
+
+def test_normalize_batch_requires_prehashed_passwords():
+    with pytest.raises(ValueError, match="pre-hashed"):
+        normalize_batch_iocs_typed(["password:plaintext"])
+    assert normalize_batch_iocs_typed(["password:" + "a" * 40])[0][1] == "password"
+    assert normalize_batch_iocs_typed(["password_sha1:" + "b" * 40])[0][1] == "password"
+
+
+def test_normalize_batch_rejects_invalid_password_sha1():
+    import pytest
+
+    with pytest.raises(ValueError, match="40-character SHA-1"):
+        normalize_batch_iocs_typed(["password_sha1:not-a-digest"])
+
+
 def _task(ioc_value, verdict, status="done"):
     t = AnalysisTask(task_id="t", ioc_value=ioc_value, status=status)
     t.composite = CompositeScore(score=0.0, verdict=verdict, confidence="low")
@@ -149,7 +177,6 @@ def test_batch_queue_emits_events_and_cleans_up():
         return await asyncio.wait_for(q.get(), timeout=2.0)
 
     async def main():
-        import asyncio as aio
         await emit()
         e1 = await collect()
         e2 = await collect()

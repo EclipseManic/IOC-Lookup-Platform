@@ -55,10 +55,10 @@ _EVIDENCE_WEIGHTS = {
     "VirusTotal": 1.00, "ThreatFox": 1.00, "MalwareBazaar": 1.00,
     "URLhaus": 0.95, "OpenPhish": 0.95, "Tria.ge": 0.95,
     "Hybrid Analysis": 0.90, "AlienVault OTX": 0.65, "urlscan.io": 0.65,
-    "AbuseIPDB": 0.55, "StopForumSpam": 0.45, "EmailRep.io": 0.45,
+    "AbuseIPDB": 0.55, "StopForumSpam": 0.45, "AbstractAPI": 0.50, "Hunter.io": 0.50,
     "Hashlookup": 0.45, "cve.org": 0.85, "NVD": 0.85,
     "GreyNoise": 0.0, "IPinfo": 0.0, "Shodan": 0.0, "Censys": 0.0,
-    "Team Cymru": 0.0, "Tor Exit": 0.0,
+    "Team Cymru": 0.0, "Tor Exit": 0.60,
     "Etherscan": 0.0, "Blockchain.info": 0.0,
     "ChainAbuse": 0.95, "FileScan.io": 0.85,
     "Hudson Rock": 0.85, "HIBP Pwned Passwords": 0.95,
@@ -77,9 +77,9 @@ _PROVENANCE_GROUPS = {
 }
 
 INTELLIGENCE_ONLY = {
-    "GreyNoise", "IPinfo", "Shodan", "Censys", "Team Cymru", "Tor Exit", "Etherscan", "Blockchain.info",
+    "GreyNoise", "IPinfo", "Shodan", "Censys", "Team Cymru", "Etherscan", "Blockchain.info",
 }
-SUPPORTING_SOURCES = {"AbuseIPDB", "StopForumSpam", "EmailRep.io", "Hashlookup", "LeakCheck.io"}
+SUPPORTING_SOURCES = {"AbuseIPDB", "StopForumSpam", "AbstractAPI", "Hunter.io", "Hashlookup", "LeakCheck.io", "Tor Exit"}
 # Backwards-compatible export for integrations that only need the qualitative
 # labels. The aggregation engine does not use these values for fusion.
 VERDICT_SCORES = {"malicious": 1.0, "suspicious": 0.6, "clean": 0.0, "benign": 0.0, "unknown": 0.0, "error": 0.0}
@@ -103,6 +103,14 @@ _KNOWN_TEST_HASHES = {
     # EICAR anti-malware test file, intentionally harmless test content.
     "44d88612fea8a8f36de82e1278abb02f": "EICAR",
     "3395856ce81f2b7382dee72602f798b642f14140": "EICAR",
+}
+
+WELL_KNOWN_PUBLIC_RESOLVERS = {
+    "1.1.1.1", "1.0.0.1", "2606:4700:4700::1111", "2606:4700:4700::1001",  # Cloudflare
+    "8.8.8.8", "8.8.4.4", "2001:4860:4860::8888", "2001:4860:4860::8844",  # Google
+    "9.9.9.9", "149.112.112.112", "2620:fe::fe", "2620:fe::9",              # Quad9
+    "208.67.222.222", "208.67.220.220",                                    # OpenDNS
+    "94.140.14.14", "94.140.15.15",                                        # AdGuard
 }
 
 
@@ -250,7 +258,8 @@ def _signal(result: NormalizedResult, status: str, detection_count: int | None, 
         "AlienVault OTX": 0.58,
         "urlscan.io": 0.58,
         "StopForumSpam": 0.38,
-        "EmailRep.io": 0.35,
+        "AbstractAPI": 0.50,
+        "Hunter.io": 0.50,
         "Hashlookup": 0.20,
         "ChainAbuse": 0.95,
         "FileScan.io": 0.85,
@@ -550,9 +559,75 @@ def aggregate_evidence(
             confidence="high" if found or technique_id in known else "low", evidence_strength=1.0 if found or technique_id in known else 0.0,
             coverage=1.0 if found or technique_id in known else 0.0, assessment_status="complete" if found or technique_id in known else "unavailable",
             freshness="fresh" if found else "unavailable", evidence_counts={"metadata": 1 if found or technique_id in known else 0},
-            evidence_summary={"assessment_domain": domain, "technique_id": technique_id}, techniques=[technique],
             provider_breakdown=observations, provider_health=_provider_health(list(chosen.values())),
             reason=reason, analyzed_at=datetime.now(timezone.utc),
+        )
+
+    if domain == "credential_exposure" or (domain == "identity_reputation" and ioc_type in {"email", "username", "password"}):
+        applicable = [o for o in observations if o.status not in {"not_applicable"}]
+        evaluated = [o for o in applicable if o.status in {"success", "not_found"}]
+        health_failures = [o for o in applicable if o.status not in {"success", "not_found"}]
+
+        breach_observations = []
+        for o in observations:
+            if o.status == "success":
+                tags_str = " ".join(o.tags).lower()
+                has_breach_tag = any(t in tags_str for t in ["compromised", "infostealer", "pwned", "breach"])
+                is_flagged = o.verdict in {"malicious", "compromised", "breached"} or bool(o.reports_count and o.reports_count > 0)
+                if has_breach_tag or is_flagged:
+                    breach_observations.append(o)
+
+        context = _context_values(list(chosen.values()), enrichment)
+        coverage = len(evaluated) / len(applicable) if applicable else 0.0
+
+        if breach_observations:
+            classification = "breached"
+            final_verdict = "breached"
+            max_infections = max([o.reports_count or 0 for o in breach_observations] + [1])
+            risk = min(1.0, 0.70 + (math.log10(max(max_infections, 1)) / 10.0))
+            score = round(risk * 100.0, 1)
+            confidence = "high" if len(breach_observations) >= 2 or max_infections >= 3 else "medium"
+            reason = f"Credential compromise detected: indicator appeared in breach databases or infostealer malware logs ({len(breach_observations)} source{'s' if len(breach_observations) != 1 else ''} flagged exposure)."
+            status_val = "complete" if coverage >= 1.0 else "partial"
+        elif evaluated:
+            classification = "not_breached"
+            final_verdict = "not_breached"
+            risk = 0.0
+            score = 0.0
+            confidence = "high" if len(evaluated) >= 2 else "medium"
+            reason = "No breach or infostealer exposure observed across evaluated credential intelligence feeds."
+            status_val = "complete" if coverage >= 1.0 else "partial"
+        else:
+            classification = "unknown"
+            final_verdict = "unknown"
+            risk = 0.0
+            score = 0.0
+            confidence = "low"
+            reason = "Credential intelligence is unavailable; no providers returned usable data."
+            status_val = "partial" if health_failures else "unavailable"
+
+        freshness_values = [evidence_freshness(r) for r in chosen.values() if _health_status(r)[0] in {"success", "not_found"}]
+        freshness = "historical" if freshness_values and all(item == "historical" for item in freshness_values) else "cached" if freshness_values and all(item == "cached" for item in freshness_values) else "fresh" if freshness_values else "unavailable"
+
+        return IOCAssessment(
+            ioc=ioc, normalized_ioc=ioc, ioc_type=ioc_type, assessment_domain=domain,
+            classification=classification, final_verdict=final_verdict, risk_score=round(risk, 4), normalized_score=score,
+            confidence_score=round(min(1.0, coverage + (0.2 if breach_observations else 0.0)), 4),
+            confidence=confidence, evidence_strength=1.0 if breach_observations or evaluated else 0.0, coverage=round(coverage, 4),
+            assessment_status=status_val,
+            freshness=freshness,
+            evidence_counts={"breach_findings": len(breach_observations), "providers": len(applicable), "contextual": len(context)},
+            evidence_summary={
+                "assessment_domain": domain,
+                "breached": bool(breach_observations),
+                "expected_providers": len(applicable),
+                "evaluated_providers": len(evaluated),
+                "coverage": round(coverage, 4),
+            },
+            provider_breakdown=observations, provider_health=_provider_health(list(chosen.values())), context=context,
+            reason=reason, analyzed_at=datetime.now(timezone.utc),
+            needs_review=bool(breach_observations),
+            review_reasons=["Credential was detected in public breach data or infostealer logs; credential reset recommended."] if breach_observations else [],
         )
 
     if domain in {"infrastructure", "identity_reputation", "artifact_metadata"}:
@@ -623,6 +698,19 @@ def aggregate_evidence(
             provenance=[{"source": o.source, "provenance_family": o.provenance_family, "source_record_id": o.source_record_id, "evidence_hash": o.evidence_hash} for o in artifact_observations],
             analyzed_at=datetime.now(timezone.utc),
         )
+
+    if ioc in WELL_KNOWN_PUBLIC_RESOLVERS and ioc_type in {"ipv4", "ipv6"}:
+        primary_threats = [o for o in observations if o.source in {"VirusTotal", "AbuseIPDB", "ThreatFox", "MalwareBazaar"} and o.contribution == "positive"]
+        if not primary_threats:
+            # Dampen infostealer client DNS noise for well-known public resolvers
+            for i, o in enumerate(observations):
+                if o.source in {"Hudson Rock", "LeakCheck.io"} and o.contribution == "positive":
+                    observations[i] = o.model_copy(update={
+                        "contribution": "neutral",
+                        "normalized_signal": 0.0,
+                        "role": "context",
+                        "reason": f"Well-known public DNS resolver ({ioc}); infostealer client log telemetry is dampened as expected ambient DNS traffic.",
+                    })
 
     threat_obs = [o for o in observations if o.role in {"threat", "supporting"}]
     positive = [o for o in threat_obs if o.contribution == "positive"]

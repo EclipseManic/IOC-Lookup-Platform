@@ -1,6 +1,5 @@
 import io
 import json
-import logging
 import time
 
 from app.backend.logger import configure_logging, get_logger, _correlation_id
@@ -45,3 +44,11 @@ def test_authorization_header_masked():
     out = _drain(cap)
     assert "abc123xyz" not in out
     assert "Authorization: ****" in out
+
+
+def test_json_style_secret_is_masked():
+    cap = _capture_logger_output()
+    get_logger("http").warning('provider payload={"api_key":"json-secret"}')
+    out = _drain(cap)
+    assert "json-secret" not in out
+    assert "api_key" in out

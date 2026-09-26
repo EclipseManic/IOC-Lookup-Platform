@@ -47,9 +47,13 @@ def _stix_id(prefix: str) -> str:
 
 
 def _verdict_to_labels(verdict: str) -> list[str]:
-    m = {"malicious": ["malicious-activity"], "suspicious": ["suspicious-activity"],
-         "clean": ["benign"], "unknown": ["unknown"]}
-    return m.get(verdict, ["unknown"])
+    if verdict in {"malicious", "breached", "compromised", "critical", "high"}:
+        return ["malicious-activity"]
+    if verdict in {"suspicious", "medium", "low"}:
+        return ["suspicious-activity"]
+    if verdict in {"clean", "benign", "not_breached", "harmless", "whitelisted"}:
+        return ["benign"]
+    return ["unknown"]
 
 
 def _escape_stix(value: str) -> str:
@@ -105,8 +109,9 @@ def build_stix_bundle(response: dict) -> dict:
     ioc_value = response.get("normalized", response.get("input", ""))
     ioc_type = response.get("ioc_type", "unknown")
     composite = response.get("composite", {})
-    score = composite.get("score", 0)
-    verdict = composite.get("verdict", "unknown")
+    assessment = response.get("final_assessment") or {}
+    score = assessment.get("normalized_score", composite.get("score", 0))
+    verdict = assessment.get("final_verdict", composite.get("verdict", "unknown"))
     results = response.get("results", [])
     enrichment = response.get("enrichment", {})
 
@@ -124,6 +129,13 @@ def build_stix_bundle(response: dict) -> dict:
         "valid_from": _ts(),
         "score": int(score),
     })
+    if assessment:
+        objects[-1]["x_ioc_platform_assessment"] = {
+            "domain": assessment.get("assessment_domain"),
+            "verdict": assessment.get("final_verdict"),
+            "score": assessment.get("normalized_score"),
+            "confidence": assessment.get("confidence"),
+        }
 
     main_obs_id = _stix_id("observed-data")
     window_first, window_last = _observed_window(results)

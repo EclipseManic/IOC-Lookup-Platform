@@ -40,6 +40,16 @@ def route_assessment_domain(ioc_type: str, normalized_ioc: str = "") -> DomainRo
             "credential_exposure", "breached_credential", "Password credentials are checked for public breach exposure.",
             "Verify if the credential appears in public breach dumps (HIBP) and enforce password reset if compromised.",
         )
+    if ioc_type in {"email", "username"}:
+        return DomainRoute(
+            "identity_reputation", "identity_exposure", "Identity and account identifiers are evaluated for credential breaches and infostealer exposure.",
+            "Check for compromised credentials in breach dumps and infostealer malware logs (Hudson Rock, HIBP). Enforce password resets or MFA if breached.",
+        )
+    if ioc_type == "mac":
+        return DomainRoute(
+            "identity_reputation", "hardware_context", "Hardware MAC identifiers require local network and vendor contextual intelligence.",
+            "Correlate vendor OUI, local network ownership, and device telemetry.",
+        )
     if ioc_type == "cve":
         return DomainRoute(
             "vulnerability", "vulnerability_record", "CVE identifiers describe published vulnerabilities.",
@@ -54,11 +64,6 @@ def route_assessment_domain(ioc_type: str, normalized_ioc: str = "") -> DomainRo
         return DomainRoute(
             "infrastructure", "infrastructure_context", "Network indicators need reputation plus ownership and infrastructure context.",
             "Enrich ownership, routing, hosting, DNS, and applicable threat feeds.",
-        )
-    if ioc_type in {"mac", "email"}:
-        return DomainRoute(
-            "identity_reputation", "identity_or_network_context", "Identity and hardware identifiers require contextual intelligence.",
-            "Correlate ownership, identity, abuse, and organizational context.",
         )
     if ioc_type in {
         "filename", "windows_path", "linux_path", "mutex", "named_pipe",

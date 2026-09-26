@@ -1,6 +1,7 @@
 import asyncio
 import base64
 import ipaddress
+import json
 import os
 import re
 import socket
@@ -11,11 +12,9 @@ from datetime import datetime
 import httpx
 import mmh3
 
-from app.backend.http_client import get_client as _get_http_client
+from app.backend.http_client import get_client as _get_http_client, resolve_public_url
 from app.backend.config import settings
 from app.backend.logger import get_logger
-
-logger = get_logger("enrichment")
 from app.backend.adapters.base import (
     BreachInfo,
     CVEInfo,
@@ -24,12 +23,15 @@ from app.backend.adapters.base import (
     EnrichmentData,
     FaviconInfo,
     GeoIPInfo,
+    HostIntelligence,
     NormalizedResult,
     ReverseDNSInfo,
     SSLInfo,
     SubdomainInfo,
     WhoisInfo,
 )
+
+logger = get_logger("enrichment")
 
 
 async def enrich(value: str, ioc_type: str) -> EnrichmentData:
@@ -58,6 +60,12 @@ async def enrich(value: str, ioc_type: str) -> EnrichmentData:
 
 
 async def _probe_port(loop, semaphore, ip: str, p: int) -> int | None:
+    try:
+        if not ipaddress.ip_address(ip).is_global:
+            return None
+    except ValueError:
+        return None
+
     def _check(p: int) -> bool:
         import socket as _socket
         from contextlib import closing
@@ -80,6 +88,11 @@ async def _probe_port(loop, semaphore, ip: str, p: int) -> int | None:
 
 
 async def _quick_port_scan(ip: str) -> list[int]:
+    try:
+        if not ipaddress.ip_address(ip).is_global:
+            return []
+    except ValueError:
+        return []
     COMMON_PORTS = [21, 22, 25, 80, 110, 143, 443, 993, 995, 3306, 3389, 5432, 8080, 8443]
     loop = asyncio.get_running_loop()
     semaphore = asyncio.Semaphore(4)
@@ -117,6 +130,101 @@ def _completeness_label(val, none_status: str = "unavailable") -> str:
     return "ok"
 
 
+_PORT_SERVICES: dict[int, str] = {
+    21: "FTP", 22: "SSH", 23: "Telnet", 25: "SMTP", 53: "DNS",
+    80: "HTTP", 110: "POP3", 111: "RPCBind", 123: "NTP", 135: "MSRPC",
+    139: "NetBIOS", 143: "IMAP", 443: "HTTPS", 445: "SMB", 465: "SMTPS",
+    587: "Submission", 993: "IMAPS", 995: "POP3S", 1433: "MSSQL",
+    1521: "Oracle", 2049: "NFS", 2082: "cPanel", 2083: "cPanel-SSL",
+    2086: "WHM", 2087: "WHM-SSL", 3306: "MySQL", 3389: "RDP",
+    5432: "PostgreSQL", 5900: "VNC", 6379: "Redis", 8080: "HTTP-Alt",
+    8443: "HTTPS-Alt", 8880: "HTTP-Alt", 9200: "Elasticsearch",
+    27017: "MongoDB",
+}
+
+
+async def _fetch_internetdb(ip: str) -> HostIntelligence | None:
+    """Fetch free Shodan InternetDB host intelligence (ports, CVEs, CPEs, tags, hostnames). Zero API key needed."""
+    try:
+        c = _get_http_client()
+        r = await c.get(f"https://internetdb.shodan.io/{ip}", timeout=5)
+        if r.status_code == 200:
+            d = r.json()
+            raw_ports = d.get("ports", []) or []
+            ports = [int(p) for p in raw_ports if isinstance(p, (int, str)) and str(p).isdigit()]
+            cpes = list(d.get("cpes", []) or [])
+            vulns = list(d.get("vulns", []) or [])
+            tags = list(d.get("tags", []) or [])
+            hostnames = list(d.get("hostnames", []) or [])
+            port_services = {p: _PORT_SERVICES.get(p, "Unknown") for p in ports}
+            return HostIntelligence(
+                open_ports=ports,
+                port_services=port_services,
+                unpatched_cves=vulns,
+                cpes=cpes,
+                tags=tags,
+                hostnames=hostnames,
+                source="internetdb",
+            )
+    except Exception as exc:
+        logger.debug("InternetDB query failed for %s: %s", ip, exc)
+    return None
+
+
+async def _pivot_domain_to_hosting_ip(a_records: list[str]) -> dict:
+    """Safe pivot from domain's A records to hosting IP context with CDN short-circuiting."""
+    results: dict[str, dict] = {}
+    client = _get_http_client()
+    for ip in a_records[:2]:
+        try:
+            ip_obj = ipaddress.ip_address(ip)
+            if not ip_obj.is_global:
+                results[ip] = {"is_private": True, "name": "Private/Internal IP"}
+                continue
+        except ValueError:
+            continue
+
+        # Check GreyNoise RIOT first (free keyless check for CDNs)
+        riot_status = False
+        riot_name = ""
+        try:
+            gn_resp = await client.get(f"https://api.greynoise.io/v3/community/{ip}", timeout=4)
+            if gn_resp.status_code == 200:
+                gn_data = gn_resp.json()
+                riot_status = gn_data.get("riot", False)
+                riot_name = gn_data.get("name", "")
+        except Exception:
+            pass
+
+        # Check GeoIP & hosting/datacenter classification
+        geo_info = {}
+        try:
+            ip_resp = await client.get(
+                f"https://ipwho.is/{ip}",
+                timeout=4,
+            )
+            if ip_resp.status_code == 200:
+                d = ip_resp.json()
+                if d.get("success", True):
+                    connection = d.get("connection", {}) or {}
+                    geo_info = {
+                        "country": d.get("country", ""),
+                        "isp": connection.get("isp", ""),
+                        "org": connection.get("org", ""),
+                        "asn_name": connection.get("asn", ""),
+                        "is_datacenter": False,
+                    }
+        except Exception:
+            pass
+
+        results[ip] = {
+            "riot": riot_status,
+            "riot_name": riot_name,
+            **geo_info,
+        }
+    return results
+
+
 async def enrich_ip(value: str) -> EnrichmentData:
     completeness: dict[str, str] = {}
 
@@ -134,10 +242,27 @@ async def enrich_ip(value: str) -> EnrichmentData:
     from app.backend.config import settings
     from app.backend.adapters.base import is_valid_api_key
 
-    open_ports_result = None
+    host_intel: HostIntelligence | None = None
+    open_ports_result: list[int] = []
     shodan_key = settings.shodan_api_key
     ip_version = ipaddress.ip_address(value).version
-    if is_valid_api_key(shodan_key) and ip_version == 4:
+
+    # Tier 1: Shodan InternetDB (Keyless, instant, rich)
+    internetdb_res = await _fetch_internetdb(value)
+    if internetdb_res and internetdb_res.open_ports:
+        host_intel = internetdb_res
+        open_ports_result = internetdb_res.open_ports
+        completeness["host_intel"] = "ok"
+        completeness["port_scan"] = "ok"
+    elif internetdb_res:
+        host_intel = internetdb_res
+        completeness["host_intel"] = "ok"
+        completeness["port_scan"] = "not_found"
+    else:
+        completeness["host_intel"] = "unavailable"
+
+    # Tier 2: Shodan full API (if key present and needed)
+    if not open_ports_result and is_valid_api_key(shodan_key) and ip_version == 4:
         from app.backend.adapters.shodan import ShodanAdapter
         try:
             shodan = ShodanAdapter()
@@ -149,15 +274,30 @@ async def enrich_ip(value: str) -> EnrichmentData:
                     port_str = port_tag.replace("ports:", "")
                     open_ports_result = [int(p) for p in port_str.split(",") if p.strip().isdigit()]
                     completeness["port_scan"] = "ok"
+                    port_services = {p: _PORT_SERVICES.get(p, "Unknown") for p in open_ports_result}
+                    host_intel = HostIntelligence(
+                        open_ports=open_ports_result,
+                        port_services=port_services,
+                        source="shodan_api",
+                    )
         except Exception as exc:
             logger.debug("Shodan port scan enrichment failed for %s: %s", value, exc)
-    if open_ports_result is None:
-        if ip_version == 4 and settings.enable_active_port_scan:
-            open_ports_result = await _quick_port_scan(value)
+
+    # Tier 3: Active port scan (fallback)
+    if not open_ports_result and ip_version == 4 and settings.enable_active_port_scan:
+        open_ports_result = await _quick_port_scan(value)
+        if open_ports_result:
             completeness["port_scan"] = "ok"
+            port_services = {p: _PORT_SERVICES.get(p, "Unknown") for p in open_ports_result}
+            host_intel = HostIntelligence(
+                open_ports=open_ports_result,
+                port_services=port_services,
+                source="active_scan",
+            )
         else:
-            open_ports_result = []
-            completeness["port_scan"] = "disabled" if not settings.enable_active_port_scan else "not_available"
+            completeness["port_scan"] = "not_available"
+    elif not open_ports_result:
+        completeness["port_scan"] = "disabled" if not settings.enable_active_port_scan else "not_available"
 
     geoip_val = geoip if not isinstance(geoip, Exception) else None
     rdns_val = rdns if not isinstance(rdns, Exception) else None
@@ -167,6 +307,7 @@ async def enrich_ip(value: str) -> EnrichmentData:
         geoip=geoip_val,
         reverse_dns=rdns_val,
         whois=whois_val,
+        host_intel=host_intel,
         relationships=_rdns_relationships(value, rdns_val) if rdns_val else [],
         completeness=completeness,
         open_ports=open_ports_result if open_ports_result else [],
@@ -191,54 +332,49 @@ async def enrich_domain(value: str) -> EnrichmentData:
     completeness["subdomains"] = _completeness_label(subdomains, none_status="not_found")
     completeness["favicon"] = "not_found" if isinstance(favicon, Exception) or favicon is None else "ok"
 
+    dns_val = dns_records if not isinstance(dns_records, Exception) else None
+    hosting_intel = {}
+    if dns_val and dns_val.a:
+        try:
+            hosting_intel = await _pivot_domain_to_hosting_ip(dns_val.a)
+        except Exception as exc:
+            logger.debug("Domain to hosting IP pivot failed: %s", exc)
+
     return EnrichmentData(
         whois=whois if not isinstance(whois, Exception) else None,
-        dns=dns_records if not isinstance(dns_records, Exception) else None,
+        dns=dns_val,
         ssl=ssl_info if not isinstance(ssl_info, Exception) else None,
         subdomains=subdomains if not isinstance(subdomains, Exception) else None,
         favicon=favicon if not isinstance(favicon, Exception) else None,
+        hosting_ip_intel=hosting_intel,
         completeness=completeness,
     )
 
 
 async def _is_public_fetch_target(url: str) -> bool:
-    """Reject URL fetches that resolve to non-public addresses.
-
-    This is a defence-in-depth control for the explicitly opt-in URL content
-    fetch feature. Normal operation leaves that feature disabled altogether.
-    """
-    from urllib.parse import urlparse
-
-    parsed = urlparse(url)
-    if parsed.scheme not in {"http", "https"} or not parsed.hostname:
-        return False
-    try:
-        addresses = await asyncio.get_running_loop().run_in_executor(
-            None, lambda: socket.getaddrinfo(parsed.hostname, parsed.port or 443)
-        )
-    except socket.gaierror:
-        return False
-
-    try:
-        resolved = {ipaddress.ip_address(item[4][0]) for item in addresses}
-    except ValueError:
-        return False
-    return bool(resolved) and all(address.is_global for address in resolved)
+    return await resolve_public_url(url) is not None
 
 
 async def _url_redirect_chain(url: str) -> list[dict]:
-    import re
     try:
         client = _get_http_client()
         chain = []
         seen = set()
         current = url
         for _ in range(6):
-            if not await _is_public_fetch_target(current):
+            pinned_target = await resolve_public_url(current)
+            if pinned_target is None:
                 logger.warning("Blocked unsafe URL enrichment target: %s", current)
                 break
             seen.add(current)
-            r = await client.get(current, follow_redirects=False, timeout=10)
+            pinned_url, pin_headers, extensions = pinned_target
+            r = await client.get(
+                pinned_url,
+                headers=pin_headers,
+                extensions=extensions,
+                follow_redirects=False,
+                timeout=10,
+            )
             status = r.status_code
             location = r.headers.get("Location", "")
             chain.append({"url": current, "status": status, "location": location})
@@ -266,13 +402,21 @@ async def _url_content_preview(url: str) -> dict:
         current = url
         seen_urls = set()
         for _ in range(6):
-            if not await _is_public_fetch_target(current):
+            pinned_target = await resolve_public_url(current)
+            if pinned_target is None:
                 logger.warning("Blocked unsafe URL enrichment target: %s", current)
                 return {}
             if current in seen_urls:
                 break
             seen_urls.add(current)
-            r = await client.get(current, timeout=10, follow_redirects=False)
+            pinned_url, pin_headers, extensions = pinned_target
+            r = await client.get(
+                pinned_url,
+                headers=pin_headers,
+                extensions=extensions,
+                timeout=10,
+                follow_redirects=False,
+            )
             if r.status_code in (301, 302, 303, 307, 308):
                 loc = r.headers.get("Location", "")
                 if loc:
@@ -388,19 +532,41 @@ async def _dnsbl_check(email: str) -> list[dict]:
     ]
     results = []
     import socket
+    loop = asyncio.get_running_loop()
+
+    def _get_ip():
+        try:
+            return socket.gethostbyname(domain)
+        except socket.gaierror:
+            return None
+
     try:
-        ip = socket.gethostbyname(domain)
-        parts = ip.split(".")
-        rev = ".".join(reversed(parts))
-        for bl in dnsbls:
-            query = f"{rev}.{bl}"
-            try:
-                socket.gethostbyname(query)
-                results.append({"blacklist": bl, "listed": True, "ip": ip})
-            except socket.gaierror:
-                pass
-    except socket.gaierror:
-        pass
+        ip = await asyncio.wait_for(loop.run_in_executor(None, _get_ip), timeout=2.5)
+    except Exception:
+        ip = None
+
+    if not ip:
+        return results
+
+    parts = ip.split(".")
+    rev = ".".join(reversed(parts))
+
+    def _query_bl(bl: str):
+        query = f"{rev}.{bl}"
+        try:
+            socket.gethostbyname(query)
+            return {"blacklist": bl, "listed": True, "ip": ip}
+        except socket.gaierror:
+            return None
+
+    bl_coros = [
+        asyncio.wait_for(loop.run_in_executor(None, _query_bl, bl), timeout=2.0)
+        for bl in dnsbls
+    ]
+    bl_results = await asyncio.gather(*bl_coros, return_exceptions=True)
+    for r in bl_results:
+        if isinstance(r, dict) and r.get("listed"):
+            results.append(r)
     return results
 
 
@@ -477,12 +643,18 @@ async def enrich_email(value: str) -> EnrichmentData:
 
 
 async def _enrich_domain_for_email(domain: str) -> EnrichmentData:
-    whois, dns_records, ssl_info = await asyncio.gather(
-        _rdap_lookup(domain),
-        _dns_lookup(domain),
-        _ssl_cert(domain),
-        return_exceptions=True,
-    )
+    try:
+        whois, dns_records, ssl_info = await asyncio.wait_for(
+            asyncio.gather(
+                _rdap_lookup(domain),
+                _dns_lookup(domain),
+                _ssl_cert(domain),
+                return_exceptions=True,
+            ),
+            timeout=8.0,
+        )
+    except Exception:
+        whois, dns_records, ssl_info = None, None, None
     return EnrichmentData(
         whois=whois if not isinstance(whois, Exception) else None,
         dns=dns_records if not isinstance(dns_records, Exception) else None,
@@ -513,7 +685,6 @@ async def _exploitdb_lookup(cve_id: str) -> list[dict]:
 
 
 async def _poc_github_check(cve_id: str) -> list[dict]:
-    import re
     try:
         c = _get_http_client()
         r = await c.get(f"https://api.github.com/search/repositories?q={cve_id}+poC&sort=stars&order=desc", timeout=10)
@@ -798,24 +969,31 @@ async def _geoip_ipapi(ip: str) -> GeoIPInfo | None:
     try:
         c = _get_http_client()
         r = await c.get(
-            f"http://ip-api.com/json/{ip}?fields=status,country,countryCode,city,as,asname,isp,org,lat,lon",
+            f"https://ipwho.is/{ip}",
             timeout=5,
         )
         if r.status_code != 200:
             return None
         d = r.json()
-        if d.get("status") != "success":
+        if not d.get("success", True):
             return None
+        connection = d.get("connection", {}) or {}
+        security = d.get("security", {}) or {}
         return GeoIPInfo(
             country=d.get("country"),
-            country_code=d.get("countryCode"),
+            country_code=d.get("country_code"),
             city=d.get("city"),
-            asn=d.get("as"),
-            asn_name=d.get("asname"),
-            isp=d.get("isp"),
-            org=d.get("org"),
-            latitude=d.get("lat"),
-            longitude=d.get("lon"),
+            region=d.get("region"),
+            timezone=(d.get("timezone") or {}).get("id"),
+            asn=connection.get("asn"),
+            asn_name=connection.get("org"),
+            isp=connection.get("isp"),
+            org=connection.get("org"),
+            latitude=d.get("latitude"),
+            longitude=d.get("longitude"),
+            is_proxy=bool(security.get("proxy", False)),
+            is_vpn=bool(security.get("vpn", False)),
+            is_datacenter=bool(security.get("hosting", False)),
         )
     except Exception:
         return None
@@ -902,12 +1080,55 @@ async def _rdap_lookup(target: str) -> WhoisInfo | None:
         registrar = _rdap_registrar(d)
         if not registrar and port43:
             return await _whois_fallback(target, server=port43)
+
+        # Extract nameservers
+        nameservers: list[str] = []
+        for ns in d.get("nameservers", []) or []:
+            if isinstance(ns, dict):
+                ns_name = ns.get("ldhName", "")
+                if ns_name:
+                    nameservers.append(ns_name.lower())
+
+        status_codes = [s for s in d.get("status", []) if isinstance(s, str)]
+        created = _rdap_date(d, "registration") or _rdap_date(d, "registrationDate") or ""
+        updated = _rdap_date(d, "last changed") or _rdap_date(d, "last update") or ""
+        expires = _rdap_date(d, "expiration") or _rdap_date(d, "expirationDate") or ""
+        org_name = d.get("name", d.get("handle", ""))
+
+        # Privacy protection detection
+        privacy_protected = False
+        text_corpus = f"{registrar} {org_name} {json.dumps(d.get('entities', []))}".lower()
+        if any(term in text_corpus for term in ("privacy", "proxy", "redacted", "gdpr", "withheld", "whoisguard")):
+            privacy_protected = True
+
+        # Domain age & newly registered calculation
+        domain_age_days = None
+        is_newly_registered = False
+        if created:
+            try:
+                from datetime import timezone
+                dt_str = created.replace("Z", "+00:00")
+                created_dt = datetime.fromisoformat(dt_str)
+                diff = datetime.now(timezone.utc) - created_dt
+                domain_age_days = max(0, diff.days)
+                if domain_age_days < 30:
+                    is_newly_registered = True
+            except Exception:
+                pass
+
         return WhoisInfo(
             registrar=registrar,
-            creation_date=_rdap_date(d, "registrationDate") or "",
-            expiration_date=_rdap_date(d, "expirationDate") or "",
+            creation_date=created,
+            expiration_date=expires,
+            updated_date=updated,
+            nameservers=nameservers,
+            status_codes=status_codes,
+            domain_age_days=domain_age_days,
+            is_newly_registered=is_newly_registered,
             abuse_email=_extract_abuse_email(d),
-            org=d.get("name", d.get("handle", "")),
+            org=org_name,
+            privacy_protected=privacy_protected,
+            fallback_tier_used=1,
         )
     except RDAPNoRecordError:
         raise
@@ -948,6 +1169,33 @@ async def _whois_tld_servers() -> dict[str, str]:
     return _WHOIS_SERVERS
 
 
+async def _resolve_public_tcp_hosts(host: str) -> list[ipaddress.IPv4Address | ipaddress.IPv6Address]:
+    try:
+        infos = await asyncio.get_running_loop().run_in_executor(
+            None,
+            socket.getaddrinfo,
+            host,
+            43,
+            0,
+            socket.AF_UNSPEC,
+            socket.SOCK_STREAM,
+        )
+        addresses = []
+        for info in infos:
+            address = ipaddress.ip_address(info[4][0].split("%", 1)[0])
+            if address not in addresses:
+                addresses.append(address)
+    except (OSError, ValueError):
+        return []
+    if not addresses or any(not address.is_global for address in addresses):
+        return []
+    return addresses
+
+
+async def _is_public_tcp_host(host: str) -> bool:
+    return bool(await _resolve_public_tcp_hosts(host))
+
+
 async def _whois_raw_query(domain: str, server: str | None = None) -> str | None:
     tld = domain.rsplit(".", 1)[-1].lower()
     if not server:
@@ -955,13 +1203,16 @@ async def _whois_raw_query(domain: str, server: str | None = None) -> str | None
         server = servers.get(tld)
     if not server:
         return None
+    addresses = await _resolve_public_tcp_hosts(server)
+    if not addresses:
+        return None
     try:
         reader, writer = await asyncio.wait_for(
-            asyncio.open_connection(server, 43), timeout=5
+            asyncio.open_connection(str(addresses[0]), 43), timeout=5
         )
         writer.write(f"{domain}\r\n".encode())
         await writer.drain()
-        data = await asyncio.wait_for(reader.read(-1), timeout=10)
+        data = await asyncio.wait_for(reader.read(1024 * 1024), timeout=10)
         writer.close()
         await writer.wait_closed()
         return data.decode("utf-8", errors="replace")
@@ -971,6 +1222,8 @@ async def _whois_raw_query(domain: str, server: str | None = None) -> str | None
 
 async def _parse_whois_text(text: str) -> WhoisInfo | None:
     result = WhoisInfo()
+    nameservers: list[str] = []
+    status_codes: list[str] = []
     for line in text.splitlines():
         low = line.lower().strip()
         if "registrar:" in low and ":" in line:
@@ -979,23 +1232,66 @@ async def _parse_whois_text(text: str) -> WhoisInfo | None:
             val = line.split(":", 1)[1].strip()[:30]
             if not result.creation_date:
                 result.creation_date = val
+        if "updated date:" in low or "last updated:" in low or "changed:" in low:
+            val = line.split(":", 1)[1].strip()[:30]
+            if not result.updated_date:
+                result.updated_date = val
         if "registry expiry date:" in low or "expiration date:" in low or "expire:" in low or "registry expiration date:" in low:
             val = line.split(":", 1)[1].strip()[:30]
             if not result.expiration_date:
                 result.expiration_date = val
+        if "name server:" in low or "nserver:" in low:
+            ns = line.split(":", 1)[1].strip().split()[0].lower()
+            if ns and ns not in nameservers:
+                nameservers.append(ns)
+        if "domain status:" in low or "status:" in low:
+            st = line.split(":", 1)[1].strip().split()[0]
+            if st and st not in status_codes:
+                status_codes.append(st)
         if "abuse" in low and "email" in low and "@" in line:
             result.abuse_email = line.split(":", 1)[1].strip()
         if "org name:" in low or "organisation:" in low or "org:" in low or "registrant organization:" in low:
             result.org = result.org or line.split(":", 1)[1].strip()[:100]
-    if any([result.registrar, result.creation_date, result.org]):
+        if "registrant country:" in low or "country:" in low:
+            if not result.registrant_country:
+                result.registrant_country = line.split(":", 1)[1].strip()[:30]
+
+    result.nameservers = nameservers
+    result.status_codes = status_codes
+    low_text = text.lower()
+    if any(term in low_text for term in ("privacy", "proxy", "redacted", "gdpr", "withheld", "whoisguard")):
+        result.privacy_protected = True
+
+    if result.creation_date:
+        try:
+            for fmt in ("%Y-%m-%d", "%Y-%m-%dT%H:%M:%SZ", "%d-%b-%Y"):
+                try:
+                    from datetime import timezone
+                    c_dt = datetime.strptime(result.creation_date[:10], fmt[:8]).replace(tzinfo=timezone.utc)
+                    diff = datetime.now(timezone.utc) - c_dt
+                    result.domain_age_days = max(0, diff.days)
+                    if result.domain_age_days < 30:
+                        result.is_newly_registered = True
+                    break
+                except Exception:
+                    continue
+        except Exception:
+            pass
+
+    result.fallback_tier_used = 2
+
+    if any([result.registrar, result.creation_date, result.org, result.nameservers]):
         return result
     return None
 
 
 async def _whois_discover_server(tld: str) -> str | None:
+    addresses = await _resolve_public_tcp_hosts("whois.iana.org")
+    if not addresses:
+        return None
     try:
         reader, writer = await asyncio.wait_for(
-            asyncio.open_connection("whois.iana.org", 43), timeout=5
+            asyncio.open_connection(str(addresses[0]), 43), timeout=5
         )
         writer.write(f"{tld}\r\n".encode())
         await writer.drain()
@@ -1017,10 +1313,13 @@ async def _whois_fallback(target: str, server: str | None = None) -> WhoisInfo |
     import re
     if not re.match(r'^[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}$', target):
         return None
+
+    # Tier 2: Port 43 TCP direct query
     raw = await _whois_raw_query(target, server=server)
     if raw:
         parsed = await _parse_whois_text(raw)
         if parsed:
+            parsed.fallback_tier_used = 2
             return parsed
     if server:
         return None
@@ -1031,19 +1330,48 @@ async def _whois_fallback(target: str, server: str | None = None) -> WhoisInfo |
         if raw:
             parsed = await _parse_whois_text(raw)
             if parsed:
+                parsed.fallback_tier_used = 2
                 return parsed
-    if os.name == "nt":
-        return None
-    try:
-        proc = await asyncio.create_subprocess_exec(
-            "whois", target,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-        )
-        stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=10)
-        return await _parse_whois_text(stdout.decode("utf-8", errors="replace"))
-    except Exception:
-        return None
+
+    # Tier 2b: Local whois CLI (if installed on Unix/Linux)
+    if os.name != "nt":
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                "whois", target,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=10)
+            parsed = await _parse_whois_text(stdout.decode("utf-8", errors="replace"))
+            if parsed:
+                parsed.fallback_tier_used = 2
+                return parsed
+        except Exception:
+            pass
+
+    # Tier 3: VirusTotal Domain Attributes WHOIS fallback
+    from app.backend.config import settings
+    from app.backend.adapters.base import is_valid_api_key
+    if is_valid_api_key(settings.virustotal_api_key):
+        try:
+            c = _get_http_client()
+            vt_resp = await c.get(
+                f"https://www.virustotal.com/api/v3/domains/{target}",
+                headers={"x-apikey": settings.virustotal_api_key},
+                timeout=6,
+            )
+            if vt_resp.status_code == 200:
+                vt_attrs = vt_resp.json().get("data", {}).get("attributes", {})
+                vt_whois = vt_attrs.get("whois", "")
+                if vt_whois:
+                    parsed = await _parse_whois_text(vt_whois)
+                    if parsed:
+                        parsed.fallback_tier_used = 3
+                        return parsed
+        except Exception as exc:
+            logger.debug("VirusTotal WHOIS fallback failed: %s", exc)
+
+    return None
 
 
 async def _dns_lookup(domain: str) -> DNSInfo | None:
@@ -1113,15 +1441,32 @@ def _san_is_wildcard(san: str) -> bool:
     return value.startswith("*.")
 
 
+def _resolve_public_addresses(hostname: str, port: int) -> list[ipaddress.IPv4Address | ipaddress.IPv6Address]:
+    try:
+        infos = socket.getaddrinfo(hostname, port, type=socket.SOCK_STREAM)
+        addresses: list[ipaddress.IPv4Address | ipaddress.IPv6Address] = []
+        for info in infos:
+            address = ipaddress.ip_address(info[4][0])
+            if not address.is_global:
+                return []
+            addresses.append(address)
+        return addresses
+    except (OSError, ValueError):
+        return []
+
+
 async def _ssl_cert(hostname: str) -> SSLInfo | None:
     try:
         loop = asyncio.get_event_loop()
 
         def _fetch():
+            addresses = _resolve_public_addresses(hostname, 443)
+            if not addresses:
+                return None
             ctx = ssl.create_default_context()
             ctx.check_hostname = True
             ctx.verify_mode = ssl.CERT_REQUIRED
-            with socket.create_connection((hostname, 443), timeout=5) as sock:
+            with socket.create_connection((str(addresses[0]), 443), timeout=5) as sock:
                 with ctx.wrap_socket(sock, server_hostname=hostname) as ssock:
                     cert = ssock.getpeercert()
                     if not cert:
@@ -1215,30 +1560,53 @@ def _is_ip(v: str) -> bool:
 
 
 async def _crt_sh_subdomains(domain: str) -> SubdomainInfo | None:
+    subs: list[str] = []
+    seen: set[str] = set()
+    dot_domain = "." + domain.lower()
+    c = _get_http_client()
+
+    # Tier 1: crt.sh Certificate Transparency
     try:
-        c = _get_http_client()
-        for attempt in range(3):
-            r = await c.get(f"https://crt.sh/?q=%25.{domain}&output=json", headers={"User-Agent": "IOC-Platform/1.0", "Accept": "application/json"}, timeout=15)
-            if r.status_code == 502 and attempt < 2:
-                await asyncio.sleep(2 ** attempt)
+        for attempt in range(2):
+            r = await c.get(
+                f"https://crt.sh/?q=%25.{domain}&output=json",
+                headers={"User-Agent": "IOC-Platform/1.0", "Accept": "application/json"},
+                timeout=10,
+            )
+            if r.status_code == 502 and attempt < 1:
+                await asyncio.sleep(1)
                 continue
+            if r.status_code == 200:
+                entries = r.json()
+                if isinstance(entries, list):
+                    for entry in entries:
+                        if isinstance(entry, dict):
+                            name = entry.get("name_value", "")
+                            for n in name.split("\n"):
+                                n = n.strip().lower()
+                                if n.endswith(dot_domain) and n not in seen:
+                                    seen.add(n)
+                                    subs.append(n)
             break
-        if r.status_code != 200:
-            return None
-        entries = r.json()
-        seen: set[str] = set()
-        subs: list[str] = []
-        dot_domain = "." + domain.lower()
-        for entry in entries:
-            name = entry.get("name_value", "")
-            for n in name.split("\n"):
-                n = n.strip().lower()
-                if n.endswith(dot_domain) and n not in seen:
-                    seen.add(n)
-                    subs.append(n)
-        return SubdomainInfo(subdomains=subs[:100])
-    except Exception:
-        return None
+    except Exception as exc:
+        logger.debug("crt.sh lookup failed for %s: %s", domain, exc)
+
+    # Tier 2: HackerTarget hostsearch fallback if crt.sh yielded nothing
+    if not subs:
+        try:
+            r = await c.get(f"https://api.hackertarget.com/hostsearch/?q={domain}", timeout=6)
+            if r.status_code == 200 and r.text and "error" not in r.text.lower():
+                for line in r.text.splitlines():
+                    parts = line.split(",")
+                    if parts:
+                        sub = parts[0].strip().lower()
+                        if sub.endswith(dot_domain) and sub not in seen:
+                            seen.add(sub)
+                            subs.append(sub)
+        except Exception as exc:
+            logger.debug("HackerTarget hostsearch fallback failed for %s: %s", domain, exc)
+
+    return SubdomainInfo(subdomains=subs[:100]) if subs else None
 
 
 # ─── 2. CISA Known Exploited Vulnerabilities ───────
@@ -1253,9 +1621,15 @@ _cisa_refresh_task: asyncio.Task | None = None
 
 async def _fetch_cisa_feed() -> dict | None:
     c = _get_http_client()
-    r = await c.get("https://www.cisa.gov/sites/default/files/feeds/known_exploited_vulnerabilities.json")
-    if r.status_code == 200:
-        return r.json()
+    try:
+        r = await c.get(
+            "https://www.cisa.gov/sites/default/files/feeds/known_exploited_vulnerabilities.json",
+            timeout=15.0,
+        )
+        if r.status_code == 200:
+            return r.json()
+    except Exception as exc:
+        logger.warning("CISA feed fetch failed: %s", exc)
     return None
 
 
@@ -1276,8 +1650,13 @@ async def start_cisa_background_refresh() -> None:
     if _cisa_refresh_task is None or _cisa_refresh_task.done():
         async def _loop():
             while True:
-                async with _cisa_lock:
-                    await _refresh_cisa_cache(force=True)
+                try:
+                    async with _cisa_lock:
+                        await _refresh_cisa_cache(force=True)
+                except asyncio.CancelledError:
+                    break
+                except Exception as exc:
+                    logger.warning("CISA background refresh error: %s", exc)
                 await asyncio.sleep(_CISA_TTL)
         _cisa_refresh_task = asyncio.create_task(_loop())
 
@@ -1398,11 +1777,12 @@ _xon_semaphore = asyncio.Semaphore(5)
 
 async def _xposedornot_lookup(email: str) -> BreachInfo | None:
     async with _xon_semaphore:
-        for attempt in range(3):
+        for attempt in range(2):
             try:
                 c = _get_http_client()
                 r = await c.get(
                     f"https://api.xposedornot.com/v1/check-email/{email}?details=true",
+                    timeout=5.0,
                 )
                 if r.status_code == 404:
                     return BreachInfo(breach_count=0, breach_names=[])

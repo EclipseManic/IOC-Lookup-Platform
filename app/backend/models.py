@@ -43,8 +43,8 @@ class InvestigationIOC(Base):
     )
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
-    investigation_id: Mapped[int] = mapped_column(ForeignKey("investigations.id", ondelete="CASCADE"), nullable=False, index=True)
-    ioc_id: Mapped[int] = mapped_column(ForeignKey("iocs.id", ondelete="CASCADE"), nullable=False, index=True)
+    investigation_id: Mapped[int] = mapped_column(ForeignKey("investigations.id"), nullable=False, index=True)
+    ioc_id: Mapped[int] = mapped_column(ForeignKey("iocs.id"), nullable=False, index=True)
     notes: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())
 
@@ -77,14 +77,16 @@ class IOCFeedback(Base):
 class LookupResult(Base):
     __tablename__ = "lookup_results"
     __table_args__ = (
+        UniqueConstraint("task_id", name="uq_lookup_results_task_id"),
         Index("ix_lookup_results_ioc_task", "ioc_id", "task_id"),
         Index("ix_lookup_results_created_at", "created_at"),
         Index("ix_lookup_results_ioc_created", "ioc_id", "created_at"),
     )
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
-    ioc_id: Mapped[int] = mapped_column(ForeignKey("iocs.id", ondelete="CASCADE"), nullable=False, index=True)
+    ioc_id: Mapped[int] = mapped_column(ForeignKey("iocs.id"), nullable=False, index=True)
     task_id: Mapped[str] = mapped_column(String(32), nullable=False, index=True)
+    batch_id: Mapped[Optional[str]] = mapped_column(String(32), nullable=True, index=True)
     composite_score: Mapped[float] = mapped_column(Float, default=0.0)
     composite_verdict: Mapped[str] = mapped_column(String(20), default="unknown")
     composite_confidence: Mapped[str] = mapped_column(String(10), default="low")
@@ -93,3 +95,17 @@ class LookupResult(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())
 
     ioc: Mapped["IOC"] = relationship("IOC", back_populates="lookup_results")
+
+
+class BatchRecord(Base):
+    __tablename__ = "batches"
+    __table_args__ = (Index("ix_batches_status_created", "status", "created_at"),)
+
+    id: Mapped[str] = mapped_column(String(32), primary_key=True)
+    status: Mapped[str] = mapped_column(String(20), default="pending")
+    total: Mapped[int] = mapped_column(Integer, default=0)
+    completed: Mapped[int] = mapped_column(Integer, default=0)
+    summary_json: Mapped[Optional[str]] = mapped_column(Text, default="{}")
+    result_json: Mapped[Optional[str]] = mapped_column(Text, default="{}")
+    error: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now(), index=True)

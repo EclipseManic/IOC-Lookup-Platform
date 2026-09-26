@@ -1,4 +1,3 @@
-from datetime import datetime
 from pydantic import BaseModel, Field
 
 
@@ -94,6 +93,7 @@ class WebhookResponse(BaseModel):
 
 class FeedbackRequest(BaseModel):
     ioc: str
+    ioc_type: str | None = None
     feedback: str = "false_positive"
     note: str | None = None
 

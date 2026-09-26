@@ -80,11 +80,22 @@ class ShodanAdapter(SourceAdapter):
             )
 
         client = self._get_client()
-        resp = await client.get(
-            f"https://api.shodan.io/shodan/host/{ioc_value}",
-            params={"key": self.api_key},
-            timeout=15,
-        )
+        try:
+            resp = await client.get(
+                f"https://api.shodan.io/shodan/host/{ioc_value}",
+                params={"key": self.api_key},
+                timeout=15,
+            )
+        except httpx.TimeoutException:
+            return NormalizedResult(
+                ioc=ioc_value, ioc_type=ioc_type, source=self.name,
+                verdict="error", execution_state="timeout", tags=["timeout"],
+            )
+        except (httpx.ConnectError, httpx.HTTPError):
+            return NormalizedResult(
+                ioc=ioc_value, ioc_type=ioc_type, source=self.name,
+                verdict="error", execution_state="error", tags=["connection_error"],
+            )
 
         if resp.status_code == 429:
             return NormalizedResult(
@@ -92,6 +103,17 @@ class ShodanAdapter(SourceAdapter):
                 verdict="unknown", tags=["rate_limited"],
             )
         if resp.status_code in (401, 403):
+            err_msg = ""
+            try:
+                err_msg = resp.json().get("error", "")
+            except Exception:
+                pass
+            if "membership" in err_msg.lower():
+                # Free Shodan key cannot query /shodan/host/, and InternetDB was already checked.
+                return NormalizedResult(
+                    ioc=ioc_value, ioc_type=ioc_type, source=self.name,
+                    verdict="unknown", status="not_found", tags=["not_found", "membership_required"],
+                )
             return NormalizedResult(
                 ioc=ioc_value, ioc_type=ioc_type, source=self.name,
                 verdict="error", tags=["unauthorized" if resp.status_code == 401 else "forbidden"],
@@ -99,7 +121,7 @@ class ShodanAdapter(SourceAdapter):
         if resp.status_code == 404:
             return NormalizedResult(
                 ioc=ioc_value, ioc_type=ioc_type, source=self.name,
-                verdict="unknown", raw_score=None,
+                verdict="unknown", status="not_found", tags=["not_found"], raw_score=None,
             )
         if resp.status_code != 200:
             return NormalizedResult(

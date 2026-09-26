@@ -5,7 +5,7 @@ from typing import Optional
 
 import httpx
 import json
-from httpx import Timeout
+
 
 from pydantic import BaseModel, Field, model_validator
 
@@ -75,6 +75,8 @@ def infer_execution_state(status: object, verdict: object, tags: object, provide
         return "timeout"
     if any(tag in tag_values for tag in {"invalid_request", "unsupported_type", "invalid_hash_format", "invalid_hash_length"}):
         return "invalid_request"
+    if str(status or "").lower() == "unavailable":
+        return "unavailable"
     if any(
         tag in tag_values
         for tag in {
@@ -131,6 +133,8 @@ def truncate_raw_data(value: object, limit: int = RAW_DATA_MAX_BYTES) -> dict:
     """
     if not isinstance(value, dict):
         return {}
+    if value.get("_truncated") is True and "_json_fragment" in value:
+        return value
     try:
         encoded = json.dumps(value, ensure_ascii=False, default=str, separators=(",", ":"))
     except (TypeError, ValueError):
@@ -349,7 +353,7 @@ class NormalizedResult(BaseModel):
                 if values is None:
                     data[field_name] = []
                 elif isinstance(values, (list, tuple, set)):
-                    data[field_name] = [value.strip() for value in values if isinstance(value, str) and value.strip()]
+                    data[field_name] = list(dict.fromkeys(value.strip() for value in values if isinstance(value, str) and value.strip()))
                 elif isinstance(values, str) and values.strip():
                     data[field_name] = [values.strip()]
                 else:
@@ -399,6 +403,8 @@ class NormalizedResult(BaseModel):
             self.status = "not_found"
         elif self.execution_state == "not_applicable":
             self.status = "not_applicable"
+        elif self.execution_state == "unavailable":
+            self.status = "unavailable"
         elif self.execution_state in {"aborted_due_to_ioc_deadline", "batch_deadline_exceeded"}:
             self.status = self.execution_state
         elif self.execution_state != "success":
@@ -446,20 +452,36 @@ class GeoIPInfo(BaseModel):
     country: Optional[str] = None
     country_code: Optional[str] = None
     city: Optional[str] = None
+    region: Optional[str] = None
+    timezone: Optional[str] = None
     asn: Optional[str] = None
     asn_name: Optional[str] = None
     isp: Optional[str] = None
     org: Optional[str] = None
     latitude: Optional[float] = None
     longitude: Optional[float] = None
+    is_vpn: bool = False
+    is_tor: bool = False
+    is_proxy: bool = False
+    is_datacenter: bool = False
+    is_anycast: bool = False
 
 
 class WhoisInfo(BaseModel):
     registrar: Optional[str] = None
     creation_date: Optional[str] = None
     expiration_date: Optional[str] = None
+    updated_date: Optional[str] = None
+    nameservers: list[str] = []
+    status_codes: list[str] = []
+    registrant_country: Optional[str] = None
+    dnssec: Optional[str] = None
+    domain_age_days: Optional[int] = None
+    is_newly_registered: bool = False
     abuse_email: Optional[str] = None
     org: Optional[str] = None
+    privacy_protected: bool = False
+    fallback_tier_used: Optional[int] = None
 
 
 class DNSInfo(BaseModel):
@@ -541,9 +563,49 @@ class EmailSecurityInfo(BaseModel):
     dmarc: str = "missing"
 
 
+class HostIntelligence(BaseModel):
+    """Structured host infrastructure data from Shodan InternetDB / Censys."""
+    open_ports: list[int] = []
+    port_services: dict[int, str] = {}  # {443: "HTTPS/nginx", 22: "SSH/OpenSSH"}
+    unpatched_cves: list[str] = []  # CVE IDs detected by Shodan
+    cpes: list[str] = []  # Software inventory (CPE strings)
+    tags: list[str] = []  # Infrastructure tags: "vpn", "tor", "cloud"
+    hostnames: list[str] = []  # PTR + forward hostnames
+    source: str = ""  # "internetdb" | "shodan_api" | "censys" | "active_scan"
+
+
+class WebPreviewInfo(BaseModel):
+    """Structured web page preview data from urlscan.io."""
+    screenshot_url: Optional[str] = None  # proxied URL via /api/screenshot
+    page_title: Optional[str] = None
+    server: Optional[str] = None
+    language: Optional[str] = None
+    domain_age_days: Optional[int] = None
+    tls_issuer: Optional[str] = None
+    tls_valid_days: Optional[int] = None
+    asn_name: Optional[str] = None
+    detected_brands: list[str] = []
+    detected_technologies: list[str] = []
+    mime_type: Optional[str] = None
+    scan_uuid: Optional[str] = None
+
+
+class InfostealerIntel(BaseModel):
+    """Structured infostealer attack surface data from Hudson Rock Cavalier."""
+    total_employee_compromises: int = 0
+    total_client_compromises: int = 0
+    top_corporate_services: list[str] = []  # e.g. ["okta.corp.com", "vpn.corp.com"]
+    top_external_services: list[str] = []
+    stealer_families: dict[str, int] = {}  # e.g. {"Lumma": 45, "RedLine": 12}
+    password_strength_weak_pct: Optional[float] = None
+    password_strength_strong_pct: Optional[float] = None
+    total_compromised_urls: Optional[int] = None
+    date_range: Optional[str] = None  # "2023-01 to 2025-06"
+
+
 class EnrichmentData(BaseModel):
     geoip: Optional[GeoIPInfo] = None
-    open_ports: list[int] = []
+    open_ports: list[int] = []  # kept for backward compat; prefer host_intel
     whois: Optional[WhoisInfo] = None
     dns: Optional[DNSInfo] = None
     ssl: Optional[SSLInfo] = None
@@ -560,6 +622,14 @@ class EnrichmentData(BaseModel):
     relationships: list[dict] = []
     completeness: dict[str, str] = {}
     analysis_notes: list[str] = []
+    # Phase 1 structured intelligence fields
+    host_intel: Optional[HostIntelligence] = None
+    web_preview: Optional[WebPreviewInfo] = None
+    infostealer: Optional[InfostealerIntel] = None
+    abuse_reports: list[dict] = []  # Structured AbuseIPDB verbose reports
+    hosting_ip_intel: dict = {}  # Domain→IP pivot results
+    malware_urls: list[str] = []  # OTX /url_list + URLhaus URLs on host
+    associated_hashes: list[str] = []  # OTX /malware hashes for IP/domain
 
 
 class SourceWeight(BaseModel):
@@ -686,9 +756,13 @@ class CompositeScore(BaseModel):
 
 class LookupResponse(BaseModel):
     input: str
+    task_id: Optional[str] = None
     normalized: str
     ioc_type: str
+    password_prehashed: bool = False
+
     composite: CompositeScore
+
     final_assessment: Optional[IOCAssessment] = None
     provider_health: list[ProviderHealth] = Field(default_factory=list)
     enrichment: EnrichmentData = EnrichmentData()

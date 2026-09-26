@@ -1,6 +1,6 @@
 import asyncio
-import hashlib
 import hmac
+import ipaddress
 import json
 import os
 import re
@@ -8,6 +8,7 @@ import sys
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Optional
+from urllib.parse import urlparse, urlsplit
 from uuid import uuid4
 
 from fastapi import Depends, FastAPI, File, HTTPException, Request, UploadFile, Response
@@ -18,34 +19,41 @@ from fastapi.responses import StreamingResponse, JSONResponse
 from fastapi.responses import FileResponse, HTMLResponse, PlainTextResponse
 from fastapi.staticfiles import StaticFiles
 from starlette.middleware.base import BaseHTTPMiddleware
+from starlette.middleware.trustedhost import TrustedHostMiddleware
 from pydantic import BaseModel, model_validator
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
 from datetime import datetime
-from app.backend.adapters.base import LookupResponse
+from app.backend.adapters.base import CompositeScore, EnrichmentData, LookupResponse
 from app.backend.batch import (
+    _persist_batch,
     consolidate_batch_results,
+    delete_batch_from_db,
+    discard_batch,
+    get_all_batches_from_db,
     get_batch,
-    get_batch_queue,
-    cleanup_batch_queue,
+    get_batch_from_db,
+    _normalize_batch_payload,
+    acquire_batch_queue,
+    release_batch_queue,
     parse_csv,
     parse_json,
-    run_batch_analysis,
+    shutdown_batch_tasks,
     start_batch_analysis,
 )
 from app.backend.cache import CacheLayer
 from app.backend.circuit_breaker import all_breaker_states
-from app.backend.classifier import SUPPORTED_IOC_TYPES, classify_ioc, refang
+from app.backend.classifier import SUPPORTED_IOC_TYPES, classify_ioc, is_password_digest, normalize_ioc, parse_typed_ioc, password_digest, refang
 from app.backend.misp_export import build_misp_event
 from app.backend.siem_export import export_siem
-from app.backend.http_client import close_client as close_http_client
+from app.backend.http_client import close_client as close_http_client, get_client as _get_http_client
 from app.backend.config import settings
 from app.backend.thresholds import DISPLAY_MALICIOUS, DISPLAY_SUSPICIOUS
-from app.backend.database import get_db, init_db, retry_sqlite_commit
+from app.backend.database import cleanup_old_lookups, get_db, init_db, retry_sqlite_commit, upsert_lookup_result
 from app.backend.models import IOC, Investigation, InvestigationIOC, LookupResult, IOCFeedback
-from app.backend.pipeline import ADAPTERS, cancel_analysis, cleanup_old_tasks, get_cache, get_rate_limiter, get_task_queue, get_task_redis, run_analysis, set_cache, set_rate_limiter, cleanup_task_queue
+from app.backend.pipeline import ADAPTERS, AnalysisTask, cancel_analysis, cleanup_old_tasks, get_cache, get_rate_limiter, get_task_queue, get_task_redis, run_analysis, set_cache, set_rate_limiter, cleanup_task_queue
 from app.backend.schemas import (
     BatchStatusResponse,
     CacheClearResponse,
@@ -70,6 +78,36 @@ from app.backend.logger import configure_logging, get_logger, _correlation_id
 
 logger = get_logger("main")
 
+_lookup_tasks: set[asyncio.Task] = set()
+_lookup_semaphore: asyncio.Semaphore | None = None
+_lookup_semaphore_loop: asyncio.AbstractEventLoop | None = None
+_pending_lookups = 0
+
+
+def _get_lookup_semaphore() -> asyncio.Semaphore:
+    global _lookup_semaphore, _lookup_semaphore_loop, _pending_lookups
+    loop = asyncio.get_running_loop()
+    if _lookup_semaphore is None or _lookup_semaphore_loop is not loop:
+        _lookup_semaphore = asyncio.Semaphore(max(1, settings.max_concurrent_lookups))
+        _lookup_semaphore_loop = loop
+        _pending_lookups = 0
+    return _lookup_semaphore
+
+
+async def _run_queued_lookup(*args, **kwargs) -> None:
+    global _pending_lookups
+    try:
+        async with _get_lookup_semaphore():
+            await run_analysis(*args, **kwargs)
+    finally:
+        _pending_lookups = max(0, _pending_lookups - 1)
+
+
+def _lookup_task_done(task: asyncio.Task) -> None:
+    _lookup_tasks.discard(task)
+    if not task.cancelled():
+        task.exception()
+
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -77,11 +115,11 @@ async def lifespan(app: FastAPI):
     _setup_exception_hooks()
     await init_db()
 
-    _cache = CacheLayer()
+    _cache = CacheLayer(redis_url=settings.redis_url or None)
     await _cache._get_redis()
     set_cache(_cache)
 
-    _rate_limiter = RateLimiter()
+    _rate_limiter = RateLimiter(redis_url=settings.redis_url or None)
     set_rate_limiter(_rate_limiter)
 
     cleanup_task = asyncio.create_task(_periodic_cleanup())
@@ -98,6 +136,13 @@ async def lifespan(app: FastAPI):
         except asyncio.CancelledError:
             pass
         await stop_cisa_background_refresh()
+        lookup_tasks = list(_lookup_tasks)
+        for task in lookup_tasks:
+            task.cancel()
+        if lookup_tasks:
+            await asyncio.gather(*lookup_tasks, return_exceptions=True)
+        _lookup_tasks.clear()
+        await shutdown_batch_tasks()
         await shutdown_webhook_tasks()
         await _cache.close()
         await _rate_limiter.close()
@@ -131,9 +176,19 @@ async def _periodic_cleanup():
     while True:
         try:
             await asyncio.sleep(1800)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception("Periodic cleanup sleep failed")
+            continue
+        try:
             await cleanup_old_tasks()
         except Exception:
-            logger.exception("Periodic cleanup failed")
+            logger.exception("Task cleanup failed")
+        try:
+            await cleanup_old_lookups()
+        except Exception:
+            logger.exception("Lookup retention cleanup failed")
 
 
 app = FastAPI(
@@ -145,46 +200,225 @@ app = FastAPI(
     openapi_url="/openapi.json" if not settings.api_keys else None,
 )
 
+
+def _configured_origins() -> tuple[str, ...]:
+    return tuple(
+        origin.rstrip("/")
+        for origin in (item.strip() for item in settings.cors_origins.split(","))
+        if origin and origin != "*"
+    )
+
+
+def _configured_trusted_hosts() -> tuple[str, ...]:
+    hosts = ["localhost", "127.0.0.1", "::1"]
+    for origin in _configured_origins():
+        parsed = urlparse(origin if "://" in origin else f"//{origin}")
+        if parsed.hostname:
+            hosts.append(parsed.hostname)
+    for host in (item.strip() for item in settings.trusted_hosts.split(",")):
+        if host:
+            hosts.append(host)
+    if settings.base_url:
+        parsed = urlparse(settings.base_url)
+        if parsed.hostname:
+            hosts.append(parsed.hostname)
+    return tuple(dict.fromkeys(hosts))
+
+
+CORS_ORIGINS = _configured_origins()
+TRUSTED_HOSTS = _configured_trusted_hosts()
+
+
+def _route_template(request: Request) -> str:
+    route = request.scope.get("route")
+    return getattr(route, "path", None) or "unmatched"
+
+
+def _safe_correlation_id(value: str | None) -> str:
+    if value and re.fullmatch(r"[A-Za-z0-9_-]{1,64}", value):
+        return value
+    return str(uuid4())
+
+
+def _client_class(request: Request) -> str:
+    host = request.client.host if request.client else None
+    if not host:
+        return "unknown"
+    return "loopback" if _is_loopback_client(host) else "remote"
+
+
+class RequestBoundaryMiddleware(BaseHTTPMiddleware):
+    async def dispatch(self, request: Request, call_next):
+        origin = request.headers.get("Origin")
+        if origin and origin.rstrip("/") not in CORS_ORIGINS:
+            request.state.request_guard = "origin_rejected"
+            logger.warning("Rejected request with disallowed origin")
+            return Response(
+                status_code=403,
+                content="Request origin is not allowed",
+                media_type="text/plain",
+            )
+        request.state.request_guard = "allowed"
+        return await call_next(request)
+
+
+class RequestAuditMiddleware(BaseHTTPMiddleware):
+    async def dispatch(self, request: Request, call_next):
+        correlation_id = _safe_correlation_id(request.headers.get("X-Correlation-ID"))
+        request.state.correlation_id = correlation_id
+        token = _correlation_id.set(correlation_id)
+        status_code = 500
+        try:
+            response = await call_next(request)
+            status_code = response.status_code
+            return response
+        finally:
+            logger.info(
+                "HTTP request method=%s route=%s status=%s client=%s auth=%s guard=%s",
+                request.method,
+                _route_template(request),
+                status_code,
+                _client_class(request),
+                getattr(request.state, "auth_result", "unknown"),
+                getattr(request.state, "request_guard", "unknown"),
+            )
+            _correlation_id.reset(token)
+
+
 class SecurityHeadersMiddleware(BaseHTTPMiddleware):
     async def dispatch(self, request: Request, call_next):
         response = await call_next(request)
         response.headers["X-Content-Type-Options"] = "nosniff"
         response.headers["X-Frame-Options"] = "DENY"
         response.headers["Referrer-Policy"] = "strict-origin-when-cross-origin"
-        response.headers["Content-Security-Policy"] = "default-src 'self'; script-src 'self'; object-src 'none'"
-        response.headers["Strict-Transport-Security"] = "max-age=31536000; includeSubDomains"
+        response.headers["Content-Security-Policy"] = (
+            "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline' "
+            "https://fonts.googleapis.com; font-src 'self' https://fonts.gstatic.com; "
+            "img-src 'self' data: https:; connect-src 'self'; object-src 'none'; "
+            "base-uri 'self'; frame-ancestors 'none'"
+        )
+        if request.url.scheme == "https":
+            response.headers["Strict-Transport-Security"] = "max-age=31536000; includeSubDomains"
         response.headers["Permissions-Policy"] = "camera=(), microphone=(), geolocation=()"
+        if request.url.path.startswith("/api/"):
+            response.headers["Cache-Control"] = "no-store"
         return response
 
 
 class CorrelationIDMiddleware(BaseHTTPMiddleware):
     async def dispatch(self, request: Request, call_next):
-        cid = request.headers.get("X-Correlation-ID") or str(uuid4())
+        cid = _safe_correlation_id(
+            request.headers.get("X-Correlation-ID")
+            or getattr(request.state, "correlation_id", None)
+        )
         _correlation_id.set(cid)
         response = await call_next(request)
         response.headers["X-Correlation-ID"] = cid
         return response
 
 
+PUBLIC_API_PATHS = {"/api/health"}
+
+
+def _is_loopback_client(host: str | None) -> bool:
+    if not host:
+        return True
+    try:
+        return ipaddress.ip_address(host.split("%", 1)[0]).is_loopback
+    except ValueError:
+        return host.lower() == "localhost"
+
+
+def _trusted_proxy(request: Request) -> bool:
+    if not settings.trust_proxy or not request.client:
+        return False
+    client_host = request.client.host
+    allowed = {item.strip() for item in settings.trusted_proxy_hosts.split(",") if item.strip()}
+    return client_host in allowed
+
+
+def _request_is_https(request: Request) -> bool:
+    if request.url.scheme == "https":
+        return True
+    if not _trusted_proxy(request):
+        return False
+    forwarded = request.headers.get("X-Forwarded-Proto", "").split(",", 1)[0].strip().lower()
+    return forwarded == "https"
+
+
 class AuthMiddleware(BaseHTTPMiddleware):
     async def dispatch(self, request: Request, call_next):
+        client_host = request.client.host if request.client else None
+        if not settings.allow_network_bind and not _is_loopback_client(client_host):
+            request.state.auth_result = "network_blocked"
+            return Response(
+                status_code=403,
+                content="Network access is disabled for this local instance",
+                media_type="text/plain",
+            )
+        if settings.allow_network_bind and settings.require_network_tls and not _request_is_https(request):
+            request.state.auth_result = "tls_required"
+            return Response(
+                status_code=400,
+                content="HTTPS is required for network access",
+                media_type="text/plain",
+            )
+        path = request.url.path
+        if not path.startswith("/api/") or path in PUBLIC_API_PATHS:
+            request.state.auth_result = "public"
+            return await call_next(request)
+
         api_keys = settings.api_keys
-        if api_keys:
-            valid_keys = [k.strip() for k in api_keys.split(",") if k.strip()]
-            if valid_keys:
-                path = request.url.path
-                if path.startswith("/api/") and not path.startswith("/api/health") and not path.startswith("/api/adapters/health") and not path.startswith("/api/sources"):
-                    provided = request.headers.get("X-API-Key", "")
-                    if not any(hmac.compare_digest(provided, valid_key) for valid_key in valid_keys):
-                        return Response(status_code=401, content="Invalid or missing API key", media_type="text/plain")
+        valid_keys = [key.strip() for key in api_keys.split(",") if key.strip()]
+        if settings.allow_network_bind and (
+            not valid_keys or any(len(key) < 16 for key in valid_keys)
+        ):
+            request.state.auth_result = "misconfigured"
+            logger.error("Authentication is not configured for network binding")
+            return Response(
+                status_code=503,
+                content="Authentication is not configured",
+                media_type="text/plain",
+            )
+        if api_keys and not valid_keys:
+            request.state.auth_result = "misconfigured"
+            logger.error("Authentication is misconfigured: API_KEYS contains no usable keys")
+            return Response(
+                status_code=503,
+                content="Authentication is not configured",
+                media_type="text/plain",
+            )
+
+        if valid_keys:
+            provided = request.headers.get("X-API-Key", "")
+            if not any(hmac.compare_digest(provided, valid_key) for valid_key in valid_keys):
+                request.state.auth_result = "failed"
+                logger.warning(
+                    "Authentication failed route=%s client=%s",
+                    _route_template(request),
+                    _client_class(request),
+                )
+                return Response(
+                    status_code=401,
+                    content="Invalid or missing API key",
+                    headers={"WWW-Authenticate": "ApiKey"},
+                    media_type="text/plain",
+                )
+            request.state.auth_result = "authenticated"
+        else:
+            request.state.auth_result = "not_configured"
         return await call_next(request)
 
 
 class RateLimitMiddleware(BaseHTTPMiddleware):
     RATE_LIMITS: dict[str, tuple[int, int]] = {
-        "/api/lookup": (60, 60),
+        "/api/lookup": (30, 60),
         "/api/batch": (10, 60),
         "/api/enrich": (30, 60),
+    }
+    GLOBAL_LIMITS: dict[str, tuple[int, int]] = {
+        "/api/lookup": (300, 60),
+        "/api/batch": (100, 60),
     }
 
     async def dispatch(self, request: Request, call_next):
@@ -193,12 +427,52 @@ class RateLimitMiddleware(BaseHTTPMiddleware):
                 # Status polling of batches (GET) should not be throttled to 10/min
                 if prefix == "/api/batch" and request.method == "GET":
                     continue
+                if prefix == "/api/tasks" and request.method == "GET":
+                    continue
+
                 client_ip = request.client.host if request.client else "unknown"
+                if _trusted_proxy(request):
+                    xff = request.headers.get("X-Forwarded-For")
+                    if xff:
+                        client_ip = xff.split(",")[0].strip()
+                    else:
+                        x_real_ip = request.headers.get("X-Real-IP")
+                        if x_real_ip:
+                            client_ip = x_real_ip.strip()
+
                 limiter = get_rate_limiter()
                 if limiter is not None:
-                    allowed = await limiter.acquire(f"ip:{client_ip}:{prefix}:{request.method}", limit, window)
-                    if not allowed:
-                        return Response(status_code=429, content="Rate limit exceeded. Try again later.", media_type="text/plain")
+                    try:
+                        # Global rate limit check
+                        if prefix in self.GLOBAL_LIMITS:
+                            glimit, gwindow = self.GLOBAL_LIMITS[prefix]
+                            effective_glimit = settings.lookup_global_rate_limit_per_minute if prefix == "/api/lookup" else glimit
+                            global_allowed = await limiter.acquire(f"global:{prefix}:{request.method}", effective_glimit, gwindow)
+                            if not global_allowed:
+                                return Response(
+                                    status_code=429,
+                                    content="Rate limit exceeded: Global rate limit. Try again later.",
+                                    headers={"Retry-After": "60"},
+                                    media_type="text/plain",
+                                )
+
+                        effective_limit = settings.lookup_rate_limit_per_minute if prefix == "/api/lookup" else limit
+                        effective_window = settings.lookup_rate_window if prefix == "/api/lookup" else window
+                        allowed = await limiter.acquire(f"ip:{client_ip}", effective_limit, effective_window)
+                        if not allowed:
+                            return Response(
+                                status_code=429,
+                                content="Rate limit exceeded. Try again later.",
+                                headers={"Retry-After": "60"},
+                                media_type="text/plain",
+                            )
+                    except Exception:
+                        logger.exception("Rate limiter failure")
+                        return Response(
+                            status_code=503,
+                            content="Rate limiter unavailable",
+                            media_type="text/plain",
+                        )
                 break
         return await call_next(request)
 
@@ -210,11 +484,14 @@ app.add_middleware(SecurityHeadersMiddleware)
 app.add_middleware(GZipMiddleware, minimum_size=1000)
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[o.strip() for o in settings.cors_origins.split(",") if o.strip()],
+    allow_origins=list(CORS_ORIGINS),
     allow_credentials=True,
     allow_methods=["GET", "POST", "PUT", "DELETE", "OPTIONS"],
     allow_headers=["Content-Type", "Authorization", "X-API-Key", "X-Correlation-ID"],
 )
+app.add_middleware(TrustedHostMiddleware, allowed_hosts=list(TRUSTED_HOSTS))
+app.add_middleware(RequestBoundaryMiddleware)
+app.add_middleware(RequestAuditMiddleware)
 
 
 # --- Exception Handlers ---
@@ -229,8 +506,13 @@ def _error_response(detail: str, error_code: str | None = None) -> ErrorResponse
 
 @app.exception_handler(RequestValidationError)
 async def validation_exception_handler(request: Request, exc: RequestValidationError):
-    logger.warning("Validation error: %s", exc.errors())
-    detail = "; ".join(f"{'.'.join(str(p) for p in e.get('loc', []))}: {e.get('msg', '')}" for e in exc.errors())
+    errors = exc.errors()
+    safe_errors = [
+        {"loc": [str(part) for part in error.get("loc", ())], "type": error.get("type", ""), "msg": error.get("msg", "")}
+        for error in errors
+    ]
+    logger.warning("Validation error route=%s errors=%s", _route_template(request), safe_errors)
+    detail = "; ".join(f"{'.'.join(str(p) for p in e.get('loc', []))}: {e.get('msg', '')}" for e in errors)
     return JSONResponse(
         status_code=422,
         content=_error_response(detail, error_code="validation_error").model_dump(),
@@ -248,7 +530,7 @@ async def http_exception_handler(request: Request, exc: HTTPException):
 
 @app.exception_handler(Exception)
 async def general_exception_handler(request: Request, exc: Exception):
-    logger.critical("Unhandled exception: %s %s", request.method, request.url.path, exc_info=exc)
+    logger.critical("Unhandled exception route=%s", _route_template(request), exc_info=exc)
     return JSONResponse(
         status_code=500,
         content=_error_response("Internal server error", error_code="internal_error").model_dump(),
@@ -259,6 +541,7 @@ class LookupRequest(BaseModel):
     ioc: str
     task_id: str | None = None
     ioc_type: str | None = None
+    refresh: bool = False
 
     @model_validator(mode="before")
     @classmethod
@@ -312,7 +595,9 @@ async def source_inventory():
         "SecurityTrails": ["SECURITYTRAILS_API_KEY"], "PhishTank": ["PHISHTANK_API_KEY"],
         "Spur.us": ["SPUR_US_API_KEY"], "Censys": ["CENSYS_API_KEY"],
         "IPinfo": ["IPINFO_API_KEY", "IPINFO_ACCESS_TOKEN"],
-        "Hudson Rock": ["HUDSON_API_KEY", "HUDSON_ROCK_API_KEY", "HUDSONROCK_API_KEY"],
+        "AbstractAPI": ["ABSTRACTAPI_API_KEY", "ABSTRACT_API_KEY"],
+        "Hunter.io": ["HUNTERIO_API_KEY", "HUNTER_IO_API_KEY", "HUNTER_API_KEY"],
+        "Hudson Rock": [],  # Public Cavalier API — no key required
         "HIBP Pwned Passwords": [],
     }
     sources = []
@@ -351,6 +636,31 @@ async def source_inventory():
         "credential_configured_count": sum(1 for s in sources if s["credential_source"] in {".env", "environment"}),
     }
 
+
+@app.get("/api/health/keys", response_model=dict)
+async def key_health():
+    inv = await source_inventory()
+    sources = inv.get("sources", [])
+    keys: dict[str, bool] = {}
+    missing_keys: list[str] = []
+    public_providers: list[str] = []
+    for s in sources:
+        name = s["name"]
+        configured = bool(s["configured"])
+        keys[name] = configured
+        if s["credential_source"] == "public_no_key":
+            public_providers.append(name)
+        elif not configured:
+            missing_keys.append(name)
+    return {
+        "keys": keys,
+        "active_providers": inv.get("available_count", 0),
+        "total_providers": inv.get("count", 0),
+        "missing_keys": missing_keys,
+        "public_providers": public_providers,
+    }
+
+
 @app.get("/api/health", response_model=HealthResponse)
 async def health():
     return HealthResponse(status="ok", app="Universal IOC Lookup Platform", version="0.2.0")
@@ -364,26 +674,103 @@ async def clear_cache():
     return CacheClearResponse(status="ok")
 
 
+def _parse_stored_response(payload: dict, fallback_task_id: str | None = None) -> LookupResponse:
+    if not isinstance(payload, dict):
+        raise ValueError("Stored result must be an object")
+    if "input" not in payload or "composite" not in payload:
+        from app.backend.pipeline import AnalysisTask
+
+        task = AnalysisTask.from_dict(payload)
+        data = {
+            "input": task.ioc_value,
+            "task_id": task.task_id or fallback_task_id,
+            "normalized": task.normalized or task.ioc_value,
+            "ioc_type": task.ioc_type or "unknown",
+            "password_prehashed": task.password_prehashed,
+            "composite": task.composite or CompositeScore(),
+            "final_assessment": task.final_assessment,
+            "provider_health": task.provider_health,
+            "enrichment": task.enrichment or EnrichmentData(),
+            "results": task.results,
+            "relationships": task.relationships,
+            "executive_summary": task.executive_summary,
+        }
+    else:
+        data = dict(payload)
+        data.setdefault("task_id", fallback_task_id)
+        data.setdefault("normalized", data.get("input", ""))
+        data.setdefault("ioc_type", "unknown")
+        data.setdefault("composite", CompositeScore())
+        data.setdefault("provider_health", [])
+        data.setdefault("enrichment", EnrichmentData())
+        data.setdefault("results", [])
+        data.setdefault("relationships", [])
+        data.setdefault("executive_summary", "")
+    return LookupResponse.model_validate(data)
+
+
+def _task_from_stored_response(response: LookupResponse) -> "AnalysisTask":
+    from app.backend.pipeline import AnalysisTask
+
+    return AnalysisTask(
+        task_id=response.task_id or "",
+        status="done",
+        progress=100.0,
+        ioc_value=response.input,
+        normalized=response.normalized,
+        ioc_type=response.ioc_type,
+        password_prehashed=response.password_prehashed,
+        results=response.results,
+        composite=response.composite,
+        final_assessment=response.final_assessment,
+        provider_health=response.provider_health,
+        enrichment=response.enrichment,
+        relationships=response.relationships,
+        executive_summary=response.executive_summary,
+    )
+
+
+async def _load_stored_response(task_id: str, db: AsyncSession) -> LookupResponse | None:
+    result = await db.execute(
+        select(LookupResult)
+        .where(LookupResult.task_id == task_id)
+        .order_by(LookupResult.created_at.desc())
+        .limit(1)
+    )
+    row = result.scalar_one_or_none()
+    if row is None or not row.full_response:
+        return None
+    try:
+        return _parse_stored_response(json.loads(row.full_response), task_id)
+    except (TypeError, ValueError, KeyError) as exc:
+        logger.warning("Ignoring malformed stored result for task %s: %s", task_id, exc)
+        return None
+
+
 # --- Pipeline Lookup ---
 
 async def _resolve_task(ioc: str, task_id: str | None = None, db: AsyncSession | None = None):
-    if task_id:
-        task = await get_task_redis(task_id)
-        if task is None:
-            raise HTTPException(status_code=404, detail="Task not found")
-        if task.status != "done":
-            raise HTTPException(status_code=425, detail="Analysis not yet complete")
-        return task
-    fp_override = False
-    if db is not None:
-        fp_override = refang(ioc.strip()) in await _fetch_fp_overrides(db)
-    task = await run_analysis(ioc.strip(), fp_override=fp_override)
+    if not task_id:
+        raise HTTPException(status_code=400, detail="task_id is required for export")
+    task = await get_task_redis(task_id)
+    if task is None and db is not None:
+        response = await _load_stored_response(task_id, db)
+        if response is not None:
+            task = _task_from_stored_response(response)
+    if task is None:
+        raise HTTPException(status_code=404, detail="Task not found")
     if task.status != "done":
-        raise HTTPException(status_code=425, detail="Analysis could not complete")
+        raise HTTPException(status_code=425, detail="Analysis not yet complete")
+    requested_ioc = refang(ioc.strip()).lower()
+    task_ioc = refang(task.normalized or task.ioc_value or "").lower()
+    if task_ioc and task_ioc != requested_ioc:
+        raise HTTPException(status_code=409, detail="Task does not belong to this IOC")
     return task
 
 
 async def _fetch_fp_overrides(db: AsyncSession) -> set[str]:
+    if settings.allow_network_bind and not settings.allow_global_feedback:
+        return set()
     rows = (
         await db.execute(select(IOCFeedback.ioc_value).where(IOCFeedback.feedback == "false_positive"))
     ).scalars().all()
@@ -396,18 +783,52 @@ def _normalize_ioc(value: str) -> str:
         raise HTTPException(status_code=400, detail="Empty IOC value")
     if len(normalized) > 2048:
         raise HTTPException(status_code=400, detail="IOC value too long")
+    parsed = urlsplit(normalized.strip("`'\"<>()[],;"))
+    if parsed.scheme.lower() in {"http", "https"} and (parsed.username is not None or parsed.password is not None):
+        raise HTTPException(status_code=400, detail="URL userinfo is not allowed")
+    return normalized
+
+
+def _reject_ambiguous_ingress(value: str, requested_type: str | None, normalized_info) -> None:
+    parsed_type, _ = parse_typed_ioc(refang(value.strip()))
+    if requested_type or parsed_type:
+        return
+    if normalized_info.ioc_type in {"service_name", "mutex", "named_pipe", "registry_key"}:
+        raise HTTPException(status_code=400, detail="Host-artifact values must use an explicit type prefix")
+
+
+def _feedback_value(value: str, requested_type: str | None = None) -> str:
+    normalized = _normalize_ioc(value)
+    parsed_type, parsed_value = parse_typed_ioc(normalized)
+    if parsed_type is not None and requested_type is None:
+        normalized = parsed_value
+    normalized_info = normalize_ioc(normalized, expected_type=requested_type or parsed_type)
+    if not normalized_info.valid:
+        raise HTTPException(status_code=400, detail="Unrecognizable IOC format")
+    _reject_ambiguous_ingress(value, requested_type, normalized_info)
+    normalized = normalized_info.value
+    if normalized_info.ioc_type == "password":
+        if requested_type == "password_sha1" or parsed_type == "password_sha1" or (
+            requested_type in {None, "password"} and is_password_digest(normalized)
+        ):
+            return normalized.lower()
+        return password_digest(normalized)
     return normalized
 
 
 def _task_to_response(task) -> LookupResponse:
     return LookupResponse(
         input=task.ioc_value,
+        task_id=task.task_id,
         normalized=task.normalized,
         ioc_type=task.ioc_type or "unknown",
-        composite=task.composite,
+        password_prehashed=task.password_prehashed or (
+            task.ioc_type == "password" and bool(re.fullmatch(r"[a-f0-9]{40}", task.normalized or "", re.IGNORECASE))
+        ),
+        composite=task.composite or CompositeScore(),
         final_assessment=getattr(task, "final_assessment", None),
         provider_health=getattr(task, "provider_health", []),
-        enrichment=task.enrichment or None,
+        enrichment=task.enrichment or EnrichmentData(),
         results=task.results,
         relationships=task.relationships,
         executive_summary=task.executive_summary,
@@ -418,51 +839,79 @@ def _task_to_response(task) -> LookupResponse:
 async def start_lookup(request: LookupRequest, db: AsyncSession = Depends(get_db)):
     req_type = request.ioc_type
     normalized = _normalize_ioc(request.ioc)
-    if req_type and req_type not in SUPPORTED_IOC_TYPES:
-        raise HTTPException(status_code=400, detail="Unsupported IOC type")
-    if not req_type and classify_ioc(normalized) == "unknown":
+    parsed_type, parsed_value = parse_typed_ioc(normalized)
+    if parsed_type is not None and req_type is None:
+        req_type = parsed_type
+        normalized = parsed_value
+    prehashed_password = req_type == "password_sha1" or (
+        req_type == "password" and is_password_digest(normalized)
+    )
+    normalized_info = normalize_ioc(normalized, expected_type=req_type)
+    if not normalized_info.valid:
         raise HTTPException(status_code=400, detail="Unrecognizable IOC format")
+    _reject_ambiguous_ingress(request.ioc, request.ioc_type, normalized_info)
+    normalized = normalized_info.value
+    effective_type = "password" if prehashed_password else (req_type or normalized_info.ioc_type)
+    if effective_type not in SUPPORTED_IOC_TYPES:
+        raise HTTPException(status_code=400, detail="Unsupported IOC type")
 
     fp_override = normalized in await _fetch_fp_overrides(db)
 
-    # For passwords, convert to SHA-1 hash for privacy-preserving k-anonymity lookup (HIBP)
     target_ioc = normalized
-    effective_type = req_type
-    if req_type == "password":
-        import hashlib
-        if not re.fullmatch(r"^[a-f0-9]{40}$", normalized, re.IGNORECASE):
-            target_ioc = hashlib.sha1(normalized.encode("utf-8")).hexdigest()
-        else:
-            target_ioc = normalized.lower()
-        effective_type = "password"
+    if effective_type == "password":
+        target_ioc = password_digest(normalized, already_digest=prehashed_password)
 
-    # A lookup can take up to the pipeline timeout. Queue it and return the
-    # identifier immediately so the UI can reliably poll or use SSE instead
-    # of timing out before it learns the task id.
+    global _pending_lookups
+    _get_lookup_semaphore()
+    if _pending_lookups >= settings.max_pending_lookups:
+        raise HTTPException(status_code=429, detail="Lookup queue is full; retry later")
+    _pending_lookups += 1
     task_id = uuid4().hex[:12]
-    asyncio.create_task(
-        run_analysis(
-            target_ioc,
-            task_id=task_id,
-            fp_override=fp_override,
-            ioc_type_override=effective_type,
-        )
-    )
+    analysis_kwargs = {
+        "task_id": task_id,
+        "fp_override": fp_override,
+        "ioc_type_override": effective_type,
+        "password_prehashed": effective_type == "password",
+    }
+    if request.refresh:
+        analysis_kwargs["bypass_cache"] = True
+    try:
+        task = asyncio.create_task(_run_queued_lookup(target_ioc, **analysis_kwargs))
+    except Exception:
+        _pending_lookups = max(0, _pending_lookups - 1)
+        raise
+    _lookup_tasks.add(task)
+    task.add_done_callback(_lookup_task_done)
     return TaskStatusResponse(
         task_id=task_id,
         status="pending",
         ioc_value=target_ioc,
         normalized=target_ioc,
-        ioc_type=request.ioc_type or classify_ioc(normalized),
+        ioc_type=effective_type,
     )
 
 
 @app.get("/api/tasks/{task_id}")
-async def get_task_status(task_id: str):
+async def get_task_status(task_id: str, db: AsyncSession = Depends(get_db)):
+    task = await get_task_redis(task_id)
+    if task:
+        return task.to_dict()
+    response = await _load_stored_response(task_id, db)
+    if response:
+        return _task_from_stored_response(response).to_dict()
+    raise HTTPException(status_code=404, detail="Task not found")
+
+
+@app.post("/api/tasks/{task_id}/cancel")
+async def cancel_task(task_id: str):
     task = await get_task_redis(task_id)
     if not task:
         raise HTTPException(status_code=404, detail="Task not found")
-    return task.to_dict()
+    if task.status in {"done", "error", "cancelled"}:
+        raise HTTPException(status_code=409, detail="Analysis is already complete")
+    if not cancel_analysis(task_id):
+        raise HTTPException(status_code=409, detail="Analysis is not cancellable")
+    return {"task_id": task_id, "status": "cancelling"}
 
 
 SSE_HEARTBEAT_INTERVAL = 15.0
@@ -501,14 +950,16 @@ async def stream_task(task_id: str, request: Request):
 
 
 @app.get("/api/tasks/{task_id}/result")
-async def get_task_result(task_id: str):
+async def get_task_result(task_id: str, db: AsyncSession = Depends(get_db)):
     task = await get_task_redis(task_id)
-    if not task:
-        raise HTTPException(status_code=404, detail="Task not found")
-    if task.status != "done":
-        raise HTTPException(status_code=425, detail="Analysis not yet complete")
-
-    return _task_to_response(task)
+    if task:
+        if task.status != "done":
+            raise HTTPException(status_code=425, detail="Analysis not yet complete")
+        return _task_to_response(task)
+    response = await _load_stored_response(task_id, db)
+    if response:
+        return response
+    raise HTTPException(status_code=404, detail="Task not found")
 
 
 # --- Investigations ---
@@ -627,7 +1078,22 @@ async def add_ioc_to_investigation(inv_id: int, body: LookupRequest, db: AsyncSe
         raise HTTPException(status_code=404, detail="Investigation not found")
 
     normalized = _normalize_ioc(body.ioc)
-    ioc_type = classify_ioc(normalized)
+    parsed_type, parsed_value = parse_typed_ioc(normalized)
+    if parsed_type is not None and body.ioc_type is None:
+        normalized = parsed_value
+    input_type = body.ioc_type or parsed_type
+    normalized_info = normalize_ioc(normalized, expected_type=input_type)
+    if not normalized_info.valid:
+        raise HTTPException(status_code=400, detail="Unrecognizable IOC format")
+    _reject_ambiguous_ingress(body.ioc, body.ioc_type, normalized_info)
+    normalized = normalized_info.value
+    prehashed_password = input_type == "password_sha1" or (
+        input_type == "password" and is_password_digest(normalized)
+    )
+    ioc_type = "password" if prehashed_password else (input_type or normalized_info.ioc_type)
+    if ioc_type == "password" or classify_ioc(normalized) == "password":
+        normalized = password_digest(normalized, already_digest=prehashed_password)
+        ioc_type = "password"
 
     existing = await db.execute(select(IOC).where(IOC.value == normalized))
     ioc = existing.scalar_one_or_none()
@@ -649,7 +1115,7 @@ async def add_ioc_to_investigation(inv_id: int, body: LookupRequest, db: AsyncSe
 
     await retry_sqlite_commit(db)
 
-    await _auto_score_ioc(normalized, ioc_id, db)
+    await _auto_score_ioc(normalized, ioc_id, db, ioc_type)
     return {"status": "added", "ioc_id": ioc_id, "value": normalized}
 
 
@@ -712,16 +1178,98 @@ async def delete_recent(ioc_id: int, db: AsyncSession = Depends(get_db)):
     return StatusResponse(status="deleted")
 
 
+@app.get("/api/recent/{ioc_id}/result")
+async def get_recent_result(ioc_id: int, db: AsyncSession = Depends(get_db)):
+    """Return the previously stored LookupResponse from database without re-running any provider scan."""
+    stmt = (
+        select(LookupResult)
+        .where(LookupResult.ioc_id == ioc_id)
+        .order_by(LookupResult.created_at.desc())
+        .limit(1)
+    )
+    result = await db.execute(stmt)
+    lr = result.scalar_one_or_none()
+    if not lr or not lr.full_response:
+        raise HTTPException(status_code=404, detail="No stored result found for this IOC")
+    try:
+        return _parse_stored_response(json.loads(lr.full_response), lr.task_id).model_dump(mode="json")
+    except Exception as exc:
+        logger.error("Failed to parse stored LookupResult for ioc_id %s: %s", ioc_id, type(exc).__name__)
+        raise HTTPException(status_code=500, detail="Corrupted stored result")
+
+
+@app.get("/api/lookup/stored")
+async def get_stored_lookup(ioc: str, db: AsyncSession = Depends(get_db)):
+    """Fetch previously stored result by IOC value if already analyzed, preserving API key quotas."""
+    normalized = _normalize_ioc(ioc)
+    stmt = (
+        select(LookupResult)
+        .join(IOC, IOC.id == LookupResult.ioc_id)
+        .where(IOC.value == normalized)
+        .order_by(LookupResult.created_at.desc())
+        .limit(1)
+    )
+    result = await db.execute(stmt)
+    lr = result.scalar_one_or_none()
+    if not lr or not lr.full_response:
+        raise HTTPException(status_code=404, detail="No stored result found for this indicator")
+    try:
+        return _parse_stored_response(json.loads(lr.full_response), lr.task_id).model_dump(mode="json")
+    except Exception as exc:
+        logger.error("Failed to parse stored LookupResult: %s", type(exc).__name__)
+        raise HTTPException(status_code=500, detail="Corrupted stored result")
+
+
+
+@app.get("/api/lookup/{ioc}/raw")
+async def get_raw_lookup(ioc: str, db: AsyncSession = Depends(get_db)):
+    normalized = _normalize_ioc(ioc)
+    result = await db.execute(
+        select(LookupResult)
+        .join(IOC, IOC.id == LookupResult.ioc_id)
+        .where(IOC.value == normalized)
+        .order_by(LookupResult.created_at.desc())
+        .limit(1)
+    )
+    row = result.scalar_one_or_none()
+    if row is None or not row.full_response:
+        raise HTTPException(status_code=404, detail="No stored result found for this indicator")
+    try:
+        response = _parse_stored_response(json.loads(row.full_response), row.task_id).model_dump(mode="json")
+    except Exception as exc:
+        logger.exception("Failed to parse stored raw result: %s", exc)
+        raise HTTPException(status_code=500, detail="Corrupted stored result")
+    providers = []
+    for provider in response.get("results", []):
+        providers.append({
+            "source": provider.get("source", "unknown"),
+            "execution_state": provider.get("execution_state", "unknown"),
+            "verdict": provider.get("verdict", "unknown"),
+            "provider_verdict": provider.get("provider_verdict"),
+            "provider_summary": provider.get("provider_summary"),
+            "raw_data": provider.get("raw_data", {}),
+        })
+    return {
+        "ioc": normalized,
+        "ioc_type": response.get("ioc_type", "unknown"),
+        "provider_count": len(providers),
+        "providers": providers,
+    }
+
+
 # --- False-Positive Feedback (A-2) ---
+
+def _require_feedback_scope():
+    if settings.allow_network_bind and not settings.allow_global_feedback:
+        raise HTTPException(status_code=403, detail="Global feedback is disabled in network mode")
+
 
 @app.post("/api/feedback", response_model=FeedbackResponse)
 async def submit_feedback(body: FeedbackRequest, db: AsyncSession = Depends(get_db)):
-    from app.backend.classifier import classify_ioc
-    value = _normalize_ioc(body.ioc)
-    if classify_ioc(value) == "unknown":
-        raise HTTPException(status_code=400, detail="Unrecognizable IOC format")
+    value = _feedback_value(body.ioc, body.ioc_type)
     if body.feedback not in ("false_positive", "confirmed"):
         raise HTTPException(status_code=400, detail="feedback must be 'false_positive' or 'confirmed'")
+    _require_feedback_scope()
 
     existing = (
         await db.execute(select(IOCFeedback).where(IOCFeedback.ioc_value == value))
@@ -744,7 +1292,8 @@ async def submit_feedback(body: FeedbackRequest, db: AsyncSession = Depends(get_
 
 @app.get("/api/feedback/{ioc}", response_model=FeedbackResponse)
 async def get_feedback(ioc: str, db: AsyncSession = Depends(get_db)):
-    value = _normalize_ioc(ioc)
+    _require_feedback_scope()
+    value = _feedback_value(ioc)
     row = (
         await db.execute(select(IOCFeedback).where(IOCFeedback.ioc_value == value))
     ).scalar_one_or_none()
@@ -760,7 +1309,8 @@ async def get_feedback(ioc: str, db: AsyncSession = Depends(get_db)):
 
 @app.delete("/api/feedback/{ioc}", response_model=StatusResponse)
 async def delete_feedback(ioc: str, db: AsyncSession = Depends(get_db)):
-    value = _normalize_ioc(ioc)
+    _require_feedback_scope()
+    value = _feedback_value(ioc)
     row = (
         await db.execute(select(IOCFeedback).where(IOCFeedback.ioc_value == value))
     ).scalar_one_or_none()
@@ -790,6 +1340,7 @@ async def start_batch(body: BatchRequest, db: AsyncSession = Depends(get_db)):
     try:
         batch = start_batch_analysis(body.iocs, fp_overrides=fp_overrides,
                                      timeout=body.timeout, concurrency=body.concurrency)
+        await _persist_batch(batch, required=True)
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
     return BatchStatusResponse(batch_id=batch.batch_id, total=batch.total, status=batch.status)
@@ -825,6 +1376,7 @@ async def upload_batch_file(file: UploadFile = File(...), db: AsyncSession = Dep
 
         fp_overrides = await _fetch_fp_overrides(db)
         batch = start_batch_analysis(iocs, fp_overrides=fp_overrides)
+        await _persist_batch(batch, required=True)
         return BatchStatusResponse(batch_id=batch.batch_id, total=batch.total, status=batch.status)
     except HTTPException:
         raise
@@ -838,26 +1390,125 @@ async def upload_batch_file(file: UploadFile = File(...), db: AsyncSession = Dep
 @app.get("/api/batch/{batch_id}")
 async def get_batch_status(batch_id: str):
     batch = get_batch(batch_id)
-    if not batch:
-        raise HTTPException(status_code=404, detail="Batch not found")
-    return batch.to_dict()
+    if batch:
+        return batch.to_dict()
+    persisted = await get_batch_from_db(batch_id)
+    if persisted:
+        return persisted
+    raise HTTPException(status_code=404, detail="Batch not found")
 
 
 @app.get("/api/batch/{batch_id}/result")
 async def get_batch_result(batch_id: str):
     batch = get_batch(batch_id)
+    if batch:
+        if batch.status not in {"done", "cancelled"}:
+            raise HTTPException(status_code=425, detail="Batch analysis not yet complete")
+        result = _normalize_batch_payload(
+            consolidate_batch_results(batch),
+            batch_id=batch.batch_id,
+            status=batch.status,
+            total=batch.total,
+            completed=batch.completed,
+            error=batch.error,
+        )
+        return result
+    db_result = await get_batch_from_db(batch_id)
+    if db_result:
+        if db_result.get("status") not in {"done", "completed", "cancelled"}:
+            raise HTTPException(status_code=425, detail="Batch analysis not yet complete")
+        return db_result
+    raise HTTPException(status_code=404, detail="Batch not found")
+
+
+@app.get("/api/batches")
+async def list_batches():
+    """Return lightweight summaries of all historical batches from SQLite."""
+    return await get_all_batches_from_db()
+
+
+@app.post("/api/batch/{batch_id}/cancel")
+async def cancel_batch(batch_id: str):
+    batch = get_batch(batch_id)
     if not batch:
         raise HTTPException(status_code=404, detail="Batch not found")
-    if batch.status != "done":
-        raise HTTPException(status_code=425, detail="Batch analysis not yet complete")
-    return consolidate_batch_results(batch)
+    if batch.status == "cancelled":
+        return {"batch_id": batch_id, "status": "cancelled"}
+    if batch.status in {"done", "error"}:
+        raise HTTPException(status_code=409, detail="Batch is already complete")
+    batch.cancel_event.set()
+    if batch.run_task is not None and not batch.run_task.done():
+        batch.run_task.cancel()
+        await asyncio.gather(batch.run_task, return_exceptions=True)
+    if batch.status not in {"cancelled", "done", "error"}:
+        batch.status = "cancelled"
+        batch.error = "Batch cancelled"
+        batch.progress = 100.0
+        await _persist_batch(batch, required=True)
+    return {"batch_id": batch_id, "status": batch.status}
+
+
+@app.delete("/api/batch/{batch_id}")
+async def delete_batch(batch_id: str):
+    """Delete a batch from the SQLite database."""
+    batch = get_batch(batch_id)
+    if batch and batch.status in {"pending", "running"}:
+        batch.cancel_event.set()
+        if batch.run_task is not None and not batch.run_task.done():
+            batch.run_task.cancel()
+            await asyncio.gather(batch.run_task, return_exceptions=True)
+    deleted = await delete_batch_from_db(batch_id)
+    if not deleted and batch is None:
+        raise HTTPException(status_code=404, detail="Batch not found in database")
+    discard_batch(batch_id)
+    return {"status": "deleted", "batch_id": batch_id, "database_record": deleted}
+
+
+@app.get("/api/batch/{batch_id}/ioc/{ioc:path}")
+async def get_batch_ioc_result(batch_id: str, ioc: str, db: AsyncSession = Depends(get_db)):
+    """Retrieve full LookupResponse for a single IOC directly from completed batch results without re-scanning."""
+    normalized = _normalize_ioc(ioc)
+    batch = get_batch(batch_id)
+    if batch:
+        target_task = None
+        for task in batch.subtasks:
+            if task.normalized == normalized or task.ioc_value == normalized or task.ioc_value == ioc:
+                target_task = task
+                break
+        if not target_task:
+            raise HTTPException(status_code=404, detail="IOC not found in this batch")
+        return _task_to_response(target_task)
+
+    stored = await db.execute(
+        select(LookupResult)
+        .join(IOC, IOC.id == LookupResult.ioc_id)
+        .where(LookupResult.batch_id == batch_id, IOC.value == normalized)
+        .order_by(LookupResult.created_at.desc())
+        .limit(1)
+    )
+    row = stored.scalar_one_or_none()
+    if row and row.full_response:
+        try:
+            return _parse_stored_response(json.loads(row.full_response), row.task_id).model_dump(mode="json")
+        except Exception as exc:
+            logger.warning("Ignoring malformed batch result %s: %s", row.id, exc)
+
+    db_result = await get_batch_from_db(batch_id)
+    if db_result:
+        for item in db_result.get("results", []):
+            if item.get("normalized") == normalized or item.get("input") == normalized or item.get("input") == ioc or item.get("ioc") == normalized or item.get("ioc") == ioc:
+                return item
+        raise HTTPException(status_code=404, detail="IOC not found in this batch")
+
+    raise HTTPException(status_code=404, detail="Batch not found")
+
 
 
 @app.get("/api/batch/{batch_id}/stream")
 async def stream_batch(batch_id: str, request: Request):
     if not get_batch(batch_id):
         raise HTTPException(status_code=404, detail="Batch not found")
-    queue = get_batch_queue(batch_id)
+    queue = acquire_batch_queue(batch_id)
 
     async def event_generator():
         last_heartbeat = asyncio.get_running_loop().time()
@@ -880,7 +1531,7 @@ async def stream_batch(batch_id: str, request: Request):
                     else:
                         yield ": keepalive\n\n"
         finally:
-            cleanup_batch_queue(batch_id)
+            release_batch_queue(batch_id)
 
     return StreamingResponse(event_generator(), media_type="text/event-stream")
 
@@ -894,7 +1545,6 @@ class ReportExportRequest(BaseModel):
 @app.post("/api/export/report")
 async def export_report(body: ReportExportRequest, db: AsyncSession = Depends(get_db)):
     normalized = _normalize_ioc(body.ioc)
-
     task = await _resolve_task(body.ioc, body.task_id, db)
     response = _task_to_response(task).model_dump()
 
@@ -906,10 +1556,11 @@ def _build_html_report(data: dict) -> str:
     ioc_val = data.get("normalized") or data.get("input") or "Unknown"
     ioc_type = data.get("ioc_type", "")
     comp = data.get("composite", {})
-    verdict = comp.get("verdict", "unknown")
-    score = comp.get("score")
+    assessment = data.get("final_assessment") or {}
+    verdict = assessment.get("final_verdict", comp.get("verdict", "unknown"))
+    score = assessment.get("normalized_score", comp.get("score"))
     score_str = f"{round(score)}/100" if score is not None else "—"
-    confidence = comp.get("confidence", "medium")
+    confidence = assessment.get("confidence", comp.get("confidence", "medium"))
     date_str = datetime.now().strftime("%Y-%m-%d %H:%M")
     results = data.get("results", [])
     enrich = data.get("enrichment", {})
@@ -1013,10 +1664,12 @@ def _build_html_report(data: dict) -> str:
     if enrich.get("email_security"):
         es = enrich["email_security"]
         parts = []
-        for k in ("spf","dkim","dmarc"):
+        for k in ("spf", "dkim", "dmarc"):
             v = es.get(k)
-            if v: parts.append(f'{k.upper()}: {_e(str(v)[:30])}')
-        if parts: html += f'<div class="stat-card"><div class="stat-lbl">Email Security</div><div class="stat-sub">{" | ".join(parts)}</div></div>'
+            if v:
+                parts.append(f'{k.upper()}: {_e(str(v)[:30])}')
+        if parts:
+            html += f'<div class="stat-card"><div class="stat-lbl">Email Security</div><div class="stat-sub">{" | ".join(parts)}</div></div>'
     html += '</div>'
 
     relations = data.get("relationships", [])
@@ -1027,23 +1680,23 @@ def _build_html_report(data: dict) -> str:
             t = rr.get("target_ioc","")
             rl = rr.get("relationship","")
             key = f"{t}|{rl}"
-            if key in seen_rel: continue
+            if key in seen_rel:
+                continue
             seen_rel.add(key)
             html += f'<tr><td class="mono">{_e(t)}</td><td>{_e(rl)}</td></tr>'
         html += '</tbody></table>'
 
-    html += f'<div class="footer">Generated by IOC Universal — https://github.com/anomalyco/ioc-platform</div></div></body></html>'
+    html += '<div class="footer">Generated by IOC Universal — https://github.com/anomalyco/ioc-platform</div></div></body></html>'
     return html
 
 def _e(s):
-    if s is None: return ""
+    if s is None:
+        return ""
     import html
     return html.escape(str(s))
 
 @app.post("/api/export/stix")
 async def export_stix(body: LookupRequest, db: AsyncSession = Depends(get_db)):
-    normalized = _normalize_ioc(body.ioc)
-
     task = await _resolve_task(body.ioc, body.task_id, db)
     response = _task_to_response(task).model_dump()
 
@@ -1053,8 +1706,6 @@ async def export_stix(body: LookupRequest, db: AsyncSession = Depends(get_db)):
 
 @app.post("/api/export/misp")
 async def export_misp(body: LookupRequest, db: AsyncSession = Depends(get_db)):
-    normalized = _normalize_ioc(body.ioc)
-
     task = await _resolve_task(body.ioc, body.task_id, db)
     response = _task_to_response(task).model_dump()
 
@@ -1070,8 +1721,6 @@ class SIEMExportRequest(BaseModel):
 
 @app.post("/api/export/siem")
 async def export_siem_endpoint(body: SIEMExportRequest, db: AsyncSession = Depends(get_db)):
-    normalized = _normalize_ioc(body.ioc)
-
     task = await _resolve_task(body.ioc, body.task_id, db)
     response = _task_to_response(task).model_dump()
 
@@ -1090,8 +1739,6 @@ async def export_siem_endpoint(body: SIEMExportRequest, db: AsyncSession = Depen
 
 @app.post("/api/export/csv")
 async def export_csv(body: LookupRequest, db: AsyncSession = Depends(get_db)):
-    normalized = _normalize_ioc(body.ioc)
-
     task = await _resolve_task(body.ioc, body.task_id, db)
 
     results = [r.model_dump() for r in task.results]
@@ -1119,6 +1766,8 @@ async def get_webhooks():
 async def create_webhook(body: WebhookCreate):
     if not settings.webhooks_enabled:
         raise HTTPException(status_code=403, detail="Webhooks are disabled")
+    if not body.secret or len(body.secret.strip()) < 16:
+        raise HTTPException(status_code=400, detail="A signing secret of at least 16 characters is required")
     try:
         result = await add_webhook(body.url, body.events, body.secret)
         return result
@@ -1138,12 +1787,13 @@ async def delete_webhook(webhook_id: str):
 
 # --- Save Lookup Result ---
 
-async def _auto_score_ioc(normalized: str, ioc_id: int, db: AsyncSession) -> bool:
+async def _auto_score_ioc(normalized: str, ioc_id: int, db: AsyncSession, ioc_type: str | None = None) -> bool:
     from app.backend.cache import cache_key
     from app.backend.pipeline import cache as _cache
 
     task = None
-    ck = cache_key("save", classify_ioc(normalized), normalized)
+    effective_type = ioc_type or classify_ioc(normalized)
+    ck = cache_key("save", effective_type, normalized)
     if _cache is not None:
         cached = await _cache.get(ck)
         if cached and cached.get("task_id"):
@@ -1152,7 +1802,12 @@ async def _auto_score_ioc(normalized: str, ioc_id: int, db: AsyncSession) -> boo
                 task = cached_task
 
     if task is None:
-        task = await run_analysis(normalized, fp_override=normalized in await _fetch_fp_overrides(db))
+        task = await run_analysis(
+            normalized,
+            fp_override=normalized in await _fetch_fp_overrides(db),
+            ioc_type_override=effective_type if effective_type in SUPPORTED_IOC_TYPES and effective_type != "unknown" else None,
+            password_prehashed=effective_type == "password",
+        )
 
     if task.status == "done" and task.composite:
         score = task.composite.score if hasattr(task.composite, "score") else 0
@@ -1161,7 +1816,8 @@ async def _auto_score_ioc(normalized: str, ioc_id: int, db: AsyncSession) -> boo
 
         response_dict = json.loads(_task_to_response(task).model_dump_json())
 
-        lr = LookupResult(
+        await upsert_lookup_result(
+            db,
             ioc_id=ioc_id,
             task_id=task.task_id,
             composite_score=score,
@@ -1170,8 +1826,6 @@ async def _auto_score_ioc(normalized: str, ioc_id: int, db: AsyncSession) -> boo
             full_response=json.dumps(response_dict),
             source_count=len(task.results),
         )
-        db.add(lr)
-        await retry_sqlite_commit(db)
         return True
     return False
 
@@ -1179,7 +1833,24 @@ async def _auto_score_ioc(normalized: str, ioc_id: int, db: AsyncSession) -> boo
 @app.post("/api/save", response_model=SaveResponse)
 async def save_lookup_result(body: LookupRequest, db: AsyncSession = Depends(get_db)):
     normalized = _normalize_ioc(body.ioc)
-    ioc_type = classify_ioc(normalized)
+    parsed_type, parsed_value = parse_typed_ioc(normalized)
+    if parsed_type is not None and body.ioc_type is None:
+        normalized = parsed_value
+    input_type = body.ioc_type or parsed_type
+    normalized_info = normalize_ioc(normalized, expected_type=input_type)
+    if not normalized_info.valid:
+        raise HTTPException(status_code=400, detail="Unrecognizable IOC format")
+    _reject_ambiguous_ingress(body.ioc, body.ioc_type, normalized_info)
+    normalized = normalized_info.value
+    prehashed_password = input_type == "password_sha1" or (
+        input_type == "password" and is_password_digest(normalized)
+    )
+    ioc_type = "password" if prehashed_password else (input_type or normalized_info.ioc_type)
+    if ioc_type == "password" or classify_ioc(normalized) == "password":
+        normalized = password_digest(normalized, already_digest=prehashed_password)
+        ioc_type = "password"
+    if ioc_type not in SUPPORTED_IOC_TYPES:
+        raise HTTPException(status_code=400, detail="Unsupported IOC type")
 
     existing = await db.execute(select(IOC).where(IOC.value == normalized))
     ioc = existing.scalar_one_or_none()
@@ -1206,8 +1877,25 @@ async def save_lookup_result(body: LookupRequest, db: AsyncSession = Depends(get
                 if cached_task is not None and cached_task.status == "done":
                     task = cached_task
 
+    if task is not None:
+        task_ioc = refang(task.normalized or task.ioc_value or "").lower()
+        if task_ioc and task_ioc != normalized.lower():
+            raise HTTPException(status_code=409, detail="Task does not belong to this IOC")
+        if task.status != "done":
+            raise HTTPException(status_code=425, detail="Analysis not yet complete")
+        existing_result = await db.execute(
+            select(LookupResult).where(LookupResult.task_id == task.task_id)
+        )
+        if existing_result.scalar_one_or_none():
+            return SaveResponse(status="saved", ioc_id=ioc_id)
+
     if task is None:
-        task = await run_analysis(normalized, fp_override=normalized in await _fetch_fp_overrides(db))
+        task = await run_analysis(
+            normalized,
+            fp_override=normalized in await _fetch_fp_overrides(db),
+            ioc_type_override=ioc_type if ioc_type != "unknown" else None,
+            password_prehashed=ioc_type == "password",
+        )
 
     if task.status == "done" and task.composite:
         score = task.composite.score if hasattr(task.composite, "score") else 0
@@ -1216,7 +1904,8 @@ async def save_lookup_result(body: LookupRequest, db: AsyncSession = Depends(get
 
         response_dict = json.loads(_task_to_response(task).model_dump_json())
 
-        lr = LookupResult(
+        await upsert_lookup_result(
+            db,
             ioc_id=ioc_id,
             task_id=task.task_id,
             composite_score=score,
@@ -1225,10 +1914,33 @@ async def save_lookup_result(body: LookupRequest, db: AsyncSession = Depends(get
             full_response=json.dumps(response_dict),
             source_count=len(task.results),
         )
-        db.add(lr)
-        await retry_sqlite_commit(db)
 
     return SaveResponse(status="saved", ioc_id=ioc_id)
+
+
+@app.get("/api/screenshot")
+async def proxy_screenshot(scan_id: str):
+    """Secure backend proxy for urlscan.io screenshots to avoid CSP issues and analyst IP leakage."""
+    if not re.match(r"^[a-zA-Z0-9\-]{10,64}$", scan_id):
+        raise HTTPException(status_code=400, detail="Invalid scan ID format")
+
+    url = f"https://urlscan.io/screenshots/{scan_id}.png"
+    client = _get_http_client()
+    try:
+        resp = await client.get(url, timeout=10)
+        if resp.status_code == 200:
+            return Response(
+                content=resp.content,
+                media_type="image/png",
+                headers={"Cache-Control": "private, no-store"},
+            )
+        raise HTTPException(status_code=resp.status_code, detail="Screenshot not available from upstream")
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=f"Failed to fetch screenshot: {exc}")
+
+
 # --- Local React UI ---
 
 ROOT = Path(__file__).resolve().parent.parent.parent

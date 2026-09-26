@@ -1,7 +1,7 @@
 import sys
 sys.path.insert(0, ".")
 
-from app.backend.classifier import classify_ioc, refang, defang
+from app.backend.classifier import classify_ioc, normalize_ioc, refang, defang
 
 
 def test_refang_hxxp():
@@ -43,6 +43,11 @@ def test_classify_invalid_ipv4_octets():
 
 def test_classify_url():
     assert classify_ioc("https://evil.com/path") == "url"
+
+
+def test_url_userinfo_is_rejected():
+    assert classify_ioc("https://user:password@evil.com/path") == "unknown"
+    assert normalize_ioc("https://user:password@evil.com/path", expected_type="url").valid is False
 
 
 def test_classify_md5():
@@ -129,6 +134,15 @@ def test_classify_sample_artifacts_without_domain_or_ssdeep_collisions():
     assert classify_ioc("e7d705a328a1e57f") == "unknown"
 
 
+def test_password_digest_requires_explicit_prehashed_input():
+    import hashlib
+    from app.backend.classifier import password_digest
+
+    value = "a" * 40
+    assert password_digest(value) == hashlib.sha1(value.encode()).hexdigest()
+    assert password_digest(value, already_digest=True) == value
+
+
 def test_password_classification():
     from app.backend.classifier import normalize_ioc, SUPPORTED_IOC_TYPES
     assert "password" in SUPPORTED_IOC_TYPES
@@ -148,3 +162,41 @@ def test_password_classification():
     assert res_long_prefix.ioc_type == "password"
     assert res_long_prefix.value == "SecretVaultKey#1"
     assert res_long_prefix.valid is True
+
+    # Bare password auto-detection (credential heuristics)
+    assert classify_ioc("Tr0ub4dor&39X9!Qz") == "password"
+    assert classify_ioc("Summer2024!") == "password"
+    assert classify_ioc("P@ssw0rd123") == "password"
+    assert classify_ioc("password123") == "password"
+    assert classify_ioc("123456") == "password"
+    assert classify_ioc("qwerty") == "password"
+
+
+def test_explicit_type_rejects_invalid_values():
+    assert normalize_ioc("not a domain", expected_type="domain").valid is False
+    assert normalize_ioc("bad", expected_type="md5").valid is False
+    assert normalize_ioc("999.1.1.1", expected_type="ipv4").valid is False
+    assert normalize_ioc("not a url", expected_type="url").valid is False
+    assert normalize_ioc("CVE-nope", expected_type="cve").valid is False
+
+
+def test_password_sha1_requires_a_digest():
+    for value in ("a" * 39, "a" * 41, "z" * 40, ""):
+        assert normalize_ioc(value, expected_type="password_sha1").valid is False
+
+
+def test_password_sha1_prefix_canonicalizes_to_password():
+    result = normalize_ioc(f"password_sha1:{'A' * 40}")
+    assert result.valid is True
+    assert result.value == "a" * 40
+    assert result.ioc_type == "password"
+
+
+def test_password_digest_detector():
+    from app.backend.classifier import is_password_digest
+
+    assert is_password_digest("a" * 40) is True
+    assert is_password_digest("A" * 40) is True
+    assert is_password_digest("a" * 39) is False
+    assert is_password_digest("S3cret!") is False
+    assert is_password_digest("") is False

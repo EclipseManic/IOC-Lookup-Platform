@@ -988,7 +988,7 @@ class TestPipeline:
         assert task.progress == 100.0
         assert task.ioc_type == "ipv4"
         assert task.normalized == "8.8.8.8"
-        assert len(task.stages) == 23
+        assert len(task.stages) == 24
 
     @pytest.mark.asyncio
     async def test_run_analysis_domain(self):
@@ -1028,7 +1028,7 @@ class TestPipeline:
     @pytest.mark.asyncio
     async def test_task_has_stages(self):
         task = await run_analysis("8.8.8.8")
-        assert len(task.stages) == 23
+        assert len(task.stages) == 24
         for stage in task.stages:
             assert stage.status in ("done", "skipped", "pending", "error")
 
@@ -1068,7 +1068,7 @@ class TestPipeline:
         assert d["task_id"] == task.task_id
         assert d["status"] == "done"
         assert d["ioc_value"] == "8.8.8.8"
-        assert len(d["stages"]) == 23
+        assert len(d["stages"]) == 24
 
 
 # Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬

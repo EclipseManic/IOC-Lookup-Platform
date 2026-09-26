@@ -3,7 +3,7 @@ import { useLookup } from "../hooks/useLookup";
 import PipelineProgress from "../components/PipelineProgress";
 import SearchBar from "../components/SearchBar";
 import { SkeletonHeader, SkeletonSourceGrid } from "../components/LoadingSkeleton";
-import { getKeyHealth, type KeyHealthResponse, type LookupResponse } from "../services/api";
+import { getKeyHealth, type BatchResult, type KeyHealthResponse, type LookupResponse } from "../services/api";
 import type { Tool } from "../App";
 import ResultView from "./ResultView";
 import SourceCoveragePanel from "../components/SourceCoveragePanel";
@@ -12,10 +12,35 @@ import History from "./History";
 import Investigations from "./Investigations";
 import Batch from "./Batch";
 
-export default function HomePage({ initialValue = "", tool = null, initialBatchId = "" }: { initialValue?: string; tool?: Tool | null; initialBatchId?: string }) {
-  const { state, submit, reset } = useLookup();
+export default function HomePage({
+  initialValue = "",
+  initialType = "",
+  tool = null,
+  initialBatchId = "",
+  batchResult,
+  historyId,
+  isHistorical = false,
+  batchResultItem,
+  fromBatch = false,
+  autoRescan = false,
+  createdAt,
+}: {
+  initialValue?: string;
+  initialType?: string;
+  tool?: Tool | null;
+  initialBatchId?: string;
+  batchResult?: BatchResult;
+  historyId?: number;
+  isHistorical?: boolean;
+  batchResultItem?: LookupResponse;
+  fromBatch?: boolean;
+  autoRescan?: boolean;
+  createdAt?: string;
+}) {
+  const { state, submit, reset, loadResult, loadStored } = useLookup();
   const submittedRef = useRef<string | null>(null);
   const [keyHealth, setKeyHealth] = useState<KeyHealthResponse | null>(null);
+  const routeSubmissionKey = `${initialType}\u0000${initialValue}`;
 
   useEffect(() => {
     if (tool) return;
@@ -23,16 +48,31 @@ export default function HomePage({ initialValue = "", tool = null, initialBatchI
   }, [tool]);
 
   useEffect(() => {
-    if (initialValue && !tool && submittedRef.current !== initialValue) {
-      submittedRef.current = initialValue;
-      submit(initialValue);
+    if (tool) return;
+    if (batchResultItem) {
+       submittedRef.current = `${initialType}\u0000${batchResultItem.normalized || batchResultItem.input}`;
+      loadResult(batchResultItem, { fromBatch: Boolean(fromBatch), batchId: initialBatchId });
+      return;
     }
-  }, [initialValue, tool, submit]);
+    if (isHistorical || historyId) {
+       submittedRef.current = routeSubmissionKey;
+      loadStored(historyId, initialValue, { isHistorical: true, historyId, scannedAt: createdAt }).then((success) => {
+        if (!success && initialValue) {
+           submit(initialValue, initialType || undefined);
+        }
+      });
+      return;
+    }
+     if (initialValue && submittedRef.current !== routeSubmissionKey) {
+       submittedRef.current = routeSubmissionKey;
+       submit(initialValue, initialType || undefined);
+    }
+  }, [initialValue, initialType, routeSubmissionKey, tool, historyId, isHistorical, batchResultItem, createdAt, initialBatchId, fromBatch, loadResult, loadStored, submit]);
 
-  const handleSearch = useCallback((value: string, iocType?: string) => {
-    submittedRef.current = value;
-    submit(value, iocType);
-    window.dispatchEvent(new CustomEvent("ioc-sync", { detail: { value } }));
+   const handleSearch = useCallback((value: string, iocType?: string, refresh = false) => {
+     submittedRef.current = `${iocType ?? ""}\u0000${value}`;
+    submit(value, iocType, refresh);
+    window.dispatchEvent(new CustomEvent("ioc-sync", { detail: { value, iocType } }));
   }, [submit]);
 
   const panelId = tool ? `panel-${tool}` : "panel-lookup";
@@ -41,7 +81,7 @@ export default function HomePage({ initialValue = "", tool = null, initialBatchI
     return (
       <div id={panelId} role="tabpanel" aria-labelledby={`tab-tool-${tool}`} tabIndex={-1} className="page-enter outline-none">
         {tool === "investigations" && <Investigations />}
-        {tool === "batch" && <Batch initialBatchId={initialBatchId} />}
+        {tool === "batch" && <Batch initialBatchId={initialBatchId} initialResult={batchResult} autoRescan={autoRescan} />}
         {tool === "history" && <History />}
       </div>
     );
@@ -61,10 +101,10 @@ export default function HomePage({ initialValue = "", tool = null, initialBatchI
       </div>
 
       <div className="max-w-3xl mx-auto mt-8 mb-8">
-        <SearchBar onSearch={handleSearch} initialValue={initialValue} disabled={state.status === "loading"} />
+         <SearchBar onSearch={handleSearch} initialValue={initialValue} initialType={initialType} disabled={state.status === "loading"} />
       </div>
 
-      <div className="max-w-6xl mx-auto" aria-live="polite" aria-label="Lookup results">
+      <div className="max-w-[1400px] mx-auto" aria-live="polite" aria-label="Lookup results">
         {state.status === "idle" && (
           <div className="flex flex-col items-center justify-center py-16 text-center text-text-secondary">
             <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.5" className="w-12 h-12 mb-4" aria-hidden="true">
@@ -95,7 +135,11 @@ export default function HomePage({ initialValue = "", tool = null, initialBatchI
         )}
 
         {state.status === "done" && (
-          <ResultView result={state.result as LookupResponse} onNewSearch={(v, type, refresh) => { submit(v, type, refresh); }} />
+          <ResultView
+            result={state.result as LookupResponse}
+            meta={state.meta}
+            onNewSearch={(v, type, refresh) => { handleSearch(v, type, refresh); }}
+          />
         )}
       </div>
 

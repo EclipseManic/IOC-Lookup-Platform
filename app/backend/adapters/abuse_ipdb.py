@@ -2,10 +2,24 @@ import asyncio
 import threading
 import time
 
-import httpx
-
 from app.backend.adapters.base import NormalizedResult, RateLimitConfig, SourceAdapter, is_valid_api_key, retry_after_seconds
+
 from app.backend.config import settings
+from app.backend.logger import get_logger
+
+logger = get_logger("adapter.abuseipdb")
+
+# AbuseIPDB integer category IDs → human-readable threat labels
+ABUSEIPDB_CATEGORIES: dict[int, str] = {
+    1: "DNS Compromise", 2: "DNS Poisoning", 3: "Fraud Orders",
+    4: "DDoS Attack", 5: "FTP Brute-Force", 6: "Ping of Death",
+    7: "Phishing", 8: "Fraud VoIP", 9: "Open Proxy",
+    10: "Web Spam", 11: "Email Spam", 12: "Blog Spam",
+    14: "Port Scan", 15: "Hacking", 16: "SQL Injection",
+    17: "Spoofing", 18: "Brute-Force", 19: "Bad Web Bot",
+    20: "Exploited Host", 21: "Web App Attack", 22: "SSH Brute-Force",
+    23: "IoT Targeted",
+}
 
 
 class AbuseIPDBAdapter(SourceAdapter):
@@ -123,6 +137,7 @@ class AbuseIPDBAdapter(SourceAdapter):
                 params={
                     "ipAddress": ioc_value,
                     "maxAgeInDays": 365,
+                    "verbose": "",  # verbose flag — unlocks reporter comments and category IDs
                 },
                 headers={"Key": self.api_key, "Accept": "application/json"},
                 timeout=15,
@@ -205,10 +220,14 @@ class AbuseIPDBAdapter(SourceAdapter):
         reports_out = []
         for r in reports[:20]:
             if isinstance(r, dict):
+                raw_cats = list(r.get("categories", []) or [])
+                cat_names = [ABUSEIPDB_CATEGORIES.get(c, f"Category {c}") for c in raw_cats if isinstance(c, int)]
                 reports_out.append({
-                    "categories": list(r.get("categories", []) or []),
+                    "categories": raw_cats,
+                    "category_names": cat_names,
                     "comment": r.get("comment", ""),
                     "reported_at": r.get("reportedAt", ""),
+                    "reporter_country": r.get("reporterCountryCode", ""),
                 })
 
         return NormalizedResult(

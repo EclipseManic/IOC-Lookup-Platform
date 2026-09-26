@@ -32,9 +32,18 @@ async def client(tmp_path):
 
     app.dependency_overrides[get_db] = override_get_db
     transport = ASGITransport(app=app)
-    async with AsyncClient(transport=transport, base_url="http://test") as c:
+    async with AsyncClient(transport=transport, base_url="http://localhost") as c:
         yield c
     app.dependency_overrides.clear()
+    from app.backend.batch import _batch_runners, shutdown_batch_tasks
+    await shutdown_batch_tasks()
+    runners = list(_batch_runners.values())
+    for runner in runners:
+        if not runner.done():
+            runner.cancel()
+    if runners:
+        await asyncio.gather(*runners, return_exceptions=True)
+    _batch_runners.clear()
     await engine.dispose()
 
 
@@ -67,7 +76,7 @@ def _monkey_pipeline(monkeypatch):
     from app.backend import batch as batch_mod
     from app.backend import pipeline as pipeline_mod
 
-    async def fake_run_analysis(ioc_value, task_id=None, fp_override=False, ioc_type_override=None):
+    async def fake_run_analysis(ioc_value, task_id=None, fp_override=False, ioc_type_override=None, bypass_cache=False, password_prehashed=False):
         task = _make_task(ioc_value)
         task.task_id = task_id or task.task_id
         if ioc_type_override:
@@ -81,10 +90,73 @@ def _monkey_pipeline(monkeypatch):
     yield
 
 
+@pytest.fixture(autouse=True)
+def _seed_export_task():
+    from app.backend import pipeline as pipeline_mod
+
+    task = _make_task()
+    with pipeline_mod._dict_lock:
+        pipeline_mod._tasks[task.task_id] = task
+    yield
+
+
 async def test_health(client):
     r = await client.get("/api/health")
     assert r.status_code == 200
     assert "status" in r.json()
+
+
+async def test_rejects_untrusted_host(client):
+    response = await client.get("/api/health", headers={"Host": "evil.example"})
+    assert response.status_code == 400
+
+
+async def test_rejects_untrusted_browser_origin(client):
+    response = await client.get("/api/health", headers={"Origin": "https://evil.example"})
+    assert response.status_code == 403
+
+
+async def test_network_mode_fails_closed_without_api_keys(monkeypatch):
+    monkeypatch.setattr(main_mod.settings, "allow_network_bind", True)
+    monkeypatch.setattr(main_mod.settings, "api_keys", "")
+    monkeypatch.setattr(main_mod.settings, "trust_proxy", True)
+    monkeypatch.setattr(main_mod.settings, "trusted_proxy_hosts", "203.0.113.10")
+    transport = ASGITransport(app=app, client=("203.0.113.10", 40000))
+    async with AsyncClient(transport=transport, base_url="http://localhost") as remote:
+        response = await remote.get("/api/recent", headers={"X-Forwarded-Proto": "https"})
+    assert response.status_code == 503
+    assert response.text == "Authentication is not configured"
+
+
+async def test_network_mode_rejects_plain_http(monkeypatch):
+    monkeypatch.setattr(main_mod.settings, "allow_network_bind", True)
+    monkeypatch.setattr(main_mod.settings, "api_keys", "network-test-key-123456")
+    transport = ASGITransport(app=app, client=("203.0.113.10", 40000))
+    async with AsyncClient(transport=transport, base_url="http://localhost") as remote:
+        response = await remote.get("/api/health")
+    assert response.status_code == 400
+    assert response.text == "HTTPS is required for network access"
+
+
+async def test_sensitive_api_responses_are_not_cacheable(client):
+    response = await client.get("/api/recent")
+    assert response.status_code == 200
+    assert response.headers["cache-control"] == "no-store"
+
+
+async def test_screenshot_proxy_is_not_publicly_cacheable(client, monkeypatch):
+    class FakeResponse:
+        status_code = 200
+        content = b"png"
+
+    class FakeClient:
+        async def get(self, *args, **kwargs):
+            return FakeResponse()
+
+    monkeypatch.setattr(main_mod, "_get_http_client", lambda: FakeClient())
+    response = await client.get("/api/screenshot?scan_id=abcdefghij")
+    assert response.status_code == 200
+    assert response.headers["cache-control"] == "no-store"
 
 
 async def test_configured_api_key_protects_private_routes_but_not_health(client, monkeypatch):
@@ -129,7 +201,7 @@ async def test_root(client):
 
 
 async def test_lookup_flow(client):
-    r = await client.post("/api/lookup", json={"ioc": "8.8.8.8"})
+    r = await client.post("/api/lookup", json={"ioc": "8.8.8.8", "task_id": "t1"})
     assert r.status_code == 200
     data = r.json()
     assert "task_id" in data
@@ -159,13 +231,130 @@ async def test_lookup_accepts_explicit_ioc_type(client):
     assert r.json()["ioc_type"] == "service_name"
 
 
+async def test_lookup_accepts_prehashed_password_contract(client, monkeypatch):
+    captured = {}
+
+    async def capture_run_analysis(ioc_value, task_id=None, fp_override=False, ioc_type_override=None, bypass_cache=False, password_prehashed=False):
+        captured["value"] = ioc_value
+        captured["type"] = ioc_type_override
+        captured["prehashed"] = password_prehashed
+        return _make_task(ioc_value)
+
+    monkeypatch.setattr(main_mod, "run_analysis", capture_run_analysis)
+    digest = "a" * 40
+    response = await client.post("/api/lookup", json={"ioc": digest, "ioc_type": "password_sha1"})
+    assert response.status_code == 200
+    await asyncio.sleep(0)
+    assert captured == {"value": digest, "type": "password", "prehashed": True}
+
+
+@pytest.mark.parametrize("value", ["abcdefghijkl", r"Global\\MyMutex", r"\\\\host\\pipe\\EvilPipe", r"HKLM\\Software\\Evil"])
+async def test_lookup_rejects_untyped_host_artifact(client, value):
+    response = await client.post("/api/lookup", json={"ioc": value})
+    assert response.status_code == 400
+    assert "explicit type" in response.json()["detail"]
+
+
+async def test_lookup_rejects_invalid_prehashed_password(client):
+    response = await client.post("/api/lookup", json={"ioc": "z" * 40, "ioc_type": "password_sha1"})
+    assert response.status_code == 400
+
+
+async def test_password_prefix_with_digest_is_not_double_hashed(client, monkeypatch):
+    captured = {}
+
+    async def capture_run_analysis(ioc_value, task_id=None, fp_override=False, ioc_type_override=None, bypass_cache=False, password_prehashed=False):
+        captured["value"] = ioc_value
+        return _make_task(ioc_value)
+
+    monkeypatch.setattr(main_mod, "run_analysis", capture_run_analysis)
+    digest = "d" * 40
+    response = await client.post("/api/lookup", json={"ioc": f"password:{digest}"})
+    assert response.status_code == 200
+    await asyncio.sleep(0)
+    assert captured["value"] == digest
+
+
+async def test_typed_password_sha1_and_result_marker(client, monkeypatch):
+    captured = {}
+
+    async def capture_run_analysis(ioc_value, task_id=None, fp_override=False, ioc_type_override=None, bypass_cache=False, password_prehashed=False):
+        captured["value"] = ioc_value
+        captured["prehashed"] = password_prehashed
+        task = _make_task(ioc_value)
+        task.task_id = task_id or task.task_id
+        task.ioc_type = "password"
+        task.password_prehashed = password_prehashed
+        from app.backend import pipeline as pipeline_mod
+        with pipeline_mod._dict_lock:
+            pipeline_mod._tasks[task.task_id] = task
+        return task
+
+    monkeypatch.setattr(main_mod, "run_analysis", capture_run_analysis)
+    digest = "b" * 40
+    response = await client.post("/api/lookup", json={"ioc": f"password_sha1:{digest}"})
+    assert response.status_code == 200
+    await asyncio.sleep(0)
+    await asyncio.sleep(0)
+    result = await client.get(f"/api/tasks/{response.json()['task_id']}/result")
+    assert result.status_code == 200
+    assert captured == {"value": digest, "prehashed": True}
+    assert result.json()["ioc_type"] == "password"
+    assert result.json()["password_prehashed"] is True
+
+
+async def test_save_rejects_untyped_host_artifact(client):
+    response = await client.post("/api/save", json={"ioc": "abcdefghijkl"})
+    assert response.status_code == 400
+
+
+async def test_save_accepts_explicit_host_artifact_type(client):
+    response = await client.post("/api/save", json={"ioc": "service_name:W32Time"})
+    assert response.status_code == 200
+
+
+async def test_save_accepts_typed_prehashed_password(client):
+    digest = "c" * 40
+    response = await client.post("/api/save", json={"ioc": f"password_sha1:{digest}"})
+    assert response.status_code == 200
+    recent = await client.get("/api/recent")
+    assert any(item["value"] == digest and item["ioc_type"] == "password" for item in recent.json())
+
+
+async def test_feedback_rejects_untyped_host_artifact(client):
+    response = await client.post("/api/feedback", json={"ioc": "abcdefghijkl", "feedback": "false_positive"})
+    assert response.status_code == 400
+
+
+async def test_lookup_refresh_forwards_cache_bypass(client, monkeypatch):
+    calls = []
+
+    async def capture_run_analysis(ioc_value, task_id=None, fp_override=False, ioc_type_override=None, bypass_cache=False, password_prehashed=False):
+        calls.append(bypass_cache)
+        return _make_task(ioc_value)
+
+    monkeypatch.setattr(main_mod, "run_analysis", capture_run_analysis)
+    response = await client.post("/api/lookup", json={"ioc": "8.8.8.8", "refresh": True})
+    assert response.status_code == 200
+    await asyncio.sleep(0)
+    assert calls == [True]
+
+
 async def test_lookup_invalid_ioc(client):
     r = await client.post("/api/lookup", json={"ioc": ""})
     assert r.status_code == 400
 
 
+async def test_lookup_rejects_url_userinfo(client):
+    response = await client.post(
+        "/api/lookup",
+        json={"ioc": "https://user:password@example.com/path", "ioc_type": "url"},
+    )
+    assert response.status_code == 400
+
+
 async def test_save_endpoint(client):
-    r = await client.post("/api/save", json={"ioc": "8.8.8.8"})
+    r = await client.post("/api/save", json={"ioc": "8.8.8.8", "task_id": "t1"})
     assert r.status_code == 200
 
 
@@ -184,49 +373,66 @@ async def test_feedback_crud(client):
     assert delete.status_code == 200
 
 
+async def test_network_mode_blocks_global_feedback_without_explicit_opt_in(client, monkeypatch):
+    monkeypatch.setattr(main_mod.settings, "allow_network_bind", True)
+    monkeypatch.setattr(main_mod.settings, "api_keys", "network-test-key-123456")
+    monkeypatch.setattr(main_mod.settings, "allow_global_feedback", False)
+    monkeypatch.setattr(main_mod.settings, "trust_proxy", True)
+    monkeypatch.setattr(main_mod.settings, "trusted_proxy_hosts", "127.0.0.1")
+    response = await client.post(
+        "/api/feedback",
+        json={"ioc": "8.8.8.8", "feedback": "false_positive"},
+        headers={
+            "X-API-Key": "network-test-key-123456",
+            "X-Forwarded-Proto": "https",
+        },
+    )
+    assert response.status_code == 403
+
+
 async def test_cache_clear(client):
     r = await client.post("/api/cache/clear")
     assert r.status_code == 200
 
 
 async def test_export_report(client):
-    r = await client.post("/api/export/report", json={"ioc": "8.8.8.8"})
+    r = await client.post("/api/export/report", json={"ioc": "8.8.8.8", "task_id": "t1"})
     assert r.status_code == 200
     assert "text/html" in r.headers["content-type"]
 
 
 async def test_export_stix(client):
-    r = await client.post("/api/export/stix", json={"ioc": "8.8.8.8"})
+    r = await client.post("/api/export/stix", json={"ioc": "8.8.8.8", "task_id": "t1"})
     assert r.status_code == 200
     assert r.json()["type"] == "bundle"
     assert "objects" in r.json()
 
 
 async def test_export_misp(client):
-    r = await client.post("/api/export/misp", json={"ioc": "8.8.8.8"})
+    r = await client.post("/api/export/misp", json={"ioc": "8.8.8.8", "task_id": "t1"})
     assert r.status_code == 200
     assert r.json()["Event"]["uuid"]
 
 
 async def test_export_siem_ok(client):
-    r = await client.post("/api/export/siem", json={"ioc": "8.8.8.8", "format": "splunk"})
+    r = await client.post("/api/export/siem", json={"ioc": "8.8.8.8", "task_id": "t1", "format": "splunk"})
     assert r.status_code == 200
     assert "text/plain" in r.headers["content-type"]
 
 
 async def test_export_siem_bad_format(client):
-    r = await client.post("/api/export/siem", json={"ioc": "8.8.8.8", "format": "cef"})
+    r = await client.post("/api/export/siem", json={"ioc": "8.8.8.8", "task_id": "t1", "format": "cef"})
     assert r.status_code == 400
 
 
 async def test_export_siem_ecs(client):
-    r = await client.post("/api/export/siem", json={"ioc": "8.8.8.8", "format": "ecs"})
+    r = await client.post("/api/export/siem", json={"ioc": "8.8.8.8", "task_id": "t1", "format": "ecs"})
     assert r.status_code == 200
     assert "application/x-ndjson" in r.headers["content-type"]
 
 
 async def test_export_csv(client):
-    r = await client.post("/api/export/csv", json={"ioc": "8.8.8.8"})
+    r = await client.post("/api/export/csv", json={"ioc": "8.8.8.8", "task_id": "t1"})
     assert r.status_code == 200
     assert "text/csv" in r.headers["content-type"]
 
@@ -235,9 +441,12 @@ async def test_batch_flow(client):
     r = await client.post("/api/batch", json={"iocs": ["8.8.8.8", "1.1.1.1"]})
     assert r.status_code == 200
     batch_id = r.json()["batch_id"]
-    await asyncio.sleep(0)
-    poll = await client.get(f"/api/batch/{batch_id}")
-    assert poll.status_code == 200
+    for _ in range(50):
+        poll = await client.get(f"/api/batch/{batch_id}")
+        assert poll.status_code == 200
+        if poll.json().get("status") == "done":
+            break
+        await asyncio.sleep(0.05)
     result = await client.get(f"/api/batch/{batch_id}/result")
     assert result.status_code == 200
     assert result.json()["total"] == 2
@@ -271,7 +480,23 @@ async def test_batch_status_polling_is_not_rate_limited(client, monkeypatch):
             return False
 
     monkeypatch.setattr(main_mod, "get_rate_limiter", lambda: AlwaysLimited())
-    r = await client.get("/api/batch/not-a-real-batch")
-    # The request reaches the batch route; it is not rejected by the HTTP
-    # submission limiter before route handling.
+    r = await client.get("/api/batch/nonexistent_batch_id")
     assert r.status_code == 404
+
+
+async def test_stored_recent_and_batch_ioc_endpoints(client):
+    # 1. Test stored lookup when non-existent
+    r_missing = await client.get("/api/lookup/stored?ioc=nonexistent.example.com")
+    assert r_missing.status_code == 404
+
+    # 2. Run a batch and test single IOC retrieval from batch
+    r_batch = await client.post("/api/batch", json={"iocs": ["1.1.1.1"]})
+    assert r_batch.status_code == 200
+    batch_id = r_batch.json()["batch_id"]
+    await client.get(f"/api/batch/{batch_id}/result")
+
+    r_single = await client.get(f"/api/batch/{batch_id}/ioc/1.1.1.1")
+    assert r_single.status_code == 200
+    single_data = r_single.json()
+    assert single_data["input"] == "1.1.1.1"
+    assert "composite" in single_data

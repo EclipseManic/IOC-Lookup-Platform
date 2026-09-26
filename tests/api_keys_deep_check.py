@@ -389,11 +389,7 @@ async def probe(service: dict, key: str) -> dict:
             if service.get("headers_fn"):
                 kwargs["headers"] = service["headers_fn"](key)
 
-            try:
-                resp = await client.request(service["method"], service["url"], **kwargs)
-            except httpx.ConnectError:
-                async with httpx.AsyncClient(verify=False, timeout=REQUEST_TIMEOUT) as fb_client:
-                    resp = await fb_client.request(service["method"], service["url"], **kwargs)
+            resp = await client.request(service["method"], service["url"], **kwargs)
             result["status_code"] = resp.status_code
             result["took_ms"] = int((time.monotonic() - started) * 1000)
 
