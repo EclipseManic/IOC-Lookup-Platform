@@ -1,19 +1,67 @@
 import asyncio
 import json
 import time
+from datetime import datetime
 
-from app.backend.adapters.base import NormalizedResult, RateLimitConfig, SourceAdapter, is_valid_api_key, retry_after_seconds
+from app.backend.adapters._http import MalformedResponse, describe_exception, http_failure, malformed, read_json
+from app.backend.adapters._matching import host_of, indicator_equals
+from app.backend.adapters.base import NormalizedResult, RateLimitConfig, SourceAdapter, is_valid_api_key
 from app.backend.config import settings
 from app.backend.logger import get_logger
 
 logger = get_logger("adapter.urlscan_io")
+
+_MAX_RELATED = 20
+
+
+def _parse_dt(value) -> datetime | None:
+    if not value:
+        return None
+    try:
+        return datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+    except ValueError:
+        return None
+
+
+def _overall_verdict(entry: dict) -> dict:
+    for container in (entry.get("verdicts"), (entry.get("result") if isinstance(entry.get("result"), dict) else {}).get("verdicts")):
+        if isinstance(container, dict) and isinstance(container.get("overall"), dict):
+            return container["overall"]
+    return {}
+
+
+def _scan_is_about(entry: dict, ioc_value: str, ioc_type: str) -> bool:
+    """True when the scan was *of* the queried indicator.
+
+    urlscan.io search matches the final page, so a scan of an unrelated
+    (possibly malicious) URL that redirected to the queried page is returned
+    too.  Only the submitted target may carry a verdict for the IOC.
+    """
+    task = entry.get("task") if isinstance(entry.get("task"), dict) else {}
+    page = entry.get("page") if isinstance(entry.get("page"), dict) else {}
+    task_url = str(task.get("url") or "")
+    if ioc_type == "url":
+        if task_url:
+            return indicator_equals(task_url, ioc_value, "url")
+        return indicator_equals(str(page.get("url") or ""), ioc_value, "url")
+    if ioc_type == "domain":
+        task_host = str(task.get("domain") or "") or host_of(task_url)
+        page_host = str(page.get("domain") or "")
+        if task_host and not indicator_equals(task_host, ioc_value, "domain"):
+            return False
+        return indicator_equals(page_host or task_host, ioc_value, "domain")
+    return False
 
 
 class UrlScanIOAdapter(SourceAdapter):
     name = "urlscan.io"
     supported_types = ["domain", "url"]
     public_without_key = True
-    rate_limit = RateLimitConfig(requests_per_minute=10, max_retries=1, timeout_seconds=10.0)
+    produces_reputation = True
+    produces_infrastructure_context = True
+    produces_relationships = True
+    # Free API: search 120/min and 1,000/hour; public scans 60/min, 500/hour.
+    rate_limit = RateLimitConfig(requests_per_minute=30, requests_per_day=1000, max_retries=1, timeout_seconds=10.0)
     SCAN_POLL_ATTEMPTS = 7
     SCAN_POLL_DELAY = 2.0
 
@@ -31,8 +79,9 @@ class UrlScanIOAdapter(SourceAdapter):
             )
             if resp.status_code in (200, 201):
                 return resp.json().get("uuid")
+            logger.info("urlscan.io scan submission for %s returned HTTP %s", ioc_value, resp.status_code)
         except Exception as exc:
-            logger.warning(f"urlscan.io scan submission failed for {ioc_value}: {exc}")
+            logger.warning("urlscan.io scan submission failed for %s: %s", ioc_value, describe_exception(exc))
         return None
 
     async def _poll_scan(self, scan_uuid: str, timeout: float = 15.0) -> dict | None:
@@ -49,298 +98,200 @@ class UrlScanIOAdapter(SourceAdapter):
                 if resp.status_code == 200:
                     return resp.json()
             except Exception as exc:
-                logger.debug("urlscan.io scan poll attempt failed: %s", exc)
+                logger.debug("urlscan.io scan poll attempt failed: %s", describe_exception(exc))
             if time.time() < deadline:
                 await asyncio.sleep(self.SCAN_POLL_DELAY)
         return None
 
     async def lookup(self, ioc_value: str, ioc_type: str) -> NormalizedResult:
         client = self._get_client()
-        headers = {"API-Key": self.api_key} if is_valid_api_key(self.api_key) else {}
+        key_sent = is_valid_api_key(self.api_key)
+        headers = {"API-Key": self.api_key} if key_sent else {}
         query_value = json.dumps(ioc_value, ensure_ascii=False)
         resp = await client.get(
                 "https://urlscan.io/api/v1/search/",
-                params={"q": f"page.{ioc_type}:{query_value}", "size": 5},
+                params={"q": f"page.{ioc_type}:{query_value}", "size": 10},
                 headers=headers or None,
                 timeout=15,
             )
 
-        if resp.status_code == 429:
-            return NormalizedResult(
-                ioc=ioc_value, ioc_type=ioc_type, source=self.name,
-                verdict="unknown", tags=["rate_limited"], http_status=resp.status_code,
-                retry_after_seconds=retry_after_seconds(resp),
-            )
-        if resp.status_code == 401:
-            return NormalizedResult(
-                ioc=ioc_value, ioc_type=ioc_type, source=self.name,
-                verdict="error", tags=["invalid_api_key"],
-            )
-        if resp.status_code != 200:
-            return NormalizedResult(
-                ioc=ioc_value, ioc_type=ioc_type, source=self.name,
-                verdict="error", tags=[f"http_{resp.status_code}"],
-            )
-
-        data = resp.json()
+        failed = http_failure(self.name, ioc_value, ioc_type, resp, key_sent=key_sent)
+        if failed is not None:
+            return failed
+        try:
+            data = read_json(resp)
+        except MalformedResponse as exc:
+            return malformed(self.name, ioc_value, ioc_type, exc.reason, resp.status_code)
         if not isinstance(data, dict):
-            return NormalizedResult(
-                ioc=ioc_value, ioc_type=ioc_type, source=self.name,
-                verdict="error", tags=["unexpected_response"],
-            )
+            return malformed(self.name, ioc_value, ioc_type)
 
         results = data.get("results", [])
         if not isinstance(results, list):
             results = []
+        results = [entry for entry in results if isinstance(entry, dict)]
+        exact = [entry for entry in results if _scan_is_about(entry, ioc_value, ioc_type)]
+        other = [entry for entry in results if entry not in exact]
 
-        has_cached_results = bool(results)
-
-        malicious = 0
-        all_tags = set()
-        all_categories = set()
-        first = None
-        last = None
-        related = []
-        samples = []
-        total = len(results)
-
-        page_domains = set()
-        page_ips = set()
-        page_countries = set()
-        page_asns = set()
-        screenshot_url = ""
-
-        # Rich page metadata for WebPreviewInfo
-        page_title = ""
-        page_server = ""
-        page_language = ""
-        domain_age_days: int | None = None
-        tls_issuer = ""
-        tls_valid_days: int | None = None
-        page_asn_name = ""
-        detected_brands: list[str] = []
-        detected_technologies: list[str] = []
-        page_mime_type = ""
-        result_scan_uuid = ""
-
-        for entry in results:
-            if not isinstance(entry, dict):
-                continue
-
-            page = entry.get("page", {})
-            if not isinstance(page, dict):
-                page = {}
-
-            dom = page.get("domain", "")
-            if dom:
-                page_domains.add(dom)
-            ip = page.get("ip", "")
-            if ip:
-                page_ips.add(ip)
-            country = page.get("country", "")
-            if country:
-                page_countries.add(country)
-            asn = page.get("asn", "")
-            if asn:
-                page_asns.add(asn)
-            server = page.get("server", "")
-            if server:
-                all_tags.add(f"server: {server}")
-                if not page_server:
-                    page_server = server
-
-            if not screenshot_url:
-                screenshot_url = entry.get("screenshot", "") or page.get("screenshot", "") or ""
-
-            # Extract rich page metadata from the first result
-            if not page_title:
-                page_title = page.get("title", "") or ""
-            if not page_language:
-                page_language = page.get("language", "") or ""
-            if domain_age_days is None:
-                age = page.get("domainAgeDays")
-                if age is not None:
-                    try:
-                        domain_age_days = int(age)
-                    except (ValueError, TypeError):
-                        pass
-            if not tls_issuer:
-                tls_issuer = page.get("tlsIssuer", "") or ""
-            if tls_valid_days is None:
-                tvd = page.get("tlsValidDays")
-                if tvd is not None:
-                    try:
-                        tls_valid_days = int(tvd)
-                    except (ValueError, TypeError):
-                        pass
-            if not page_asn_name:
-                page_asn_name = page.get("asnname", "") or ""
-            if not page_mime_type:
-                page_mime_type = page.get("mimeType", "") or ""
-
-            # Capture scan UUID from the task for screenshot proxying
-            task = entry.get("task", {})
-            if isinstance(task, dict) and not result_scan_uuid:
-                result_scan_uuid = task.get("uuid", "") or ""
-
-            # Extract brand detection from verdicts
-            result_entry = entry.get("result", {})
-            if isinstance(result_entry, dict):
-                brands_data = result_entry.get("verdicts", {}).get("overall", {}).get("brands", [])
-                if isinstance(brands_data, list):
-                    for brand in brands_data:
-                        if isinstance(brand, str) and brand not in detected_brands:
-                            detected_brands.append(brand)
-                        elif isinstance(brand, dict):
-                            bname = brand.get("name", "")
-                            if bname and bname not in detected_brands:
-                                detected_brands.append(bname)
-
-            lists_data = entry.get("lists", {})
-            if isinstance(lists_data, dict):
-                for list_ip in (lists_data.get("ips", []) or []):
-                    related.append((list_ip, "related_ip"))
-                for list_domain in (lists_data.get("domains", []) or []):
-                    related.append((list_domain, "related_domain"))
-                for h in (lists_data.get("hashes", []) or []):
-                    if isinstance(h, str):
-                        samples.append(h)
-                        related.append((h, "related_hash"))
-                for cert in (lists_data.get("certificates", []) or []):
-                    if isinstance(cert, dict):
-                        cn = cert.get("subjectName", "")
-                        if cn:
-                            all_tags.add(f"cert_cn:{cn}")
-
-            if not isinstance(result_entry, dict):
-                result_entry = {}
-            overall = result_entry.get("verdicts", {}).get("overall", {})
-            if not overall:
-                overall = entry.get("verdicts", {}).get("overall", {})
+        malicious_scans = 0
+        max_score = 0
+        brands: list[str] = []
+        tags: set[str] = set()
+        categories: set[str] = set()
+        first = last = None
+        for entry in exact:
+            overall = _overall_verdict(entry)
             if overall.get("malicious"):
-                malicious += 1
-
-            tags = page.get("tags", [])
-            if isinstance(tags, list):
-                all_tags.update(tags)
-
-            cats = entry.get("categories", [])
-            if isinstance(cats, list):
-                all_categories.update(cats)
-
-            if isinstance(task, dict):
-                url = task.get("url", "")
-                if url and url.lower() != ioc_value.lower():
-                    related.append((url, "related_scan"))
-
-            score = overall.get("score", 0)
-            if score:
-                samples.append(f"Score: {score}")
-
-            submitted = task.get("time") if isinstance(task, dict) else None
+                malicious_scans += 1
+            score = overall.get("score")
+            if isinstance(score, (int, float)) and score > max_score:
+                max_score = score
+            for brand in overall.get("brands", []) or []:
+                name = brand.get("name") if isinstance(brand, dict) else brand
+                if isinstance(name, str) and name and name not in brands:
+                    brands.append(name)
+            for tag in overall.get("tags", []) or []:
+                if isinstance(tag, str) and tag:
+                    tags.add(tag)
+            for category in overall.get("categories", []) or entry.get("categories", []) or []:
+                if isinstance(category, str) and category:
+                    categories.add(category)
+            task = entry.get("task") if isinstance(entry.get("task"), dict) else {}
+            submitted = _parse_dt(task.get("time"))
             if submitted:
-                try:
-                    from datetime import datetime
-                    dt = datetime.fromisoformat(submitted.replace("Z", "+00:00"))
-                    if first is None or dt < first:
-                        first = dt
-                    if last is None or dt > last:
-                        last = dt
-                except Exception as exc:
-                    logger.debug("urlscan.io date parse failed: %s", exc)
+                first = submitted if first is None or submitted < first else first
+                last = submitted if last is None or submitted > last else last
 
-        for d in page_domains:
-            all_tags.add(f"domain: {d}")
-        for c in page_countries:
-            all_tags.add(f"country: {c}")
-        for a in page_asns:
-            all_tags.add(f"asn: {a}")
-        if screenshot_url:
-            samples.insert(0, f"Screenshot: {screenshot_url}")
+        # Page/infrastructure context from the most recent exact scan (or,
+        # failing that, the most recent returned scan).
+        reference = (exact or results or [{}])[0]
+        page = reference.get("page") if isinstance(reference.get("page"), dict) else {}
+        task = reference.get("task") if isinstance(reference.get("task"), dict) else {}
+        result_scan_uuid = str(task.get("uuid") or reference.get("_id") or "")
+        screenshot_url = reference.get("screenshot", "") or ""
+        report_url = task.get("reportURL") or (f"https://urlscan.io/result/{result_scan_uuid}/" if result_scan_uuid else "")
 
-        is_malicious = malicious > 0
-        score_val = min(malicious / total, 1.0) if total > 0 else 0.0
-        confidence = "high" if malicious >= 3 else "medium" if malicious > 0 else "low"
+        related: list[tuple[str, str]] = []
+        for entry in results:
+            entry_page = entry.get("page") if isinstance(entry.get("page"), dict) else {}
+            ip = entry_page.get("ip")
+            if ip and (str(ip), "hosted_on") not in related:
+                related.append((str(ip), "hosted_on"))
+        for entry in other:
+            entry_task = entry.get("task") if isinstance(entry.get("task"), dict) else {}
+            if entry_task.get("url"):
+                related.append((str(entry_task["url"]), "scan_redirected_to_target"))
+        related = related[:_MAX_RELATED]
 
-        report_url = ""
-        if results and isinstance(results[0], dict):
-            task = results[0].get("task", {})
-            if isinstance(task, dict):
-                report_url = task.get("reportURL", "") or task.get("screenshotURL", "") or ""
-        if screenshot_url and not report_url:
-            report_url = screenshot_url
+        scans_summary = []
+        for entry in results[:10]:
+            entry_task = entry.get("task") if isinstance(entry.get("task"), dict) else {}
+            entry_page = entry.get("page") if isinstance(entry.get("page"), dict) else {}
+            overall = _overall_verdict(entry)
+            scans_summary.append({
+                "uuid": entry_task.get("uuid") or entry.get("_id"),
+                "time": entry_task.get("time"),
+                "task_url": str(entry_task.get("url") or "")[:300],
+                "page_url": str(entry_page.get("url") or "")[:300],
+                "page_domain": entry_page.get("domain"),
+                "page_ip": entry_page.get("ip"),
+                "exact_target": entry in exact,
+                "malicious": overall.get("malicious"),
+                "score": overall.get("score"),
+            })
 
         scan_uuid = None
         scan_completed = False
-        if not has_cached_results and is_valid_api_key(self.api_key) and settings.enable_public_url_submission:
+        active_malicious = False
+        if not results and key_sent and settings.enable_public_url_submission:
             scan_uuid = await self._submit_scan(ioc_value)
         if scan_uuid:
-            all_tags.add("active_scan_submitted")
+            tags.add("active_scan_submitted")
             active = await self._poll_scan(scan_uuid)
             if active:
                 scan_completed = True
-                all_tags.add("active_scan_completed")
+                tags.add("active_scan_completed")
                 verdicts = active.get("verdicts", {})
-                if isinstance(verdicts, dict):
-                    overall = verdicts.get("overall", {})
-                    if isinstance(overall, dict) and overall.get("malicious"):
-                        is_malicious = True
-                        score_val = max(score_val, overall.get("score", 0) / 100.0)
-                page = active.get("page", {})
-                if isinstance(page, dict):
-                    if page.get("domain"):
-                        all_tags.add(f"active_domain:{page['domain']}")
-                    if page.get("ip"):
-                        all_tags.add(f"active_ip:{page['ip']}")
-                    if page.get("country"):
-                        all_tags.add(f"active_country:{page['country']}")
-                    if page.get("asn"):
-                        all_tags.add(f"active_asn:{page['asn']}")
-                    if page.get("server"):
-                        all_tags.add(f"active_server:{page['server']}")
+                overall = verdicts.get("overall", {}) if isinstance(verdicts, dict) else {}
+                if isinstance(overall, dict) and overall.get("malicious"):
+                    active_malicious = True
+                    score = overall.get("score")
+                    if isinstance(score, (int, float)):
+                        max_score = max(max_score, score)
+                active_page = active.get("page") if isinstance(active.get("page"), dict) else {}
+                if active_page:
+                    page = active_page
                 if not screenshot_url:
-                    screenshot_url = active.get("screenshot") or active.get("page", {}).get("screenshot", "")
-                if screenshot_url:
-                    report_url = f"https://urlscan.io/result/{scan_uuid}/"
-                if not result_scan_uuid:
-                    result_scan_uuid = scan_uuid
+                    screenshot_url = active.get("screenshot") or ""
+                report_url = f"https://urlscan.io/result/{scan_uuid}/"
+                result_scan_uuid = result_scan_uuid or scan_uuid
 
-        if not is_malicious and not has_cached_results and not scan_completed:
+        raw_data = {
+            "total_results": data.get("total"),
+            "returned_scans": len(results),
+            "exact_scans": len(exact),
+            "malicious_exact_scans": malicious_scans,
+            "scans": scans_summary,
+            "page": {
+                "domain": page.get("domain"),
+                "ip": page.get("ip"),
+                "asn": page.get("asn"),
+                "asnname": page.get("asnname"),
+                "country": page.get("country"),
+                "server": page.get("server"),
+            },
+            "web_preview": {
+                "screenshot_url": screenshot_url,
+                "page_title": page.get("title", "") or "",
+                "server": page.get("server", "") or "",
+                "language": page.get("language", "") or "",
+                "domain_age_days": page.get("domainAgeDays") if isinstance(page.get("domainAgeDays"), int) else None,
+                "tls_issuer": page.get("tlsIssuer", "") or "",
+                "tls_valid_days": page.get("tlsValidDays") if isinstance(page.get("tlsValidDays"), int) else None,
+                "asn_name": page.get("asnname", "") or "",
+                "detected_brands": brands,
+                "detected_technologies": [],
+                "mime_type": page.get("mimeType", "") or "",
+                "scan_uuid": result_scan_uuid,
+            },
+        }
+
+        if not exact and not scan_completed:
+            summary = "No scan of this exact indicator"
+            if results:
+                summary += f"; {len(results)} scan(s) of other targets that reached it kept as context"
             return NormalizedResult(
                 ioc=ioc_value, ioc_type=ioc_type, source=self.name,
-                verdict="unknown", raw_score=0.0,
+                verdict="unknown", provider_verdict="not_found",
+                execution_state="not_found", status="not_found",
+                related_iocs=related, provider_summary=summary,
+                source_link=report_url or None, raw_data=raw_data,
             )
 
+        if malicious_scans or active_malicious:
+            verdict = "malicious"
+            confidence = "high" if malicious_scans >= 3 else "medium"
+        else:
+            # urlscan.io only flags scans it classifies as malicious; an
+            # unflagged scan is "no detection", not an assertion of safety.
+            verdict = "undetected"
+            confidence = "low"
+        scanned = len(exact) + (1 if scan_completed else 0)
         return NormalizedResult(
             ioc=ioc_value,
             ioc_type=ioc_type,
             source=self.name,
-            verdict="malicious" if is_malicious else "clean",
+            verdict=verdict,
             confidence=confidence,
-            raw_score=round(score_val, 4),
-            tags=sorted(all_tags),
-            categories=sorted(all_categories),
+            raw_score=round(min(max_score / 100.0, 1.0), 4) if max_score else (1.0 if verdict == "malicious" else 0.0),
+            tags=sorted(tags)[:10],
+            categories=sorted(categories),
             first_seen=first,
             last_seen=last,
             related_iocs=related,
-            source_link=report_url,
-            reports_count=total,
-            samples=samples[:10],
-            raw_data={
-                **data,
-                "web_preview": {
-                    "screenshot_url": screenshot_url,
-                    "page_title": page_title,
-                    "server": page_server,
-                    "language": page_language,
-                    "domain_age_days": domain_age_days,
-                    "tls_issuer": tls_issuer,
-                    "tls_valid_days": tls_valid_days,
-                    "asn_name": page_asn_name,
-                    "detected_brands": detected_brands,
-                    "detected_technologies": detected_technologies,
-                    "mime_type": page_mime_type,
-                    "scan_uuid": result_scan_uuid,
-                },
-            },
+            source_link=report_url or None,
+            reports_count=scanned,
+            provider_summary=(
+                f"{malicious_scans + (1 if active_malicious else 0)} of {scanned} scan(s) of this indicator flagged malicious"
+            ),
+            raw_data=raw_data,
         )

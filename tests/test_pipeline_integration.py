@@ -186,11 +186,13 @@ async def test_pipeline_runs_public_adapter_without_api_key(disable_cache_rate_l
 
 
 @pytest.mark.asyncio
-async def test_rate_limit_waiting_respects_the_retry_budget(disable_cache_rate_limit, monkeypatch):
-    """A rate-limited provider must not retry past its configured max_retries."""
+async def test_rate_limit_denial_is_reported_without_calling_the_provider(disable_cache_rate_limit, monkeypatch):
+    """When the shared scheduler cannot fit a slot before the IOC deadline the
+    provider is not called and the result is an explicit rate_limited record
+    carrying the required wait (replaces the old fixed retry-budget loop)."""
     from contextlib import asynccontextmanager
 
-    from app.backend.rate_limiter import RateLimitDecision
+    from app.backend.rate_limiter import SlotReservation
 
     calls = []
 
@@ -222,14 +224,11 @@ async def test_rate_limit_waiting_respects_the_retry_budget(disable_cache_rate_l
 
             return _cm()
 
-        async def wait_for_interval(self, *args, **kwargs):
-            return 0.0
+        def reserve_provider(self, *args, **kwargs):
+            return SlotReservation(False, retry_after_seconds=120.0, reason="rate_limited")
 
-        async def acquire_provider(self, *args, **kwargs):
-            return RateLimitDecision(allowed=False, retry_after_seconds=0.01, reason="rate_limited")
-
-        async def acquire(self, *args, **kwargs):
-            return RateLimitDecision(allowed=False, retry_after_seconds=0.01, reason="rate_limited")
+        async def wait_for_reservation(self, source, reservation, *, max_wait):
+            return reservation
 
     async def fake_enrich(value, ioc_type):
         return EnrichmentData()
@@ -245,7 +244,8 @@ async def test_rate_limit_waiting_respects_the_retry_budget(disable_cache_rate_l
     assert len(task.results) == 1
     rate_limited = task.results[0]
     assert rate_limited.execution_state == "rate_limited"
-    assert rate_limited.retry_count == 2
+    assert rate_limited.request_made is False
+    assert rate_limited.retry_after_seconds == 120.0
 
 
 @pytest.mark.asyncio

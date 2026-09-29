@@ -45,13 +45,16 @@ async def test_team_cymru_bogon_ipv6_query_name():
 
 
 @pytest.mark.asyncio
-async def test_team_cymru_non_bogon_is_clean():
+async def test_team_cymru_non_bogon_is_not_a_clean_verdict():
+    # Being allocated address space says nothing about reputation.
     adapter = TeamCymruAdapter()
     adapter.set_client(_make_client(200, {"Status": 0, "Answer": []}))
     result = await adapter.lookup("8.8.8.8", "ipv4")
-    assert result.verdict == "clean"
+    assert result.verdict == "unknown"
+    assert result.normalized_verdict == "unknown"
+    assert result.execution_state == "success"
     assert "not_bogon" in result.tags
-    assert result.raw_score == 0.0
+    assert result.raw_score is None
 
 
 @pytest.mark.asyncio
@@ -59,7 +62,7 @@ async def test_team_cymru_doh_failure_is_error():
     adapter = TeamCymruAdapter()
     adapter.set_client(_make_client(200, {"Status": 2, "Answer": []}))
     result = await adapter.lookup("8.8.8.8", "ipv4")
-    assert result.verdict == "error"
+    assert result.execution_state == "error"
     assert "doh_status:2" in result.tags
 
 
@@ -68,5 +71,6 @@ async def test_team_cymru_http_error():
     adapter = TeamCymruAdapter()
     adapter.set_client(_make_client(500))
     result = await adapter.lookup("8.8.8.8", "ipv4")
-    assert result.verdict == "error"
+    assert result.execution_state == "error"
+    assert "http_500" in result.tags
     assert "http_500" in result.tags

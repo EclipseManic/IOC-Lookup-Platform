@@ -9,7 +9,7 @@ from app.backend.adapters.base import (
     retry_after_seconds,
 )
 from app.backend.config import settings
-from app.backend.logger import get_logger
+from app.backend.logger import describe_exception, get_logger
 
 logger = get_logger("adapter.hunter_io")
 
@@ -71,7 +71,7 @@ class HunterIOAdapter(SourceAdapter):
                 tags=["timeout"],
             )
         except httpx.HTTPError as exc:
-            logger.warning("Hunter.io request error: %s", exc)
+            logger.warning("Hunter.io request error: %s", describe_exception(exc))
             return NormalizedResult(
                 ioc=ioc_value,
                 ioc_type=ioc_type,
@@ -114,13 +114,16 @@ class HunterIOAdapter(SourceAdapter):
         try:
             payload = resp.json()
             data = payload.get("data") or {}
+            if not isinstance(data, dict):
+                raise ValueError("unexpected data shape")
         except Exception:
             return NormalizedResult(
                 ioc=ioc_value,
                 ioc_type=ioc_type,
                 source=self.name,
                 verdict="error",
-                tags=["invalid_json"],
+                tags=["malformed_response"],
+                provider_summary="Hunter.io returned a malformed response",
             )
 
         status = str(data.get("status") or "").lower()
@@ -143,8 +146,6 @@ class HunterIOAdapter(SourceAdapter):
             tags.append(f"hunter:result:{result_str}")
         if status:
             tags.append(f"hunter:status:{status}")
-        if score is not None:
-            tags.append(f"hunter:score:{score}")
         if is_disposable:
             tags.append("hunter:disposable")
         if is_gibberish:
@@ -153,8 +154,6 @@ class HunterIOAdapter(SourceAdapter):
             tags.append("hunter:webmail")
         if is_accept_all:
             tags.append("hunter:accept_all")
-        if sources:
-            tags.append(f"hunter:sources_found:{len(sources)}")
 
         # Verdict assignment
         if is_disposable:
@@ -190,6 +189,6 @@ class HunterIOAdapter(SourceAdapter):
             raw_score=raw_score,
             confidence=confidence,
             tags=tags,
-            raw_data=data,
+            raw_data={**data, "sources_found": len(sources) if isinstance(sources, list) else 0},
             source_link=f"https://hunter.io/verify/{ioc_value}",
         )

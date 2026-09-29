@@ -273,18 +273,20 @@ async def enrich_ip(value: str) -> EnrichmentData:
             shodan = ShodanAdapter()
             shodan.set_client(_get_http_client())
             shodan_result = await shodan.lookup(value, "ipv4")
-            if shodan_result.tags:
-                port_tag = next((t for t in shodan_result.tags if t.startswith("ports:")), None)
-                if port_tag:
-                    port_str = port_tag.replace("ports:", "")
-                    open_ports_result = [int(p) for p in port_str.split(",") if p.strip().isdigit()]
-                    completeness["port_scan"] = "ok"
-                    port_services = {p: _PORT_SERVICES.get(p, "Unknown") for p in open_ports_result}
-                    host_intel = HostIntelligence(
-                        open_ports=open_ports_result,
-                        port_services=port_services,
-                        source="shodan_api",
-                    )
+            shodan_ports = (shodan_result.raw_data or {}).get("ports")
+            if not isinstance(shodan_ports, list):
+                # Older results carried the port list as a "ports:80,443" tag.
+                port_tag = next((t for t in shodan_result.tags or [] if t.startswith("ports:")), None)
+                shodan_ports = port_tag.replace("ports:", "").split(",") if port_tag else []
+            if shodan_ports:
+                open_ports_result = [int(p) for p in shodan_ports if str(p).strip().isdigit()]
+                completeness["port_scan"] = "ok"
+                port_services = {p: _PORT_SERVICES.get(p, "Unknown") for p in open_ports_result}
+                host_intel = HostIntelligence(
+                    open_ports=open_ports_result,
+                    port_services=port_services,
+                    source="shodan_api",
+                )
         except Exception as exc:
             logger.debug("Shodan port scan enrichment failed for %s: %s", value, exc)
 
@@ -814,54 +816,294 @@ async def enrich_btc(value: str) -> EnrichmentData:
         return EnrichmentData(completeness={"blockchain_address": "error"})
 
 
+async def _etherscan_api_summary(value: str) -> dict:
+    """Balance and latest transactions from the Etherscan V2 API."""
+    client = _get_http_client()
+    base = "https://api.etherscan.io/v2/api"
+    common = {"address": value, "apikey": settings.etherscan_api_key, "chainid": 1}
+    balance_response, tx_response = await asyncio.gather(
+        client.get(base, params={"module": "account", "action": "balance", **common}, timeout=15),
+        client.get(
+            base,
+            params={"module": "account", "action": "txlist", "startblock": 0, "endblock": 99999999, "page": 1, "offset": 25, "sort": "desc", **common},
+            timeout=15,
+        ),
+    )
+    balance = balance_response.json() if balance_response.status_code == 200 else {}
+    payload = tx_response.json() if tx_response.status_code == 200 else {}
+    if not isinstance(balance, dict) or balance.get("status") != "1":
+        raise RuntimeError(str((balance or {}).get("result") or f"http_{balance_response.status_code}")[:120])
+    transactions = payload.get("result", []) if isinstance(payload, dict) else []
+    transactions = [tx for tx in transactions if isinstance(tx, dict)] if isinstance(transactions, list) else []
+
+    def _int(raw) -> int:
+        try:
+            return int(raw)
+        except (TypeError, ValueError):
+            return 0
+
+    lowered = value.lower()
+    recent = []
+    for tx in transactions:
+        sender, receiver = str(tx.get("from") or ""), str(tx.get("to") or "")
+        direction = "SELF" if sender.lower() == receiver.lower() == lowered else "OUT" if sender.lower() == lowered else "IN"
+        function = str(tx.get("functionName") or "").split("(")[0]
+        recent.append({
+            "hash": tx.get("hash"),
+            "method": function or ("Transfer" if tx.get("input") in ("0x", "", None) else tx.get("methodId")),
+            "block": _int(tx.get("blockNumber")) or None,
+            "time": _int(tx.get("timeStamp")) or None,
+            "direction": direction,
+            "from": {"address": sender},
+            "to": {"address": receiver or tx.get("contractAddress")},
+            "value_eth": _int(tx.get("value")) / 10**18,
+            "fee_eth": _int(tx.get("gasUsed")) * _int(tx.get("gasPrice")) / 10**18,
+            "failed": tx.get("isError") == "1",
+        })
+    return {"balance_eth": _int(balance.get("result")) / 10**18, "recent_transactions": recent}
+
+
+# Chains queried for native balances through the Etherscan V2 API when the
+# address page omits its Blockscan multichain portfolio (Etherscan does not
+# always render it). (chainid, name, native symbol). BNB Chain, Optimism, Base,
+# Avalanche and Gnosis are left out: the free API tier rejects them.
+_ETHERSCAN_V2_CHAINS = [
+    (1, "Ethereum", "ETH"), (42161, "Arbitrum One", "ETH"), (59144, "Linea", "ETH"),
+    (81457, "Blast", "ETH"), (167000, "Taiko", "ETH"), (480, "World Chain", "ETH"),
+    (130, "Unichain", "ETH"), (2741, "Abstract", "ETH"), (137, "Polygon", "POL"),
+    (5000, "Mantle", "MNT"), (204, "opBNB", "BNB"), (252, "Fraxtal", "FRAX"),
+    (33139, "ApeChain", "APE"), (146, "Sonic", "S"), (80094, "Berachain", "BERA"),
+]
+_ETHERSCAN_V2_PAID_CHAINS = ["BNB Chain", "Optimism", "Base", "Avalanche C-Chain", "Gnosis"]
+_NATIVE_PRICE_TTL = 600
+_native_prices: dict[str, tuple[float, float]] = {}  # symbol -> (usd, fetched_at)
+
+
+async def _etherscan_multichain_native(
+    value: str, eth_balance: float | None = None, eth_price: float | None = None,
+) -> dict:
+    """Native-coin balance per chain from the Etherscan V2 API, valued in USD.
+
+    Token balances per chain need a paid plan, so this is a native-only view;
+    the caller labels it that way. A known Ethereum balance/price is reused
+    instead of spending calls on it."""
+    client = _get_http_client()
+    base = "https://api.etherscan.io/v2/api"
+    key = settings.etherscan_api_key
+    if eth_price:
+        _native_prices["ETH"] = (eth_price, time.time())
+    # The free tier allows only a few calls per second, shared with the
+    # Etherscan adapter running in parallel.
+    semaphore = asyncio.Semaphore(2)
+
+    async def _call(chain_id: int, **params) -> str | None:
+        for attempt in range(3):
+            async with semaphore:
+                response = await client.get(base, params={"chainid": chain_id, "apikey": key, **params}, timeout=15)
+                await asyncio.sleep(0.5)
+            payload = response.json() if response.status_code == 200 else {}
+            if isinstance(payload, dict) and payload.get("status") == "1":
+                return payload.get("result")
+            if "rate limit" not in str((payload or {}).get("result", "")).lower() and response.status_code != 429:
+                return None
+            await asyncio.sleep(1.2 * (attempt + 1))
+        return None
+
+    async def _price(chain_id: int, symbol: str) -> float | None:
+        cached = _native_prices.get(symbol)
+        if cached and time.time() - cached[1] < _NATIVE_PRICE_TTL:
+            return cached[0]
+        result = await _call(chain_id, module="stats", action="ethprice")
+        try:
+            usd = float(result["ethusd"]) if isinstance(result, dict) else None
+        except (KeyError, TypeError, ValueError):
+            usd = None
+        if usd is not None:
+            _native_prices[symbol] = (usd, time.time())
+        return usd
+
+    async def _balance(chain_id: int) -> float | None:
+        if chain_id == 1 and eth_balance is not None:
+            return float(eth_balance)
+        result = await _call(chain_id, module="account", action="balance", address=value)
+        try:
+            return int(result) / 10**18
+        except (TypeError, ValueError):
+            return None
+
+    balances = await asyncio.gather(*(_balance(chain_id) for chain_id, _, _ in _ETHERSCAN_V2_CHAINS), return_exceptions=True)
+    price_chains = {symbol: chain_id for chain_id, _, symbol in reversed(_ETHERSCAN_V2_CHAINS)}
+    held = {symbol for (_, _, symbol), balance in zip(_ETHERSCAN_V2_CHAINS, balances) if isinstance(balance, float) and balance > 0}
+    prices = dict(zip(held, await asyncio.gather(*(_price(price_chains[s], s) for s in held), return_exceptions=True)))
+
+    chains, failed = [], []
+    for (chain_id, name, symbol), balance in zip(_ETHERSCAN_V2_CHAINS, balances):
+        if not isinstance(balance, float):
+            failed.append(name)
+            continue
+        if balance <= 0:
+            continue
+        price = prices.get(symbol)
+        chains.append({
+            "chain": name,
+            "chain_id": str(chain_id),
+            "native_symbol": symbol,
+            "native_balance": balance,
+            "value_usd": round(balance * price, 2) if isinstance(price, float) else 0.0,
+        })
+    total = sum(chain["value_usd"] for chain in chains)
+    for chain in chains:
+        share = chain["value_usd"] / total * 100 if total else 0.0
+        chain["share_pct"] = round(share) if share >= 1 else 1.0
+        chain["share_below_pct"] = share < 1
+    chains.sort(key=lambda chain: chain["value_usd"], reverse=True)
+    return {
+        "chains": chains,
+        "multichain_portfolio_usd": round(total, 2),
+        "active_chain_count": len(chains),
+        "multichain_source": "etherscan_v2_native",
+        "multichain_chains_checked": len(_ETHERSCAN_V2_CHAINS) - len(failed),
+        "multichain_chains_failed": failed,
+        "multichain_chains_unsupported": _ETHERSCAN_V2_PAID_CHAINS,
+    }
+
+
+def _eth_relationships(value: str, ethereum: dict) -> list[dict]:
+    relationships = []
+
+    def _add(target: dict | None, relationship: str, **details) -> None:
+        address = (target or {}).get("address")
+        if not address or address.lower() == value.lower():
+            return
+        relationships.append({
+            "source_ioc": value,
+            "target_ioc": address,
+            "target_type": "eth",
+            "relationship": relationship,
+            "via_source": "Etherscan",
+            "confidence": "high",
+            "evidence_type": "observed_relationship",
+            "label": (target or {}).get("label"),
+            **details,
+        })
+
+    _add(ethereum.get("funded_by"), "funded_by", tx_hash=(ethereum.get("funded_by") or {}).get("tx_hash"))
+    _add(ethereum.get("contract_creator"), "created_by", tx_hash=(ethereum.get("contract_creator") or {}).get("tx_hash"))
+    for counterparty in ethereum.get("risky_counterparties", [])[:10]:
+        _add(counterparty, "transacted_with_flagged", tx_count=counterparty.get("tx_count"))
+    return relationships
+
+
 async def enrich_eth(value: str) -> EnrichmentData:
-    """Fetch lightweight Ethereum wallet context for the enrichment tab."""
+    """Ethereum wallet context for the enrichment tab.
+
+    The Etherscan address page supplies labels, warnings, USD valuation, token
+    holdings, the multichain portfolio, funding source, total transaction count
+    and counterparty tags; the V2 API (when a key is configured) supplies an
+    exact balance and a transaction list, and is the fallback when the page is
+    unavailable."""
+    from app.backend import etherscan_page
     from app.backend.adapters.base import is_valid_api_key
 
-    if not is_valid_api_key(settings.etherscan_api_key):
+    if not etherscan_page.ETH_ADDRESS_RE.fullmatch(value):
+        return EnrichmentData(completeness={"ethereum_address": "invalid"})
+    use_page = settings.etherscan_page_enrichment
+    use_api = is_valid_api_key(settings.etherscan_api_key)
+    if not use_page and not use_api:
         return EnrichmentData(
             completeness={"ethereum_address": "not_configured"},
-            analysis_notes=["Ethereum balance enrichment requires ETHERSCAN_API_KEY; provider results may still be available."],
+            analysis_notes=["Ethereum enrichment requires ETHERSCAN_API_KEY or ETHERSCAN_PAGE_ENRICHMENT=true; provider results may still be available."],
         )
-    try:
-        client = _get_http_client()
-        common = {"address": value, "apikey": settings.etherscan_api_key}
-        balance_response, tx_response = await asyncio.gather(
-            client.get(
-                "https://api.etherscan.io/api",
-                params={"module": "account", "action": "balance", **common}, timeout=15,
-            ),
-            client.get(
-                "https://api.etherscan.io/api",
-                params={"module": "account", "action": "txlist", "startblock": 0, "endblock": 99999999, "page": 1, "offset": 25, "sort": "desc", **common},
-                timeout=15,
-            ),
-            return_exceptions=True,
-        )
-        balance = balance_response.json() if not isinstance(balance_response, Exception) and balance_response.status_code == 200 else {}
-        transactions_payload = tx_response.json() if not isinstance(tx_response, Exception) and tx_response.status_code == 200 else {}
-        transactions = transactions_payload.get("result", []) if isinstance(transactions_payload, dict) else []
-        transactions = [tx for tx in transactions if isinstance(tx, dict)] if isinstance(transactions, list) else []
-        balance_wei = balance.get("result", "0") if isinstance(balance, dict) else "0"
+
+    async def _skip():
+        return None
+
+    page, api = await asyncio.gather(
+        etherscan_page.scrape_address(value) if use_page else _skip(),
+        _etherscan_api_summary(value) if use_api else _skip(),
+        return_exceptions=True,
+    )
+    completeness: dict[str, str] = {}
+    notes: list[str] = []
+    ethereum: dict = {"address": value}
+    sources: list[str] = []
+
+    if isinstance(page, dict):
+        ethereum.update(page)
+        sources.append("etherscan_page")
+        completeness["etherscan_page"] = "ok"
+    elif use_page:
+        logger.info("Etherscan page enrichment unavailable for %s: %s", value, page)
+        completeness["etherscan_page"] = "unavailable"
+        notes.append(f"Etherscan address page unavailable ({str(page)[:80]}); labels, holdings and multichain data are missing.")
+    else:
+        completeness["etherscan_page"] = "disabled"
+
+    if isinstance(api, dict):
+        sources.append("etherscan_api")
+        completeness["etherscan_api"] = "ok"
+        # The API balance is exact; the page renders a rounded figure.
+        ethereum["balance_eth"] = api["balance_eth"]
+        if not ethereum.get("recent_transactions"):
+            ethereum["recent_transactions"] = api["recent_transactions"]
+        if ethereum.get("transaction_count") is None:
+            ethereum["transaction_count"] = len(api["recent_transactions"])
+            ethereum["transaction_count_is_lower_bound"] = len(api["recent_transactions"]) >= 25
+    elif use_api:
+        logger.info("Etherscan API enrichment failed for %s: %s", value, api)
+        completeness["etherscan_api"] = "error"
+    else:
+        completeness["etherscan_api"] = "not_configured"
+
+    # Etherscan does not always embed the Blockscan multichain portfolio in the
+    # page; fall back to per-chain native balances from the V2 API.
+    if ethereum.get("chains"):
+        ethereum["multichain_source"] = "etherscan_page"
+        completeness["multichain_holdings"] = "ok"
+    elif use_api:
         try:
-            balance_eth = int(balance_wei) / 10**18
-        except (TypeError, ValueError):
-            balance_eth = 0.0
-        return EnrichmentData(
-            completeness={"ethereum_address": "ok" if balance or transactions else "not_found"},
-            extra={"ethereum": {
-                "address": value,
-                "balance_eth": balance_eth,
-                "transaction_count": len(transactions),
-                "recent_transactions": [
-                    {"hash": tx.get("hash"), "value_eth": (int(tx.get("value", 0) or 0) / 10**18), "time": tx.get("timeStamp")}
-                    for tx in transactions[:5]
-                ],
-            }},
-        )
-    except Exception as exc:
-        logger.debug("Ethereum enrichment failed for %s: %s", value, exc)
-        return EnrichmentData(completeness={"ethereum_address": "error"})
+            multichain = await _etherscan_multichain_native(
+                value, ethereum.get("balance_eth"), ethereum.get("eth_price_usd"),
+            )
+        except Exception as exc:
+            logger.info("Etherscan multichain lookup failed for %s: %s", value, exc)
+            multichain = None
+        if multichain and multichain["multichain_chains_checked"]:
+            ethereum.update(multichain)
+            completeness["multichain_holdings"] = "partial"
+            notes.append(
+                f"Multichain holdings are native-coin balances on {multichain['multichain_chains_checked']} chains "
+                "(Etherscan V2 API); token holdings on other chains and "
+                + ", ".join(_ETHERSCAN_V2_PAID_CHAINS) + " need a paid Etherscan plan."
+            )
+        else:
+            completeness["multichain_holdings"] = "error"
+    else:
+        completeness["multichain_holdings"] = "unavailable"
+        if isinstance(page, dict):
+            notes.append("Etherscan did not include the multichain portfolio for this address; set ETHERSCAN_API_KEY to load per-chain balances.")
+
+    if not sources:
+        completeness["ethereum_address"] = "error"
+        return EnrichmentData(completeness=completeness, analysis_notes=notes)
+
+    ethereum["data_sources"] = sources
+    completeness["ethereum_address"] = "ok"
+    if ethereum.get("public_name_tag"):
+        notes.append(f"Etherscan public name tag: {ethereum['public_name_tag']}.")
+    if ethereum.get("risk_labels"):
+        notes.append("Etherscan flags this address: " + ", ".join(ethereum["risk_labels"]) + ".")
+    for warning in ethereum.get("warnings", [])[:3]:
+        notes.append(f"Etherscan warning: {warning}")
+    risky = ethereum.get("risky_counterparties") or []
+    if risky:
+        notes.append(f"{len(risky)} recent counterparties carry threat-related Etherscan tags (e.g. {risky[0]['label']}).")
+    return EnrichmentData(
+        completeness=completeness,
+        extra={"ethereum": ethereum},
+        relationships=_eth_relationships(value, ethereum),
+        analysis_notes=notes,
+    )
 
 
 async def enrich_asn(value: str) -> EnrichmentData:

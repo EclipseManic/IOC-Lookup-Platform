@@ -317,6 +317,288 @@ def normalize_provider_result(result: NormalizedResult, assessment_domain: str =
     return result
 
 
+# ---------------------------------------------------------------------------
+# Evidence semantics
+#
+# A provider's verdict vocabulary is not the same thing as the role its record
+# plays for the queried indicator. Infostealer exposure of an IP is context,
+# Tor-exit membership is anonymization risk, community votes are crowd
+# opinion, and a feed record for ``https://sites.google.com/x`` is not a
+# record for ``google.com``. These helpers derive that meaning from typed
+# fields / raw_data first and fall back to the legacy ``key: value`` tags that
+# older adapters emit.
+# ---------------------------------------------------------------------------
+
+CREDENTIAL_IOC_TYPES = frozenset({"email", "username", "password"})
+HASH_IOC_TYPES = frozenset({"md5", "sha1", "sha256", "sha512"})
+# Sources whose positive record describes credential/infostealer exposure.
+EXPOSURE_SOURCES = frozenset({"Hudson Rock", "LeakCheck.io", "HIBP Pwned Passwords"})
+# Sources whose positive record means "part of an anonymization network".
+ANONYMIZATION_SOURCES = frozenset({"Tor Exit"})
+# Email/identity reputation signals (spam reports, disposable mailboxes,
+# deliverability risk). They are abuse reputation, not credential exposure.
+IDENTITY_REPUTATION_SOURCES = frozenset({"StopForumSpam", "Hunter.io", "AbstractAPI"})
+
+_EXPOSURE_TAGS = frozenset({
+    "infostealer_compromised", "compromised_credential", "pwned_password",
+    "breached", "pwned", "credential_leak", "leaked_credentials",
+})
+
+
+def _raw(result: NormalizedResult) -> dict:
+    return result.raw_data if isinstance(result.raw_data, dict) else {}
+
+
+def tag_value(tags: Any, *keys: str) -> str | None:
+    """Return the value of a legacy ``key:value`` / ``key: value`` tag."""
+    wanted = {key.strip().lower() for key in keys}
+    for tag in tags or []:
+        text = str(tag)
+        if ":" not in text:
+            continue
+        key, value = text.split(":", 1)
+        if key.strip().lower() in wanted and value.strip():
+            return value.strip()
+    return None
+
+
+def _to_int(value: Any) -> int | None:
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, (int, float)):
+        return int(value)
+    if isinstance(value, str):
+        text = value.strip().replace(",", "")
+        try:
+            return int(float(text))
+        except ValueError:
+            return None
+    return None
+
+
+def typed_number(result: NormalizedResult, raw_keys: tuple[str, ...], tag_keys: tuple[str, ...] = ()) -> int | None:
+    """Read a count from raw_data first, then from legacy tags."""
+    raw = _raw(result)
+    for key in raw_keys:
+        number = _to_int(raw.get(key))
+        if number is not None:
+            return number
+    if tag_keys:
+        return _to_int(tag_value(result.tags, *tag_keys))
+    return None
+
+
+def community_votes(result: NormalizedResult) -> dict[str, int] | None:
+    """Community (crowd) votes, e.g. VirusTotal ``total_votes``.
+
+    Votes are opinions, not detections; scoring treats them as a weak signal.
+    """
+    raw = _raw(result)
+    nested = raw.get("community_votes") or raw.get("total_votes")
+    malicious = harmless = None
+    if isinstance(nested, dict):
+        malicious = _to_int(nested.get("malicious"))
+        harmless = _to_int(nested.get("harmless"))
+    if malicious is None:
+        malicious = typed_number(result, ("votes_malicious",), ("votes_malicious",))
+    if harmless is None:
+        harmless = typed_number(result, ("votes_harmless",), ("votes_harmless",))
+    if malicious is None and harmless is None:
+        return None
+    return {"malicious": malicious or 0, "harmless": harmless or 0}
+
+
+def infostealer_exposure(result: NormalizedResult) -> dict[str, int] | None:
+    """Positive credential/infostealer exposure recorded by an exposure source."""
+    if result.execution_state != "success":
+        return None
+    tags = {str(tag).strip().lower() for tag in result.tags or []}
+    infections = typed_number(result, ("total_infections", "infections"), ("infections",))
+    occurrences = typed_number(result, ("breach_occurrences", "breach_count"), ("breach_occurrences", "breaches"))
+    credentials = typed_number(result, ("credentials_at_risk",), ("credentials_at_risk",))
+    if credentials is None:
+        raw = _raw(result)
+        parts = [_to_int(raw.get(key)) for key in ("total_corporate_services", "total_user_services")]
+        if any(part is not None for part in parts):
+            credentials = sum(part or 0 for part in parts)
+    flagged = bool(tags & _EXPOSURE_TAGS) or (infections or 0) > 0 or (occurrences or 0) > 0
+    if not flagged and result.source in EXPOSURE_SOURCES:
+        flagged = normalize_provider_verdict(result.normalized_verdict or result.verdict) == "malicious"
+    if not flagged:
+        return None
+    exposure = {"infections": infections or 0, "credentials_at_risk": credentials or 0, "occurrences": occurrences or 0}
+    if not any(exposure.values()):
+        exposure["infections"] = max(0, int(result.reports_count or 0))
+    return exposure
+
+
+def is_anonymization_record(result: NormalizedResult) -> bool:
+    """True when the record states the IP is a Tor exit / anonymizer node."""
+    if result.execution_state != "success":
+        return False
+    raw = _raw(result)
+    tags = {str(tag).strip().lower() for tag in result.tags or []}
+    if raw.get("is_tor") is True or raw.get("isTor") is True or raw.get("tor_exit") is True:
+        return True
+    if "tor_exit_node" in tags or "tor_exit" in tags:
+        return True
+    return result.source in ANONYMIZATION_SOURCES and normalize_provider_verdict(result.normalized_verdict or result.verdict) in {"malicious", "suspicious"}
+
+
+def _strip_url(value: str) -> tuple[str, str]:
+    """Return (host, rest) for a URL-ish or bare indicator string."""
+    text = value.strip().lower()
+    scheme_split = text.split("://", 1)
+    body = scheme_split[1] if len(scheme_split) == 2 else text
+    host, _, rest = body.partition("/")
+    for sep in ("?", "#"):
+        if sep in host:
+            host, extra = host.split(sep, 1)
+            rest = sep + extra + rest
+    return host, rest
+
+
+def _same_indicator(entry: str, ioc: str, ioc_type: str) -> bool:
+    candidate = str(entry or "").strip().lower()
+    target = str(ioc or "").strip().lower()
+    if not candidate or not target:
+        return False
+    if candidate == target:
+        return True
+    if ioc_type in {"ipv4", "ipv6"}:
+        host, rest = _strip_url(candidate)
+        if rest.strip("/"):
+            return False
+        host = host.strip("[]")
+        if host == target:
+            return True
+        # ThreatFox records ip:port pairs; the port does not change the IP.
+        return ioc_type == "ipv4" and host.rsplit(":", 1)[0] == target
+    if ioc_type == "domain":
+        host, rest = _strip_url(candidate)
+        host = host.rsplit(":", 1)[0] if host.count(":") == 1 else host
+        return host == target and not rest.strip("/")
+    if ioc_type == "url":
+        return candidate.rstrip("/") == target.rstrip("/")
+    return False
+
+
+def _record_indicators(raw: dict) -> list[str]:
+    """Indicator values of the records a search-style provider matched."""
+    values: list[str] = []
+    for key in ("data", "matches", "records"):
+        entries = raw.get(key)
+        if isinstance(entries, list):
+            for entry in entries:
+                if isinstance(entry, dict):
+                    value = entry.get("ioc") or entry.get("indicator")
+                    if isinstance(value, str) and value.strip():
+                        values.append(value.strip())
+    if not values and raw.get("_truncated") is True and isinstance(raw.get("_json_fragment"), str):
+        values = re.findall(r'"(?:ioc|indicator)"\s*:\s*"((?:[^"\\]|\\.)+)"', raw["_json_fragment"])
+        values = [value.replace("\\/", "/") for value in values]
+    return values
+
+
+def indicator_match(result: NormalizedResult, ioc: str, ioc_type: str) -> str:
+    """Classify how a provider record relates to the queried indicator.
+
+    ``exact``      the record is about this indicator,
+    ``related``    the provider matched other indicators (a URL on this domain,
+                   a subdomain, another IP:port) and not this one,
+    ``unverified`` the record does not expose enough structure to check; the
+                   adapter's own matching is trusted.
+    Hash lookups are exact by construction.
+    """
+    raw = _raw(result)
+    declared = raw.get("match_type")
+    if isinstance(declared, str) and declared.strip():
+        return "exact" if declared.strip().lower() == "exact" else "related"
+    if isinstance(raw.get("exact_match"), bool):
+        return "exact" if raw["exact_match"] else "related"
+    if ioc_type in HASH_IOC_TYPES:
+        return "exact"
+    if ioc_type not in {"ipv4", "ipv6", "domain", "url"}:
+        return "unverified"
+    records = _record_indicators(raw)
+    if not records:
+        return "unverified"
+    if any(_same_indicator(value, ioc, ioc_type) for value in records):
+        return "exact"
+    if raw.get("_truncated") is True:
+        # Only a prefix of the payload survived truncation. The adapter lists
+        # every non-identical matched record in related_iocs; if that list
+        # covers every record it kept, none of them was the indicator itself.
+        reports = result.reports_count
+        if reports is None or len(result.related_iocs or []) < reports:
+            return "unverified"
+    return "related"
+
+
+def _identity_detail(result: NormalizedResult) -> str | None:
+    """Short description of an email/identity abuse-reputation finding."""
+    raw = _raw(result)
+    tags = {str(tag).strip().lower() for tag in result.tags or []}
+    parts: list[str] = []
+    frequency = typed_number(result, ("frequency",), ("frequency",))
+    if frequency:
+        parts.append(f"{frequency} spam report{'s' if frequency != 1 else ''}")
+    elif "spam_report" in tags:
+        parts.append("spam reports")
+    disposable = raw.get("disposable") is True or raw.get("is_disposable_email") is True or any(
+        tag in tags for tag in ("hunter:disposable", "abstract:disposable_email", "disposable")
+    )
+    if disposable:
+        parts.append("disposable mailbox")
+    status = str(raw.get("result") or raw.get("status") or tag_value(result.tags, "hunter:result") or "").strip().lower()
+    if status in {"risky", "undeliverable", "invalid"}:
+        parts.append(f"{status} address")
+    deliverability = str(raw.get("deliverability") or tag_value(result.tags, "deliverability") or "").strip().lower()
+    if deliverability in {"risky", "undeliverable"} and f"{deliverability} address" not in parts:
+        parts.append(f"{deliverability} address")
+    return ", ".join(dict.fromkeys(parts)) or None
+
+
+def evidence_semantics(result: NormalizedResult, ioc: str, ioc_type: str, assessment_domain: str) -> dict[str, Any]:
+    """Describe what a provider record means for this indicator.
+
+    ``kind`` is one of: ``reputation`` (ordinary threat/reputation evidence),
+    ``anonymization`` (Tor exit / anonymizer membership: risk context),
+    ``exposure_context`` (infostealer/breach exposure for a non-credential
+    indicator: context only), ``credential_exposure`` (exposure of the
+    credential itself), ``identity_reputation`` (spam/disposable signals).
+    """
+    semantics: dict[str, Any] = {"kind": "reputation"}
+    exposure = infostealer_exposure(result) if result.source in EXPOSURE_SOURCES or ioc_type in CREDENTIAL_IOC_TYPES else None
+    if result.source in EXPOSURE_SOURCES:
+        semantics["kind"] = "credential_exposure" if ioc_type in CREDENTIAL_IOC_TYPES else "exposure_context"
+    elif ioc_type in CREDENTIAL_IOC_TYPES and exposure is not None:
+        semantics["kind"] = "credential_exposure"
+    elif result.source in ANONYMIZATION_SOURCES:
+        semantics["kind"] = "anonymization"
+    elif ioc_type in CREDENTIAL_IOC_TYPES and result.source in IDENTITY_REPUTATION_SOURCES:
+        semantics["kind"] = "identity_reputation"
+    if exposure is not None:
+        semantics["exposure"] = exposure
+    if semantics["kind"] == "identity_reputation" and result.execution_state == "success":
+        detail = _identity_detail(result)
+        if detail:
+            semantics["detail"] = detail
+    if ioc_type in {"ipv4", "ipv6"} and is_anonymization_record(result):
+        semantics["anonymization"] = True
+    votes = community_votes(result)
+    if votes is not None:
+        semantics["community_votes"] = votes
+    if result.execution_state == "success" and assessment_domain in {"ioc_reputation", "infrastructure"}:
+        semantics["match_type"] = indicator_match(result, ioc, ioc_type)
+        if semantics["match_type"] == "related":
+            examples = [str(value) for value, _ in (result.related_iocs or [])][:3]
+            if not examples:
+                examples = [value for value in _record_indicators(_raw(result)) if not _same_indicator(value, ioc, ioc_type)][:3]
+            semantics["related_examples"] = examples
+    return semantics
+
+
 def evidence_freshness(result: NormalizedResult, now: datetime | None = None) -> str:
     now = now or datetime.now(timezone.utc)
     timestamp = result.source_timestamp or result.last_seen or result.first_seen or result.observed_at

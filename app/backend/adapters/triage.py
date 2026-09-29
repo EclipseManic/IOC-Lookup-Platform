@@ -1,9 +1,18 @@
-import logging
 from datetime import datetime
 
 import httpx
 
-from app.backend.adapters.base import NormalizedResult, RateLimitConfig, SourceAdapter, is_valid_api_key, retry_after_seconds
+from app.backend.adapters._http import (
+    MalformedResponse,
+    describe_exception,
+    exception_result,
+    failure,
+    http_failure,
+    malformed,
+    not_configured,
+    read_json,
+)
+from app.backend.adapters.base import NormalizedResult, RateLimitConfig, SourceAdapter, is_valid_api_key
 from app.backend.config import settings
 from app.backend.logger import get_logger
 
@@ -18,70 +27,54 @@ class TriageAdapter(SourceAdapter):
     def __init__(self):
         self.api_key = settings.triage_api_key
 
-    async def _search_by_term(self, client, ioc_value: str):
-        """Search Tria.ge by host-artifact term. Uses v0 search API."""
+    async def _search_by_term(self, client, ioc_value: str, ioc_type: str):
+        """Search Tria.ge by host-artifact term (v0 search API).
+
+        Returns a sample id, ``None`` when nothing references the term, or a
+        ready-made failure ``NormalizedResult``.
+        """
+        resp = await client.get(
+            "https://api.tria.ge/v0/search",
+            params={"query": ioc_value},
+            headers={"Authorization": f"Bearer {self.api_key}"},
+            timeout=15,
+        )
+        failed = http_failure(self.name, ioc_value, ioc_type, resp, not_found_summary="No sandbox sample references this artifact")
+        if failed is not None:
+            if failed.execution_state == "not_found":
+                return None
+            return failed
         try:
-            resp = await client.get(
-                "https://api.tria.ge/v0/search",
-                params={"query": ioc_value},
-                headers={"Authorization": f"Bearer {self.api_key}"},
-                timeout=15,
-            )
-            if resp.status_code == 404:
-                return None
-            if resp.status_code == 429:
-                logger.warning("Tria.ge rate limited for %s", ioc_value)
-                return "rate_limited"
-            if resp.status_code in (401, 403):
-                logger.warning("Tria.ge auth failed %s for %s", resp.status_code, ioc_value)
-                return "auth_error"
-            if resp.status_code != 200:
-                logger.warning("Tria.ge search failed %s for %s", resp.status_code, ioc_value)
-                return "error"
-            data = resp.json()
-            items = data.get("data", []) if isinstance(data, dict) else data
-            if not isinstance(items, list) or not items:
-                return None
-            first = items[0]
-            sample_id = first.get("id", first.get("sample", {}).get("id", ""))
-            if sample_id:
-                return sample_id
+            data = read_json(resp)
+        except MalformedResponse as exc:
+            return malformed(self.name, ioc_value, ioc_type, exc.reason, resp.status_code)
+        items = data.get("data", []) if isinstance(data, dict) else data
+        if not isinstance(items, list) or not items or not isinstance(items[0], dict):
             return None
-        except Exception as exc:
-            logger.debug("Tria.ge _search_by_term exception for %s: %s", ioc_value, exc)
-            return "error"
+        first = items[0]
+        sample = first.get("sample") if isinstance(first.get("sample"), dict) else {}
+        return first.get("id") or sample.get("id") or None
 
     async def lookup(self, ioc_value: str, ioc_type: str) -> NormalizedResult:
         if not is_valid_api_key(self.api_key):
-            return NormalizedResult(
-                ioc=ioc_value, ioc_type=ioc_type, source=self.name,
-                verdict="unknown", tags=["no_api_key_configured"],
-            )
+            return not_configured(self.name, ioc_value, ioc_type)
+        try:
+            return await self._lookup(ioc_value, ioc_type)
+        except httpx.HTTPError as exc:
+            logger.warning("Tria.ge request failed for %s: %s", ioc_value, describe_exception(exc))
+            return exception_result(self.name, ioc_value, ioc_type, exc)
 
+    async def _lookup(self, ioc_value: str, ioc_type: str) -> NormalizedResult:
         client = self._get_client()
         sample_id = None
         if ioc_type in ("mutex", "named_pipe", "registry_key", "service_name", "ssdeep"):
-            sample_id = await self._search_by_term(client, ioc_value)
-            if sample_id == "rate_limited":
-                return NormalizedResult(
-                    ioc=ioc_value, ioc_type=ioc_type, source=self.name,
-                    verdict="unknown", tags=["rate_limited"],
-                )
-            if sample_id == "auth_error":
-                return NormalizedResult(
-                    ioc=ioc_value, ioc_type=ioc_type, source=self.name,
-                    verdict="error", tags=["http_401", "auth_error"],
-                )
-            if sample_id == "error":
-                return NormalizedResult(
-                    ioc=ioc_value, ioc_type=ioc_type, source=self.name,
-                    verdict="error", tags=["search_error"],
-                )
+            sample_id = await self._search_by_term(client, ioc_value, ioc_type)
+            if isinstance(sample_id, NormalizedResult):
+                return sample_id
             if not sample_id:
-                return NormalizedResult(
-                    ioc=ioc_value, ioc_type=ioc_type, source=self.name,
-                    verdict="unknown", raw_score=0.0, status="not_found",
-                    tags=["term_not_found"],
+                return failure(
+                    self.name, ioc_value, ioc_type, "not_found", ["term_not_found"],
+                    "No sandbox sample references this artifact",
                 )
             # Fetch that sample
             resp = await client.get(
@@ -96,24 +89,16 @@ class TriageAdapter(SourceAdapter):
                 timeout=30,
             )
 
-        if resp.status_code == 404:
-            return NormalizedResult(
-                ioc=ioc_value, ioc_type=ioc_type, source=self.name,
-                verdict="unknown", raw_score=0.0, status="not_found",
-            )
-        if resp.status_code == 429:
-            return NormalizedResult(
-                ioc=ioc_value, ioc_type=ioc_type, source=self.name,
-                verdict="unknown", tags=["rate_limited"], http_status=resp.status_code,
-                retry_after_seconds=retry_after_seconds(resp),
-            )
-        if resp.status_code != 200:
-            return NormalizedResult(
-                ioc=ioc_value, ioc_type=ioc_type, source=self.name,
-                verdict="error", tags=[f"http_{resp.status_code}"],
-            )
+        failed = http_failure(self.name, ioc_value, ioc_type, resp, not_found_summary="No sandbox sample for this indicator")
+        if failed is not None:
+            return failed
 
-        data = resp.json()
+        try:
+            data = read_json(resp)
+        except MalformedResponse as exc:
+            return malformed(self.name, ioc_value, ioc_type, exc.reason, resp.status_code)
+        if not isinstance(data, dict):
+            return malformed(self.name, ioc_value, ioc_type, http_status=resp.status_code)
         status = data.get("status", "")
 
         raw_tags = data.get("tags", [])
@@ -146,13 +131,15 @@ class TriageAdapter(SourceAdapter):
                             if isinstance(mitre_id, str) and mitre_id not in mitre:
                                 mitre.append(mitre_id)
             except Exception as exc:
-                logger.debug("Triage overview enrichment failed: %s", exc)
+                logger.debug("Triage overview enrichment failed: %s", describe_exception(exc))
 
         if status != "complete":
+            # The sample exists but has no finished analysis, so there is no
+            # verdict yet (not the same as "no sample").
             return NormalizedResult(
                 ioc=ioc_value, ioc_type=ioc_type, source=self.name,
-                verdict="unknown", raw_score=0.0, tags=[f"status_{status}"],
-                status="not_found",
+                verdict="unknown", raw_score=None, tags=[f"status_{status}"],
+                status="not_found", provider_summary=f"Sandbox analysis not finished (status: {status or 'unknown'})",
             )
 
         sample_verdict = data.get("verdict", "unknown")

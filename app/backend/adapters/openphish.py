@@ -75,7 +75,7 @@ class OpenPhishAdapter(SourceAdapter):
                 else:
                     logger.warning("OpenPhish feed download failed with status %d", r.status_code)
             except Exception as e:
-                logger.warning("OpenPhish feed download error: %s", e)
+                logger.warning("OpenPhish feed download error: %s: %r", type(e).__name__, e)
 
     async def lookup(self, ioc_value: str, ioc_type: str) -> NormalizedResult:
         await self._ensure_feed()

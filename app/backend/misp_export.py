@@ -1,6 +1,8 @@
 import uuid
 from datetime import datetime, timezone
 
+from app.backend.stix_export import provider_evidence_rows
+
 _MISP_ATTR_TYPE_MAP = {
     "ipv4": "ip-dst",
     "ipv6": "ip-dst",
@@ -61,7 +63,8 @@ def build_misp_event(response: dict) -> dict:
     event_id = uuid.uuid4().hex
     attributes: list[dict] = []
     objects: list[dict] = []
-    window_first, window_last = _observed_window(results)
+    evidence_rows = provider_evidence_rows(response)
+    window_first, window_last = _observed_window([row for row, _ in evidence_rows])
 
     attr_id = _misp_id("Attribute")
     attributes.append({
@@ -70,15 +73,18 @@ def build_misp_event(response: dict) -> dict:
         "category": "Network activity",
         "value": ioc_value,
         "comment": f"IOC Platform lookup — {verdict} (score: {score})",
-        "to_ids": True,
+        # Only indicators assessed as threats are flagged for IDS use; a
+        # benign/unknown/context result must not end up in detection rules.
+        "to_ids": verdict in {"malicious", "suspicious"},
         "timestamp": _ts(),
         "first_seen": window_first,
         "last_seen": window_last,
     })
 
-    for r in results:
+    # Not-found / rate-limited / unavailable providers are absence of data and
+    # are not exported as attributes.
+    for r, r_verdict in evidence_rows:
         source = r.get("source", "Unknown")
-        r_verdict = r.get("verdict", "unknown")
         r_score = r.get("raw_score", "")
 
         atype = _MISP_ATTR_TYPE_MAP.get(ioc_type, "text")
@@ -92,7 +98,9 @@ def build_misp_event(response: dict) -> dict:
             "category": category,
             "value": ioc_value,
             "comment": f"{source}: {r_verdict}" + (f" (score: {r_score})" if r_score else ""),
-            "to_ids": True,
+            # Per-provider rows annotate the same value; the IDS flag lives on
+            # the assessed attribute above.
+            "to_ids": False,
             "timestamp": _ts(),
             "first_seen": _fmt_ts(r.get("first_seen")),
             "last_seen": _fmt_ts(r.get("last_seen")),

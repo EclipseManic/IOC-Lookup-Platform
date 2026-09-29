@@ -98,6 +98,14 @@ class TestGreyNoiseAdapter:
     may return 401/404 instead.
     """
 
+    @pytest.fixture(autouse=True)
+    def _reset_quota_state(self, monkeypatch):
+        """The anonymous weekly quota is process-wide class state; a 429 in
+        one test must not exhaust it for the next (or for other test files)."""
+        monkeypatch.setattr(GreyNoiseAdapter, "_weekly_requests_used", 0)
+        monkeypatch.setattr(GreyNoiseAdapter, "_quota_reset_time", 0.0)
+        monkeypatch.setattr(GreyNoiseAdapter, "_quota_remaining", None)
+
     def test_supported_types(self):
         a = GreyNoiseAdapter()
         assert a.supported_types == ["ipv4"]
@@ -114,7 +122,9 @@ class TestGreyNoiseAdapter:
             r = await a.lookup("1.2.3.4", "ipv4")
         assert r.verdict == "unknown"
         assert "internet_scanner" in r.tags
-        assert "classification:noise" in r.tags
+        assert r.raw_data["classification"] == "noise"
+        assert r.raw_data["name"] == "Unknown Scanner"
+        assert r.raw_data["last_seen"] == "2025-01-01"
 
     @pytest.mark.asyncio
     async def test_riot_classification(self):
@@ -148,7 +158,8 @@ class TestGreyNoiseAdapter:
         with patch("httpx.AsyncClient", mock_class):
             r = await a.lookup("10.0.0.1", "ipv4")
         assert r.verdict == "unknown"
-        assert r.raw_score == 0.0
+        assert r.execution_state == "not_found"
+        assert r.raw_score is None
 
     @pytest.mark.asyncio
     async def test_401_unauthorized(self):
@@ -156,7 +167,8 @@ class TestGreyNoiseAdapter:
         mock_class, _ = _mock_async_client(status_code=401)
         with patch("httpx.AsyncClient", mock_class):
             r = await a.lookup("8.8.8.8", "ipv4")
-        assert r.verdict == "error"
+        assert r.verdict == "unknown"
+        assert r.execution_state == "unavailable"
         assert "unauthorized" in r.tags
 
     @pytest.mark.asyncio
@@ -217,7 +229,8 @@ class TestAlienVaultOTXAdapter:
         mock_class, _ = _mock_async_client(status_code=401)
         with patch("httpx.AsyncClient", mock_class):
             r = await a.lookup("8.8.8.8", "ipv4")
-        assert r.verdict == "error"
+        assert r.verdict == "unknown"
+        assert r.execution_state == "unavailable"
         assert "unauthorized" in r.tags
 
     @pytest.mark.asyncio
@@ -228,7 +241,8 @@ class TestAlienVaultOTXAdapter:
         with patch("httpx.AsyncClient", mock_class):
             r = await a.lookup("8.8.8.8", "ipv4")
         assert r.verdict == "unknown"
-        assert r.raw_score == 0.0
+        assert r.execution_state == "not_found"
+        assert r.raw_score is None
 
     @pytest.mark.asyncio
     async def test_timeout_returns_normalized_error(self):
@@ -246,14 +260,21 @@ class TestAlienVaultOTXAdapter:
 
     @pytest.mark.asyncio
     async def test_malicious_response(self):
-        """pulse_count>0 AND threat_score>=5 → malicious / high."""
+        """3+ pulses that name a malware family or ATT&CK technique -> malicious.
+
+        The verdict comes from the indicator's own ``general`` pulse_info
+        (pulse membership with attribution), not from a top-level threat_score,
+        and pulse names are structured raw_data rather than tags.
+        """
         data = {
-            "pulse_count": 8,
-            "threat_score": 7,
-            "pulses": [
-                {"name": "Emotet C2", "threat_type": "malware"},
-                {"name": "Malicious IP", "threat_type": "c2"},
-            ],
+            "pulse_info": {
+                "count": 8,
+                "pulses": [
+                    {"name": "Emotet C2", "malware_families": [{"display_name": "Emotet"}],
+                     "attack_ids": [{"id": "T1071"}]},
+                    {"name": "Malicious IP"},
+                ],
+            },
         }
         a = AlienVaultOTXAdapter()
         a.api_key = "valid"
@@ -262,20 +283,22 @@ class TestAlienVaultOTXAdapter:
             r = await a.lookup("1.2.3.4", "ipv4")
         assert r.verdict == "malicious"
         assert r.raw_score == 0.7
-        assert r.confidence == "high"
+        assert r.confidence == "medium"
         assert r.reports_count == 8
-        # Tags from pulses
-        tags_str = " ".join(r.tags)
-        assert "Emotet C2" in tags_str
-        assert "Malicious IP" in tags_str
+        assert r.malware_family == "Emotet"
+        assert r.mitre_attck == ["T1071"]
+        assert r.raw_data["pulse_count"] == 8
+        assert "Emotet C2" in r.raw_data["pulse_names"]
+        assert "Emotet C2" not in " ".join(r.tags)
 
     @pytest.mark.asyncio
     async def test_suspicious_response(self):
-        """pulse_count>0 but threat_score<5 → suspicious / medium."""
+        """Pulse membership without any family/technique attribution -> suspicious."""
         data = {
-            "pulse_count": 3,
-            "threat_score": 2,
-            "pulses": [{"name": "Suspicious", "threat_type": "scan"}],
+            "pulse_info": {
+                "count": 3,
+                "pulses": [{"name": "Suspicious"}],
+            },
         }
         a = AlienVaultOTXAdapter()
         a.api_key = "valid"
@@ -288,24 +311,39 @@ class TestAlienVaultOTXAdapter:
 
     @pytest.mark.asyncio
     async def test_unknown_response(self):
-        """pulse_count==0 → unknown / low."""
-        data = {"pulse_count": 0, "threat_score": 0, "pulses": []}
+        """pulse_count==0 -> not found (no pulse references the indicator)."""
+        data = {"pulse_info": {"count": 0, "pulses": []}}
         a = AlienVaultOTXAdapter()
         a.api_key = "valid"
         mock_class, _ = _mock_async_client(json_data=data)
         with patch("httpx.AsyncClient", mock_class):
             r = await a.lookup("1.2.3.4", "ipv4")
         assert r.verdict == "unknown"
+        assert r.execution_state == "not_found"
         assert r.raw_score is None
         assert r.confidence == "low"
+
+    @pytest.mark.asyncio
+    async def test_whitelist_validation_is_not_malicious(self):
+        data = {
+            "pulse_info": {"count": 9, "pulses": [{"name": "p", "malware_families": ["Emotet"]}]},
+            "validation": [{"source": "whitelist", "message": "Whitelisted domain", "name": "Whitelisted"}],
+        }
+        a = AlienVaultOTXAdapter()
+        a.api_key = "valid"
+        mock_class, _ = _mock_async_client(json_data=data)
+        with patch("httpx.AsyncClient", mock_class):
+            r = await a.lookup("google.com", "domain")
+        assert r.verdict == "whitelisted"
 
     @pytest.mark.asyncio
     async def test_url_type(self):
         """URL type maps to 'url' segment."""
         data = {
-            "pulse_count": 5,
-            "threat_score": 6,
-            "pulses": [{"name": "Phishing URL", "threat_type": "phishing"}],
+            "pulse_info": {
+                "count": 5,
+                "pulses": [{"name": "Phishing URL", "malware_families": [{"display_name": "Kit"}]}],
+            },
         }
         a = AlienVaultOTXAdapter()
         a.api_key = "valid"
@@ -313,7 +351,7 @@ class TestAlienVaultOTXAdapter:
         with patch("httpx.AsyncClient", mock_class):
             r = await a.lookup("https://evil.com/phish", "url")
         assert r.verdict == "malicious"
-        assert r.raw_score == 0.6
+        assert r.raw_score == 0.7
 
     @pytest.mark.asyncio
     async def test_unsupported_type(self):
@@ -351,8 +389,9 @@ class TestShodanAdapter:
         mock_class, _ = _mock_async_client(status_code=401)
         with patch("httpx.AsyncClient", mock_class):
             r = await a.lookup("8.8.8.8", "ipv4")
-        assert r.verdict == "error"
-        assert "unauthorized" in r.tags
+        assert r.verdict == "unknown"
+        assert r.execution_state == "unavailable"
+        assert "invalid_api_key" in r.tags
 
     @pytest.mark.asyncio
     async def test_404_not_found(self):
@@ -382,9 +421,12 @@ class TestShodanAdapter:
             r = await a.lookup("1.2.3.4", "ipv4")
         assert r.verdict == "unknown"
         assert r.raw_score is None
-        assert "vulns:CVE-2021-1234" in r.tags
-        assert "ports:80,443,22" in r.tags
-        assert "hostname:example.com" in r.tags
+        # Ports, vulnerabilities and hostnames are structured raw_data.
+        assert r.raw_data["vulns"] == ["CVE-2021-1234"]
+        assert r.raw_data["ports"] == [80, 443, 22]
+        assert r.raw_data["hostnames"] == ["example.com", "www.example.com"]
+        assert r.raw_data["org"] == "Example Corp"
+        assert "known_vulnerabilities" in r.tags
         assert r.categories is not None
         assert "Example Corp" in r.categories
 
@@ -399,7 +441,7 @@ class TestShodanAdapter:
             r = await a.lookup("1.2.3.4", "ipv4")
         assert r.verdict == "unknown"
         assert r.raw_score is None
-        assert "ports:80" in r.tags
+        assert r.raw_data["ports"] == [80]
         assert r.categories is not None
 
 
@@ -491,7 +533,8 @@ class TestURLHausAdapter:
         assert r.verdict == "malicious"
         assert r.raw_score == 1.0
         assert "malware_url" in r.tags
-        assert "threat:malware_download" in r.tags
+        # The threat class is a category, not a "threat:..." tag.
+        assert r.categories == ["malware_download"]
         assert "emotet" in r.tags
         assert r.source_link == "https://urlhaus.abuse.ch/url/123/"
 
@@ -514,14 +557,24 @@ class TestURLHausAdapter:
 
     @pytest.mark.asyncio
     async def test_unknown_response(self):
-        """query_status not 'ok' → unknown."""
-        data = {"query_status": "no_result"}
+        """URLhaus answers ``no_results`` for an unlisted URL -> not_found."""
+        data = {"query_status": "no_results"}
         a = URLHausAdapter()
         mock_class, _ = _mock_async_client(json_data=data)
         with patch("httpx.AsyncClient", mock_class):
             r = await a.lookup("https://safe.example.com", "url")
         assert r.verdict == "unknown"
-        assert r.raw_score == 0.0
+        assert r.execution_state == "not_found"
+        assert r.raw_score is None
+
+    @pytest.mark.asyncio
+    async def test_unexpected_query_status_is_an_error(self):
+        """An unrecognised query_status is a provider problem, not "not found"."""
+        a = URLHausAdapter()
+        mock_class, _ = _mock_async_client(json_data={"query_status": "no_result"})
+        with patch("httpx.AsyncClient", mock_class):
+            r = await a.lookup("https://safe.example.com", "url")
+        assert r.execution_state == "error"
 
     @pytest.mark.asyncio
     async def test_error_response(self):
@@ -542,18 +595,45 @@ class TestURLHausAdapter:
         assert r.execution_state == "error"
         assert "request_error" in r.tags
 
-        """Domain type works the same as URL."""
+    @pytest.mark.asyncio
+    async def test_domain_type_uses_host_endpoint(self):
+        """Domain lookups query /host/: malware URLs hosted on the host are
+        evidence about the host (suspicious), not a malicious verdict for it."""
         data = {
             "query_status": "ok",
-            "url_status": "online",
-            "tags": ["malware"],
+            "host": "evil.com",
+            "url_count": 3,
+            "urls": [{"url": "http://evil.com/a.exe", "url_status": "online", "threat": "malware_download"}],
+            "blacklists": {},
         }
         a = URLHausAdapter()
         mock_class, _ = _mock_async_client(json_data=data)
         with patch("httpx.AsyncClient", mock_class):
             r = await a.lookup("evil.com", "domain")
-        assert r.verdict == "malicious"
-        assert r.raw_score == 1.0
+        assert r.verdict == "suspicious"
+        assert r.raw_data["url_count"] == 3
+        assert r.raw_data["online_url_count"] == 1
+        assert "malware_hosting" in r.tags
+
+    @pytest.mark.asyncio
+    async def test_domain_record_for_another_host_is_context_only(self):
+        data = {"query_status": "ok", "host": "sub.evil.com", "url_count": 2, "urls": []}
+        a = URLHausAdapter()
+        mock_class, _ = _mock_async_client(json_data=data)
+        with patch("httpx.AsyncClient", mock_class):
+            r = await a.lookup("evil.com", "domain")
+        assert r.verdict == "unknown"
+        assert r.execution_state == "not_found"
+
+    @pytest.mark.asyncio
+    async def test_url_record_for_another_url_is_context_only(self):
+        data = {"query_status": "ok", "url": "https://evil.com/other.exe", "url_status": "online"}
+        a = URLHausAdapter()
+        mock_class, _ = _mock_async_client(json_data=data)
+        with patch("httpx.AsyncClient", mock_class):
+            r = await a.lookup("https://evil.com/emotet.exe", "url")
+        assert r.verdict == "unknown"
+        assert r.execution_state == "not_found"
 
 
 # ============================================================
@@ -561,6 +641,19 @@ class TestURLHausAdapter:
 # ============================================================
 
 class TestTorExitAdapter:
+    @pytest.fixture(autouse=True)
+    def _isolate_tor_state(self, monkeypatch):
+        """No real DNS/HTTP: reset the module cache and failure back-off, and
+        make the DNS exit-list fallback unable to answer."""
+        monkeypatch.setattr(_tor_exit_mod, "_cache", set())
+        monkeypatch.setattr(_tor_exit_mod, "_cache_time", 0.0)
+        monkeypatch.setattr(_tor_exit_mod, "_last_failure", 0.0)
+
+        async def _no_dnsel(self, ioc_value):
+            return None
+
+        monkeypatch.setattr(TorExitAdapter, "_check_dnsel", _no_dnsel)
+
     def test_supported_types(self):
         a = TorExitAdapter()
         assert a.supported_types == ["ipv4"]
@@ -578,9 +671,12 @@ class TestTorExitAdapter:
         a = TorExitAdapter()
         with patch("httpx.AsyncClient", mock_class):
             r = await a.lookup("1.2.3.4", "ipv4")
-        assert r.verdict == "malicious"
-        assert r.raw_score == 0.8
+        # Tor membership is anonymization context, not a maliciousness verdict.
+        assert r.verdict == "unknown"
+        assert r.provider_verdict == "tor_exit_node"
+        assert r.raw_score is None
         assert "tor_exit_node" in r.tags
+        assert r.raw_data["tor_exit"] is True
 
     @pytest.mark.asyncio
     async def test_unknown_response(self):
@@ -596,11 +692,13 @@ class TestTorExitAdapter:
         with patch("httpx.AsyncClient", mock_class):
             r = await a.lookup("192.168.1.1", "ipv4")
         assert r.verdict == "unknown"
-        assert r.raw_score == 0.0
+        assert r.execution_state == "not_found"
+        assert r.raw_score is None
+        assert r.raw_data["tor_exit"] is False
 
     @pytest.mark.asyncio
     async def test_feed_unavailable(self):
-        """Feed download fails → unknown (cache stays empty)."""
+        """Feed download fails -> unavailable (never "not a Tor exit")."""
         _tor_exit_mod._cache = []
         _tor_exit_mod._cache_time = 0.0
 
@@ -609,7 +707,8 @@ class TestTorExitAdapter:
         with patch("httpx.AsyncClient", mock_class):
             r = await a.lookup("1.2.3.4", "ipv4")
         assert r.verdict == "unknown"
-        assert r.raw_score == 0.0
+        assert r.execution_state == "unavailable"
+        assert "feed_unavailable" in r.tags
 
     @pytest.mark.asyncio
     async def test_cache_hit(self):
@@ -620,7 +719,8 @@ class TestTorExitAdapter:
         # Even without patching httpx, the cached entry should match
         a = TorExitAdapter()
         r = await a.lookup("10.0.0.1", "ipv4")
-        assert r.verdict == "malicious"
+        assert r.verdict == "unknown"
+        assert r.provider_verdict == "tor_exit_node"
         assert "tor_exit_node" in r.tags
 
 
@@ -661,7 +761,8 @@ class TestCensysAdapter:
         mock_class, _ = _mock_async_client(status_code=401)
         with patch("httpx.AsyncClient", mock_class):
             r = await a.lookup("8.8.8.8", "ipv4")
-        assert r.verdict == "error"
+        assert r.verdict == "unknown"
+        assert r.execution_state == "unavailable"
         assert "unauthorized" in r.tags
 
     @pytest.mark.asyncio
@@ -738,8 +839,12 @@ class TestCensysAdapter:
         assert r.verdict == "unknown"
         assert r.raw_score is None
         assert r.status == "found"
-        assert "services:3" in r.tags
-        assert "ports:80,443,22" in r.tags
+        # Services and ports are structured raw_data; the tag is a label.
+        assert r.tags == ["active_ip"]
+        assert r.raw_data["service_count"] == 3
+        assert r.raw_data["ports"] == [80, 443, 22]
+        assert r.raw_data["location"]["city"] == "Mountain View"
+        assert r.raw_data["autonomous_system"]["asn"] == 15169
 
     @pytest.mark.asyncio
     async def test_empty_services(self):
@@ -778,7 +883,11 @@ class TestCensysAdapter:
         a._has_credentials = False
         r = await a.lookup("1.2.3.4", "ipv4")
         assert r.verdict == "unknown"
+        # A configuration gap is unavailable, never a successful lookup.
+        assert r.execution_state == "unavailable"
+        assert r.request_made is False
         assert "censys_organization_id_missing" in r.tags
+        assert "CENSYS_ORGANIZATION_ID" in r.provider_summary
 
     @pytest.mark.asyncio
     async def test_422_is_not_reported_as_a_provider_outage(self):
@@ -789,8 +898,8 @@ class TestCensysAdapter:
         mock_class, _ = _mock_async_client(status_code=422, json_data={})
         with patch("httpx.AsyncClient", mock_class):
             r = await a.lookup("1.2.3.4", "ipv4")
-        assert r.verdict == "error"
-        assert r.tags == ["http_422"]
+        assert r.execution_state == "invalid_request"
+        assert r.tags == ["http_422", "invalid_request"]
 
 
 # ============================================================
@@ -810,6 +919,16 @@ class TestIPinfoAdapter:
         with patch("httpx.AsyncClient", mock_class):
             r = await a.lookup("8.8.8.8", "ipv4")
         assert r.verdict == "unknown"
+        assert r.execution_state == "not_found"
+
+    @pytest.mark.asyncio
+    async def test_lite_endpoint_outage_is_flagged(self):
+        a = IPinfoAdapter()
+        a.api_key = ""
+        mock_class = _mock_async_router({"ipinfo.io": (503, {})})
+        with patch("httpx.AsyncClient", mock_class):
+            r = await a.lookup("8.8.8.8", "ipv4")
+        assert r.execution_state == "error"
         assert "lite_api_unavailable" in r.tags
 
     @pytest.mark.asyncio
@@ -819,7 +938,8 @@ class TestIPinfoAdapter:
         mock_class, _ = _mock_async_client(status_code=401)
         with patch("httpx.AsyncClient", mock_class):
             r = await a.lookup("8.8.8.8", "ipv4")
-        assert r.verdict == "error"
+        assert r.verdict == "unknown"
+        assert r.execution_state == "unavailable"
         assert "unauthorized" in r.tags
 
     @pytest.mark.asyncio
@@ -849,12 +969,27 @@ class TestIPinfoAdapter:
         with patch("httpx.AsyncClient", mock_class):
             r = await a.lookup("8.8.8.8", "ipv4")
         assert r.verdict == "unknown"
-        assert "city:Mountain View" in r.tags
-        assert "region:California" in r.tags
-        assert "country:US" in r.tags
-        assert "org:AS15169 Google LLC" in r.tags
-        assert "asn:AS15169" in r.tags
-        assert "asn_name:Google LLC" in r.tags
+        # Geo/ASN values are structured raw_data, not tags.
+        assert r.raw_data["city"] == "Mountain View"
+        assert r.raw_data["region"] == "California"
+        assert r.raw_data["country"] == "US"
+        assert r.raw_data["org"] == "AS15169 Google LLC"
+        assert r.raw_data["asn"] == "AS15169"
+        assert r.raw_data["asn_name"] == "Google LLC"
+        assert not any(tag.startswith(("city:", "asn:", "org:")) for tag in r.tags)
+
+    @pytest.mark.asyncio
+    async def test_hosting_network_is_context_not_suspicious(self):
+        data = {"ip": "8.8.8.8", "hosting": {"is_hosting": True}}
+        a = IPinfoAdapter()
+        a.api_key = "valid"
+        mock_class, _ = _mock_async_client(json_data=data)
+        with patch("httpx.AsyncClient", mock_class):
+            r = await a.lookup("8.8.8.8", "ipv4")
+        assert r.verdict == "unknown"
+        assert r.raw_score is None
+        assert r.raw_data["is_hosting"] is True
+        assert "hosting_provider" in r.tags
 
 
 # ============================================================
@@ -869,7 +1004,8 @@ class TestExtendedAdapterConsistency:
         ("AlienVault OTX", AlienVaultOTXAdapter, ["ipv4", "ipv6", "domain", "url", "md5", "sha1", "sha256"]),
         ("Shodan", ShodanAdapter, ["ipv4"]),
         ("OpenPhish", OpenPhishAdapter, ["url"]),
-        ("URLhaus", URLHausAdapter, ["url", "domain", "md5", "sha1", "sha256"]),
+        # The URLhaus payload endpoint accepts md5_hash / sha256_hash only.
+        ("URLhaus", URLHausAdapter, ["url", "domain", "md5", "sha256"]),
         ("Tor Exit", TorExitAdapter, ["ipv4"]),
         ("Censys", CensysAdapter, ["ipv4"]),
         ("IPinfo", IPinfoAdapter, ["ipv4", "ipv6"]),

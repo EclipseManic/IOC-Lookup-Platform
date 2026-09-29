@@ -1,5 +1,6 @@
 import ipaddress
 
+from app.backend.adapters._http import MalformedResponse, failure, http_failure, malformed, read_json
 from app.backend.adapters.base import NormalizedResult, RateLimitConfig, SourceAdapter
 
 _DOH_ENDPOINT = "https://cloudflare-dns.com/dns-query"
@@ -30,6 +31,11 @@ class TeamCymruAdapter(SourceAdapter):
     name = "Team Cymru"
     supported_types = ["ipv4", "ipv6"]
     public_without_key = True
+    evidence_roles = ("context",)
+    direct_threat_evidence = False
+    produces_reputation = False
+    produces_infrastructure_context = True
+    produces_metadata = True
     rate_limit = RateLimitConfig(requests_per_minute=30)
 
     async def lookup(self, ioc_value: str, ioc_type: str) -> NormalizedResult:
@@ -42,38 +48,54 @@ class TeamCymruAdapter(SourceAdapter):
             timeout=10,
         )
 
-        if resp.status_code != 200:
-            return NormalizedResult(
-                ioc=ioc_value, ioc_type=ioc_type, source=self.name,
-                verdict="error", tags=[f"http_{resp.status_code}"],
-            )
-
-        data = resp.json()
-        doh_status = int(data.get("Status", 0) or 0)
+        failed = http_failure(self.name, ioc_value, ioc_type, resp, key_sent=False)
+        if failed is not None:
+            if failed.execution_state == "not_found":
+                # A DoH endpoint never answers 404 for a valid query.
+                failed = failure(self.name, ioc_value, ioc_type, "error", ["http_404"], "DNS-over-HTTPS resolver returned HTTP 404", http_status=404)
+            return failed
+        try:
+            data = read_json(resp)
+        except MalformedResponse as exc:
+            return malformed(self.name, ioc_value, ioc_type, exc.reason, resp.status_code)
+        if not isinstance(data, dict):
+            return malformed(self.name, ioc_value, ioc_type)
+        try:
+            doh_status = int(data.get("Status", 0) or 0)
+        except (TypeError, ValueError):
+            return malformed(self.name, ioc_value, ioc_type)
         if doh_status not in (0, 3):
-            return NormalizedResult(
-                ioc=ioc_value, ioc_type=ioc_type, source=self.name,
-                verdict="error", tags=[f"doh_status:{doh_status}"],
+            return failure(
+                self.name, ioc_value, ioc_type, "error", [f"doh_status:{doh_status}"],
+                f"Bogon DNS query failed (DNS status {doh_status})",
             )
 
         prefixes = [
             str(a.get("data", "")).strip().strip('"')
             for a in (data.get("Answer") or [])
-            if a.get("type") == 16 and a.get("data")
+            if isinstance(a, dict) and a.get("type") == 16 and a.get("data")
         ]
 
         if prefixes:
             prefix = prefixes[0]
+            # A publicly-seen address inside an unallocated/bogon prefix is an
+            # anomaly (spoofing or hijacked space) worth flagging.
             return NormalizedResult(
                 ioc=ioc_value, ioc_type=ioc_type, source=self.name,
                 verdict="suspicious", raw_score=0.3, confidence="medium",
                 tags=["bogon", f"bogon_prefix:{prefix}"],
                 source_link="https://www.team-cymru.com/bogon-reference-dns",
+                provider_summary=f"Address is inside bogon prefix {prefix}",
+                raw_data={"bogon": True, "bogon_prefix": prefix},
             )
 
+        # Not being a bogon says nothing about reputation.
         return NormalizedResult(
             ioc=ioc_value, ioc_type=ioc_type, source=self.name,
-            verdict="clean", raw_score=0.0, confidence="low",
+            verdict="unknown", provider_verdict="not_bogon", normalized_verdict="unknown",
+            raw_score=None, confidence="low",
             tags=["not_bogon"],
             source_link="https://www.team-cymru.com/bogon-reference-dns",
+            provider_summary="Allocated address space (not a bogon)",
+            raw_data={"bogon": False},
         )

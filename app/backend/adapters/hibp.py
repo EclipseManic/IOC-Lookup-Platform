@@ -66,7 +66,7 @@ class HIBPAdapter(SourceAdapter):
                 tags=["timeout"],
             )
         except httpx.HTTPError as exc:
-            logger.warning("HIBP request error: %s", exc)
+            logger.warning("HIBP request error: %s: %r", type(exc).__name__, exc)
             return NormalizedResult(
                 ioc=ioc_value,
                 ioc_type=ioc_type,
@@ -121,11 +121,7 @@ class HIBPAdapter(SourceAdapter):
                 raw_score=round(score, 3),
                 confidence="high",
                 reports_count=match_count,
-                tags=[
-                    "compromised_credential",
-                    "pwned_password",
-                    f"breach_occurrences:{match_count:,}",
-                ],
+                tags=["compromised_credential", "pwned_password"],
                 source_link="https://haveibeenpwned.com/Passwords",
                 provider_summary=f"Compromised credential: seen in {match_count:,} breach dumps",
                 raw_data={"hash_suffix": suffix, "breach_occurrences": match_count},
@@ -136,7 +132,9 @@ class HIBPAdapter(SourceAdapter):
             ioc_type=ioc_type,
             source=self.name,
             status="found",
-            verdict="clean",
+            # Absence from the corpus is "not observed", not proof the
+            # credential is safe.
+            verdict="undetected",
             raw_score=0.0,
             confidence="low",
             tags=["not_in_pwned_passwords"],

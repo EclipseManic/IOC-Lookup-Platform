@@ -1,6 +1,6 @@
-import json
-
-from app.backend.adapters.base import NormalizedResult, RateLimitConfig, SourceAdapter, retry_after_seconds
+from app.backend.adapters._http import MalformedResponse, http_failure, malformed, read_json
+from app.backend.adapters.base import NormalizedResult, RateLimitConfig, SourceAdapter, is_valid_api_key, retry_after_seconds
+from app.backend.config import settings
 
 
 def _severity_label(score: float) -> str:
@@ -12,14 +12,22 @@ def _severity_label(score: float) -> str:
         return "MEDIUM"
     return "LOW"
 
+def _as_vulnerability(result):
+    """Failures for CVE lookups stay in the vulnerability domain, where a
+    verdict is never used (the execution state carries the failure)."""
+    result.assessment_domain = "vulnerability"
+    result.verdict = "unknown"
+    return result
+
 
 class NvdAdapter(SourceAdapter):
     """NVD CVE record lookup against the official NIST NVD JSON 2.0 API.
 
     ``GET https://services.nvd.nist.gov/rest/json/cves/2.0?cveId={id}`` is
-    publicly readable (no key) at ~5 requests/30s. Records without CVSS data
-    map to ``unknown``; CVSS base scores drive conservative severity-derived
-    verdicts. NVD complements cve.org as a second key-free CVE source.
+    publicly readable (no key) at 5 requests/30s; with ``NVD_API_KEY`` (sent as
+    the ``apiKey`` header) the limit is 50 requests/30s. Records carry typed
+    vulnerability data (CVSS, CWE, references) and never a reputation verdict.
+    NVD complements cve.org as a second key-free CVE source.
     """
 
     name = "NVD"
@@ -30,14 +38,26 @@ class NvdAdapter(SourceAdapter):
     produces_metadata = True
     produces_relationships = True
     provenance_family = "cve_records"
+    # Without a key: 5 requests per rolling 30 s (= 10/min).
     rate_limit = RateLimitConfig(requests_per_minute=10)
+    # With a key: 50 requests per rolling 30 s.
+    KEYED_REQUESTS_PER_MINUTE = 100
+
+    def __init__(self):
+        self.api_key = settings.nvd_api_key
+        if is_valid_api_key(self.api_key):
+            self.rate_limit = self.rate_limit.model_copy(
+                update={"requests_per_minute": self.KEYED_REQUESTS_PER_MINUTE}
+            )
 
     async def lookup(self, ioc_value: str, ioc_type: str) -> NormalizedResult:
         cve_id = ioc_value.strip().upper()
         client = self._get_client()
+        key_sent = is_valid_api_key(self.api_key)
         resp = await client.get(
             "https://services.nvd.nist.gov/rest/json/cves/2.0",
             params={"cveId": cve_id},
+            headers={"apiKey": self.api_key} if key_sent else None,
             timeout=15,
         )
 
@@ -47,19 +67,21 @@ class NvdAdapter(SourceAdapter):
                 verdict="unknown", provider_verdict="rate_limited", assessment_domain="vulnerability", tags=["rate_limited"], http_status=resp.status_code,
                 retry_after_seconds=retry_after_seconds(resp),
             )
-        if resp.status_code != 200:
-            return NormalizedResult(
-                ioc=cve_id, ioc_type=ioc_type, source=self.name,
-                verdict="unknown", provider_verdict="provider_error", assessment_domain="vulnerability", tags=[f"http_{resp.status_code}"],
-            )
+        failed = http_failure(self.name, cve_id, ioc_type, resp, key_sent=key_sent)
+        if failed is not None:
+            _as_vulnerability(failed)
+            return failed
 
         try:
-            data = resp.json()
-        except (ValueError, json.JSONDecodeError):
-            return NormalizedResult(
-                ioc=cve_id, ioc_type=ioc_type, source=self.name,
-                verdict="unknown", provider_verdict="malformed_response", assessment_domain="vulnerability", tags=["malformed_response"],
-            )
+            data = read_json(resp)
+        except MalformedResponse as exc:
+            failed = malformed(self.name, cve_id, ioc_type, exc.reason, resp.status_code)
+            _as_vulnerability(failed)
+            return failed
+        if not isinstance(data, dict):
+            failed = malformed(self.name, cve_id, ioc_type, http_status=resp.status_code)
+            _as_vulnerability(failed)
+            return failed
         vulnerabilities = data.get("vulnerabilities") or []
         if not vulnerabilities:
             return NormalizedResult(
@@ -104,22 +126,13 @@ class NvdAdapter(SourceAdapter):
             ref.get("url", "") for ref in (record.get("references") or []) if ref.get("url")
         ]
 
+        # Tags are labels only; CVSS, CWE and reference values are typed
+        # fields on the result and in raw_data.
         tags = []
         if description:
             tags.append("record_found")
         if vuln_status.upper() == "REJECTED":
             tags.append("rejected")
-        if record.get("cveTags"):
-            tags.append(f"cve_tags:{len(record['cveTags'])}")
-        if base_score is not None:
-            tags.append(f"cvss:{base_score}")
-            tags.append(f"severity:{severity}" if severity else f"severity:{_severity_label(base_score)}")
-        for cwe in cwes[:5]:
-            tags.append(f"cwe:{cwe}")
-        if references:
-            tags.append(f"references:{len(references)}")
-
-        tags = list(dict.fromkeys(tags))
 
         verdict = "unknown"
         raw_score = None
@@ -158,7 +171,11 @@ class NvdAdapter(SourceAdapter):
                 "cve_id": cve_id,
                 "description": description[:500],
                 "cvss": cvss,
+                "cvss_score": base_score,
+                "severity": (severity or (_severity_label(base_score) if base_score is not None else "")).lower() or None,
                 "cwes": cwe_values,
+                "reference_count": len(references),
+                "cve_tags": record.get("cveTags") or [],
                 "references": references[:20],
                 "published": record.get("published"),
                 "lastModified": record.get("lastModified"),

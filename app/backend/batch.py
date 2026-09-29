@@ -188,6 +188,14 @@ def normalize_batch_iocs_typed(values: list[str]) -> list[tuple[str, str | None]
     return normalized
 
 
+def _planned_not_applicable(task: AnalysisTask) -> int:
+    """Providers the plan marked not applicable for this IOC."""
+    return sum(
+        1 for item in (getattr(task, "provider_plan", None) or [])
+        if isinstance(item, dict) and item.get("applicable") is False
+    )
+
+
 class BatchTask:
     def __init__(self, batch_id: str, iocs: list[str], type_overrides: dict[str, str] | None = None):
         self.batch_id = batch_id
@@ -241,6 +249,9 @@ class BatchTask:
                 self.expected_lookups += int(assessment.evidence_summary.get("expected_providers", len(task.results)) or 0)
             else:
                 self.expected_lookups += len(task.results)
+            # Applicability lives in the provider plan; results only carry
+            # legacy not_applicable rows for tasks stored before that change.
+            self.not_applicable_lookups += _planned_not_applicable(task)
             for raw_result in task.results:
                 if isinstance(raw_result, dict):
                     legacy_result = dict(raw_result)
@@ -494,14 +505,25 @@ async def run_batch_analysis(iocs: list[str], batch_id: Optional[str] = None,
                 fp = False
                 if fp_overrides:
                     fp = refang(clean_val) in fp_overrides
-                kwargs = {"task_id": f"{bid}-{uuid.uuid4().hex[:12]}", "fp_override": fp}
+                # run_analysis finalizes on its own IOC deadline with whatever
+                # providers answered (timeouts recorded as such).  Give it a
+                # deadline slightly inside the outer safety timeout -- and
+                # inside the remaining batch time -- so the outer wait_for
+                # never discards a nearly finished, partially useful result.
+                budget = max(0.05, min(float(ioc_timeout), batch_deadline - time.monotonic()))
+                ioc_deadline = max(0.05, budget - min(5.0, budget * 0.1))
+                kwargs = {
+                    "task_id": f"{bid}-{uuid.uuid4().hex[:12]}",
+                    "fp_override": fp,
+                    "ioc_deadline": ioc_deadline,
+                }
                 if ioc_type_override is not None:
                     kwargs["ioc_type_override"] = ioc_type_override
                 if ioc_type_override == "password":
                     kwargs["password_prehashed"] = bool(re.fullmatch(r"[a-f0-9]{40}", clean_val, re.IGNORECASE))
                 task = await asyncio.wait_for(
                     run_analysis(clean_val, **kwargs),
-                    timeout=ioc_timeout,
+                    timeout=budget,
                 )
                 if task.status == "error" and task.final_assessment is None:
                     value = refang(clean_val)
@@ -1173,6 +1195,7 @@ def consolidate_batch_results(batch: BatchTask) -> dict:
     execution_health = {"applicable_provider_lookups": 0, "successful": 0, "not_found": 0, "rate_limited": 0, "timeout": 0, "errors": 0, "not_applicable": 0, "cached": 0, "partial": 0, "batch_deadline_exceeded": 0}
 
     for task in batch.subtasks:
+        execution_health["not_applicable"] += _planned_not_applicable(task)
         verdict = task.final_assessment.final_verdict if task.final_assessment else (task.composite.verdict if task.composite else ("error" if task.status == "error" else "unknown"))
         domain_bucket = None
         if task.final_assessment and task.final_assessment.assessment_domain == "vulnerability":

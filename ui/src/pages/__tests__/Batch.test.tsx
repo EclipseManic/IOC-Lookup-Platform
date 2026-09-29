@@ -10,11 +10,20 @@ const mocks = vi.hoisted(() => ({
   saveBatchHistory: vi.fn(),
   buildLookupResponseFromBatch: vi.fn(() => ({}) as never),
   showToast: vi.fn(),
+  ApiError: class ApiError extends Error {
+    status: number;
+    constructor(message: string, status: number) {
+      super(message);
+      this.status = status;
+    }
+  },
 }));
 
 const { startBatch, getBatchStatus, getBatchResult, showToast } = mocks;
 
 vi.mock("../../services/api", () => ({
+  ApiError: mocks.ApiError,
+  errorMessage: (error: unknown, fallback = "Request failed") => (error instanceof Error && error.message ? error.message : fallback),
   startBatch: mocks.startBatch,
   getBatchStatus: mocks.getBatchStatus,
   getBatchResult: mocks.getBatchResult,
@@ -137,6 +146,7 @@ describe("Batch polling terminal states", () => {
   beforeEach(() => {
     vi.useFakeTimers({ shouldAdvanceTime: true });
     vi.clearAllMocks();
+    window.sessionStorage.clear();
     startBatch.mockResolvedValue({ batch_id: "batch-1", total: 11, status: "pending" });
     getBatchStatus.mockResolvedValue(STATUS_DONE);
     getBatchResult.mockResolvedValue(makeResult());
@@ -166,7 +176,9 @@ describe("Batch polling terminal states", () => {
     fireEvent.click(screen.getByRole("button", { name: /analyze/i }));
     await vi.advanceTimersByTimeAsync(1500);
 
-    expect(screen.getByRole("button", { name: /cancel batch/i })).toBeTruthy();
+    await waitFor(() => {
+      expect(screen.getByRole("button", { name: /cancel batch/i })).toBeTruthy();
+    });
     expect(screen.getByText(/Processing 5\/11 IOCs/)).toBeTruthy();
     expect(screen.queryByTestId("assessment-card")).toBeNull();
   });
@@ -192,7 +204,73 @@ describe("Batch polling terminal states", () => {
     fireEvent.click(screen.getByRole("button", { name: /analyze/i }));
     await vi.advanceTimersByTimeAsync(1500);
 
-    expect(showToast).toHaveBeenCalledWith("provider storm", "error");
+    await waitFor(() => {
+      expect(showToast).toHaveBeenCalledWith("provider storm", "error");
+    });
     expect(screen.queryByRole("button", { name: /cancel batch/i })).toBeNull();
+  });
+
+  it("keeps polling through a transient status failure instead of aborting", async () => {
+    getBatchStatus
+      .mockRejectedValueOnce(new Error("Cannot reach the IOC platform backend."))
+      .mockResolvedValue(STATUS_DONE);
+    await startBatchAndWait();
+    await vi.advanceTimersByTimeAsync(1500);
+
+    await waitFor(() => {
+      expect(screen.getByTestId("assessment-card")).toBeTruthy();
+    });
+    expect(screen.queryByText(/Batch polling interrupted/)).toBeNull();
+  });
+
+  it("shows the retry card after repeated polling failures", async () => {
+    getBatchStatus.mockRejectedValue(new Error("Cannot reach the IOC platform backend."));
+    await startBatchAndWait();
+    await vi.advanceTimersByTimeAsync(8000);
+
+    await waitFor(() => {
+      expect(screen.getByText(/Batch polling interrupted/)).toBeTruthy();
+    });
+    expect(screen.getByRole("button", { name: /^retry$/i })).toBeTruthy();
+  });
+
+  it("keeps the batch failure visible after the toast", async () => {
+    getBatchStatus.mockResolvedValue({ ...STATUS_DONE, status: "error", error: "provider storm" });
+    await startBatchAndWait();
+
+    await waitFor(() => {
+      expect(screen.getByRole("alert").textContent).toContain("provider storm");
+    });
+  });
+
+  it("shows a starting notice instead of an empty page before the first status", async () => {
+    let resolveStart: (value: unknown) => void = () => undefined;
+    startBatch.mockReturnValue(new Promise((resolve) => { resolveStart = resolve; }));
+    render(<Batch />);
+    fireEvent.change(screen.getByRole("textbox"), { target: { value: "domain:coinhive.com" } });
+    fireEvent.click(screen.getByRole("button", { name: /analyze/i }));
+
+    await waitFor(() => {
+      expect(screen.getByText(/Starting batch/)).toBeTruthy();
+    });
+    resolveStart({ batch_id: "batch-1", total: 1, status: "pending" });
+  });
+
+  it("resumes a running batch after the Batch tab is remounted", async () => {
+    getBatchStatus.mockResolvedValue({ ...STATUS_DONE, status: "running", progress: 42, completed: 5 });
+    const first = render(<Batch />);
+    fireEvent.change(screen.getByRole("textbox"), { target: { value: "domain:coinhive.com" } });
+    fireEvent.click(screen.getByRole("button", { name: /analyze/i }));
+    await vi.advanceTimersByTimeAsync(1500);
+    first.unmount();
+
+    getBatchResult.mockRejectedValueOnce(new mocks.ApiError("not_ready", 425));
+    render(<Batch />);
+    await vi.advanceTimersByTimeAsync(1500);
+
+    await waitFor(() => {
+      expect(screen.getByText(/Processing 5\/11 IOCs/)).toBeTruthy();
+    });
+    expect(screen.queryByRole("textbox")).toBeNull();
   });
 });

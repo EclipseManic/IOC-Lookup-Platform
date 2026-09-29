@@ -46,7 +46,10 @@ async def test_nvd_critical_cvss_is_typed_vulnerability_data():
     assert result.assessment_domain == "vulnerability"
     assert result.cvss_score == 9.8
     assert result.source == "NVD"
-    assert "cvss:9.8" in result.tags
+    # CVSS is typed data (cvss_score, raw_data), not a tag.
+    assert result.raw_data["cvss_score"] == 9.8
+    assert result.raw_data["severity"] == "high"
+    assert "cvss:9.8" not in result.tags
     assert result.ioc == "CVE-2024-0001"
 
 

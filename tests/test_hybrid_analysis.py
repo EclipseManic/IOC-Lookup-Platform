@@ -50,7 +50,8 @@ class TestHybridAnalysisAdapter:
         with patch("httpx.AsyncClient", mock):
             r = await a.lookup("d41d8cd98f00b204e9800998ecf8427e", "md5")
         assert r.verdict == "unknown"
-        assert r.raw_score == 0.0
+        assert r.execution_state == "not_found"
+        assert r.raw_score is None
 
     @pytest.mark.asyncio
     async def test_401_unauthorized(self):
@@ -59,8 +60,9 @@ class TestHybridAnalysisAdapter:
         mock = _mock_client(status_code=401)
         with patch("httpx.AsyncClient", mock):
             r = await a.lookup("d41d8cd98f00b204e9800998ecf8427e", "md5")
-        assert r.verdict == "error"
-        assert "http_401" in r.tags
+        assert r.verdict == "unknown"
+        assert r.execution_state == "unavailable"
+        assert "invalid_api_key" in r.tags
 
     @pytest.mark.asyncio
     async def test_malicious_response(self):
@@ -152,7 +154,30 @@ class TestHybridAnalysisAdapter:
         with patch("httpx.AsyncClient", mock):
             r = await a.lookup("d41d8cd98f00b204e9800998ecf8427e", "md5")
         assert r.verdict == "unknown"
-        assert r.raw_score == 0.0
+        assert r.execution_state == "not_found"
+        assert r.raw_score is None
+
+    @pytest.mark.asyncio
+    async def test_report_for_a_different_hash_is_not_a_match(self):
+        report = {"threat_score": 100, "verdict": "malicious", "sha256": "f" * 64, "md5": "a" * 32}
+        a = HybridAnalysisAdapter()
+        a.api_key = "valid_key"
+        mock = _mock_client(status_code=200, json_data=[report])
+        with patch("httpx.AsyncClient", mock):
+            r = await a.lookup("d41d8cd98f00b204e9800998ecf8427e", "md5")
+        assert r.verdict == "unknown"
+        assert r.execution_state == "not_found"
+
+    @pytest.mark.asyncio
+    async def test_no_specific_threat_is_not_clean(self):
+        report = {"threat_score": 0, "verdict": "no specific threat", "md5": "d41d8cd98f00b204e9800998ecf8427e"}
+        a = HybridAnalysisAdapter()
+        a.api_key = "valid_key"
+        mock = _mock_client(status_code=200, json_data=[report])
+        with patch("httpx.AsyncClient", mock):
+            r = await a.lookup("d41d8cd98f00b204e9800998ecf8427e", "md5")
+        assert r.verdict == "undetected"
+        assert r.raw_data["match_type"] == "exact"
 
     @pytest.mark.asyncio
     async def test_adapter_name(self):

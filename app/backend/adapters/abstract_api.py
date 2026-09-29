@@ -9,7 +9,7 @@ from app.backend.adapters.base import (
     retry_after_seconds,
 )
 from app.backend.config import settings
-from app.backend.logger import get_logger
+from app.backend.logger import describe_exception, get_logger
 
 logger = get_logger("adapter.abstract_api")
 
@@ -72,7 +72,7 @@ class AbstractAPIAdapter(SourceAdapter):
                 tags=["timeout"],
             )
         except httpx.HTTPError as exc:
-            logger.warning("AbstractAPI request error: %s", exc)
+            logger.warning("AbstractAPI request error: %s", describe_exception(exc))
             return NormalizedResult(
                 ioc=ioc_value,
                 ioc_type=ioc_type,
@@ -115,12 +115,15 @@ class AbstractAPIAdapter(SourceAdapter):
         try:
             data = resp.json()
         except Exception:
+            data = None
+        if not isinstance(data, dict):
             return NormalizedResult(
                 ioc=ioc_value,
                 ioc_type=ioc_type,
                 source=self.name,
                 verdict="error",
-                tags=["invalid_json"],
+                tags=["malformed_response"],
+                provider_summary="AbstractAPI returned a malformed response",
             )
 
         deliverability = str(data.get("deliverability") or "").upper()
@@ -147,8 +150,6 @@ class AbstractAPIAdapter(SourceAdapter):
         tags = []
         if deliverability:
             tags.append(f"deliverability:{deliverability.lower()}")
-        if quality_score is not None:
-            tags.append(f"quality_score:{quality_score:.2f}")
         if is_disposable:
             tags.append("abstract:disposable_email")
         if is_free:

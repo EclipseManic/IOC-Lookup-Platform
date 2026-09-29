@@ -1,8 +1,7 @@
 import time
 
-import httpx
-
-from app.backend.adapters.base import NormalizedResult, RateLimitConfig, SourceAdapter, is_valid_api_key, retry_after_seconds
+from app.backend.adapters._http import MalformedResponse, failure, http_failure, malformed, read_json
+from app.backend.adapters.base import NormalizedResult, RateLimitConfig, SourceAdapter, is_valid_api_key
 from app.backend.config import settings
 
 
@@ -10,6 +9,8 @@ class GreyNoiseAdapter(SourceAdapter):
     name = "GreyNoise"
     supported_types = ["ipv4"]
     public_without_key = True
+    # Community API: 50 searches/week anonymously; keyed accounts are governed
+    # server-side. Pace requests so a burst cannot trip the 429.
     rate_limit = RateLimitConfig(requests_per_minute=10)
 
     WEEKLY_LIMIT = 50
@@ -45,67 +46,52 @@ class GreyNoiseAdapter(SourceAdapter):
     async def lookup(self, ioc_value: str, ioc_type: str) -> NormalizedResult:
         allowed, quota_tag = await self._check_weekly_quota()
         if not allowed:
-            return NormalizedResult(
-                ioc=ioc_value, ioc_type=ioc_type, source=self.name,
-                verdict="unknown", tags=[quota_tag or "weekly_quota_exhausted"],
+            return failure(
+                self.name, ioc_value, ioc_type, "unavailable", [quota_tag or "weekly_quota_exhausted"],
+                f"GreyNoise anonymous weekly quota ({self.WEEKLY_LIMIT} lookups) used up; set GREYNOISE_API_KEY",
+                request_made=False,
             )
 
         client = self._get_client()
+        key_sent = is_valid_api_key(self.api_key)
         headers = {"accept": "application/json"}
-        if is_valid_api_key(self.api_key):
+        if key_sent:
             headers["key"] = self.api_key
         resp = await client.get(
-                f"https://api.greynoise.io/v3/community/{ioc_value}",
-                headers=headers,
-                timeout=10,
-            )
+            f"https://api.greynoise.io/v3/community/{ioc_value}",
+            headers=headers,
+            timeout=10,
+        )
 
-        if not is_valid_api_key(self.api_key):
+        if not key_sent:
             GreyNoiseAdapter._weekly_requests_used += 1
         if GreyNoiseAdapter._quota_remaining is not None:
             GreyNoiseAdapter._quota_remaining = max(GreyNoiseAdapter._quota_remaining - 1, 0)
+        if resp.status_code == 429 and not key_sent:
+            GreyNoiseAdapter._quota_remaining = 0
 
-        if resp.status_code == 429:
-            if not is_valid_api_key(self.api_key):
-                GreyNoiseAdapter._quota_remaining = 0
-            return NormalizedResult(
-                ioc=ioc_value, ioc_type=ioc_type, source=self.name,
-                verdict="unknown", tags=["rate_limited"], http_status=resp.status_code,
-                retry_after_seconds=retry_after_seconds(resp),
-            )
-        if resp.status_code == 401:
-            return NormalizedResult(
-                ioc=ioc_value, ioc_type=ioc_type, source=self.name,
-                verdict="error", tags=["unauthorized"],
-            )
-        if resp.status_code == 404:
-            return NormalizedResult(
-                ioc=ioc_value, ioc_type=ioc_type, source=self.name,
-                verdict="unknown", raw_score=0.0, status="not_found",
-            )
-        if resp.status_code != 200:
-            return NormalizedResult(
-                ioc=ioc_value, ioc_type=ioc_type, source=self.name,
-                verdict="error", tags=[f"http_{resp.status_code}"],
-            )
+        # 404 from the community API means "IP not observed by GreyNoise".
+        failed = http_failure(
+            self.name, ioc_value, ioc_type, resp, key_sent=key_sent,
+            not_found_summary="GreyNoise has not observed this IP",
+        )
+        if failed is not None:
+            return failed
+        try:
+            data = read_json(resp)
+        except MalformedResponse as exc:
+            return malformed(self.name, ioc_value, ioc_type, exc.reason, resp.status_code)
+        if not isinstance(data, dict):
+            return malformed(self.name, ioc_value, ioc_type, http_status=resp.status_code)
 
-        data = resp.json()
-        classification = data.get("classification", "")
-        tags = []
-        if classification:
-            tags.append(f"classification:{classification}")
-        if data.get("name"):
-            tags.append(f"name:{data['name']}")
-        if data.get("link"):
-            tags.append(f"link:{data['link']}")
-        if data.get("last_seen"):
-            tags.append(f"last_seen:{data['last_seen']}")
-
+        classification = str(data.get("classification") or "")
+        tags: list[str] = []
         if classification == "noise":
             verdict = "unknown"
             raw_score = None
             tags.append("internet_scanner")
         elif classification == "riot":
+            # RIOT = a known, common business service (CDN, public DNS, ...).
             verdict = "clean"
             raw_score = 0.0
             tags.append("known_service")
@@ -121,7 +107,13 @@ class GreyNoiseAdapter(SourceAdapter):
             verdict = "unknown"
             raw_score = None
 
+        raw_data = {
+            key: data.get(key)
+            for key in ("classification", "noise", "riot", "name", "link", "last_seen", "message")
+            if data.get(key) not in (None, "")
+        }
         return NormalizedResult(
             ioc=ioc_value, ioc_type=ioc_type, source=self.name,
-            verdict=verdict, raw_score=raw_score, tags=tags, raw_data=data,
+            verdict=verdict, raw_score=raw_score, tags=tags, raw_data=raw_data,
+            source_link=data.get("link") or None, http_status=resp.status_code,
         )

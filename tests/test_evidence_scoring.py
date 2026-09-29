@@ -55,12 +55,24 @@ def test_email_is_not_clean_when_breach_source_is_unavailable():
 
 
 def test_email_is_not_breached_when_every_source_answers():
+    # "not_breached" is a claim about breach/infostealer data, so at least one
+    # exposure source (Hudson Rock here) must have answered.
+    assessment = aggregate_evidence("user@example.com", "email", [
+        result("AbstractAPI", "unknown", ioc="user@example.com", ioc_type="email", status="not_found"),
+        result("Hunter.io", "unknown", ioc="user@example.com", ioc_type="email", status="not_found"),
+        result("Hudson Rock", "unknown", ioc="user@example.com", ioc_type="email", status="not_found"),
+    ])
+    assert assessment.final_verdict == "not_breached"
+    assert assessment.needs_review is False
+
+
+def test_email_without_any_exposure_source_is_not_claimed_not_breached():
     assessment = aggregate_evidence("user@example.com", "email", [
         result("AbstractAPI", "unknown", ioc="user@example.com", ioc_type="email", status="not_found"),
         result("Hunter.io", "unknown", ioc="user@example.com", ioc_type="email", status="not_found"),
     ])
-    assert assessment.final_verdict == "not_breached"
-    assert assessment.needs_review is False
+    assert assessment.final_verdict == "unknown"
+    assert "exposure" in assessment.reason
 
 
 def test_infrastructure_context_does_not_raise_score_by_itself():

@@ -20,8 +20,8 @@ from fastapi.responses import FileResponse, HTMLResponse, PlainTextResponse
 from fastapi.staticfiles import StaticFiles
 from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.middleware.trustedhost import TrustedHostMiddleware
-from pydantic import BaseModel, model_validator
-from sqlalchemy import select
+from pydantic import AliasChoices, BaseModel, model_validator
+from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
@@ -51,9 +51,9 @@ from app.backend.siem_export import export_siem
 from app.backend.http_client import close_client as close_http_client, get_client as _get_http_client
 from app.backend.config import settings
 from app.backend.thresholds import DISPLAY_MALICIOUS, DISPLAY_SUSPICIOUS
-from app.backend.database import cleanup_old_lookups, get_db, init_db, retry_sqlite_commit, upsert_lookup_result
+from app.backend.database import cleanup_old_lookups, get_db, init_db, persisted_verdict_fields, retry_sqlite_commit, upsert_lookup_result
 from app.backend.models import IOC, Investigation, InvestigationIOC, LookupResult, IOCFeedback
-from app.backend.pipeline import ADAPTERS, AnalysisTask, cancel_analysis, cleanup_old_tasks, get_cache, get_rate_limiter, get_task_queue, get_task_redis, run_analysis, set_cache, set_rate_limiter, cleanup_task_queue
+from app.backend.pipeline import ADAPTERS, AnalysisTask, TERMINAL_TASK_STATES, cancel_analysis, cleanup_old_tasks, get_cache, get_rate_limiter, get_task_queue, get_task_redis, mark_task_cancelled, register_pending_task, register_running_task, release_running_task, run_analysis, set_cache, set_rate_limiter, cleanup_task_queue, task_response_payload
 from app.backend.schemas import (
     BatchStatusResponse,
     CacheClearResponse,
@@ -74,7 +74,7 @@ from app.backend.schemas import (
 from app.backend.rate_limiter import RateLimiter
 from app.backend.stix_export import build_stix_bundle, results_to_csv
 from app.backend.webhooks import add_webhook, list_webhooks, remove_webhook, shutdown_webhook_tasks
-from app.backend.logger import configure_logging, get_logger, _correlation_id
+from app.backend.logger import configure_logging, describe_exception, get_logger, _correlation_id
 
 logger = get_logger("main")
 
@@ -82,6 +82,11 @@ _lookup_tasks: set[asyncio.Task] = set()
 _lookup_semaphore: asyncio.Semaphore | None = None
 _lookup_semaphore_loop: asyncio.AbstractEventLoop | None = None
 _pending_lookups = 0
+# (ioc_type, value, fp_override) -> task_id of the lookup currently queued or
+# running for that indicator.  A repeated submission (double Enter, re-search
+# while the first is running) joins that task instead of spending provider
+# quota on an identical second fan-out.  Refresh requests never coalesce.
+_inflight_lookups: dict[tuple[str, str, bool], str] = {}
 
 
 def _get_lookup_semaphore() -> asyncio.Semaphore:
@@ -96,15 +101,42 @@ def _get_lookup_semaphore() -> asyncio.Semaphore:
 
 async def _run_queued_lookup(*args, **kwargs) -> None:
     global _pending_lookups
+    task_id = kwargs.get("task_id")
+    started = False
     try:
         async with _get_lookup_semaphore():
+            started = True
             await run_analysis(*args, **kwargs)
+    except asyncio.CancelledError:
+        if task_id and not started:
+            # Cancelled while still queued: run_analysis never ran, so give
+            # the registered pending task its terminal state here.
+            await mark_task_cancelled(task_id)
+        raise
+    except Exception as exc:
+        # run_analysis records its own failures; this only fires for errors
+        # outside it, which would otherwise leave the task pending forever.
+        logger.error("Queued lookup %s failed: %s", task_id, describe_exception(exc), exc_info=exc)
+        if task_id:
+            from app.backend.pipeline import get_task
+
+            task = get_task(task_id)
+            if task is not None and task.status not in TERMINAL_TASK_STATES:
+                task.status = "error"
+                task.error = describe_exception(exc, limit=200)
+                task.progress = 100.0
     finally:
         _pending_lookups = max(0, _pending_lookups - 1)
 
 
 def _lookup_task_done(task: asyncio.Task) -> None:
     _lookup_tasks.discard(task)
+    task_id = getattr(task, "_ioc_task_id", None)
+    if task_id:
+        release_running_task(task_id, task)
+    for key, inflight_id in list(_inflight_lookups.items()):
+        if inflight_id == task_id:
+            _inflight_lookups.pop(key, None)
     if not task.cancelled():
         task.exception()
 
@@ -121,6 +153,12 @@ async def lifespan(app: FastAPI):
 
     _rate_limiter = RateLimiter(redis_url=settings.redis_url or None)
     set_rate_limiter(_rate_limiter)
+
+    # Adapters are bound to the shared HTTP client at import time; a previous
+    # lifespan (tests, reload) may have closed it, so re-bind a live client.
+    http_client = _get_http_client()
+    for adapter in ADAPTERS:
+        adapter.set_client(http_client)
 
     cleanup_task = asyncio.create_task(_periodic_cleanup())
     from app.backend.enrichment import start_cisa_background_refresh, stop_cisa_background_refresh
@@ -144,11 +182,15 @@ async def lifespan(app: FastAPI):
         _lookup_tasks.clear()
         await shutdown_batch_tasks()
         await shutdown_webhook_tasks()
+        _inflight_lookups.clear()
         await _cache.close()
         await _rate_limiter.close()
         await close_http_client()
         set_cache(None)
         set_rate_limiter(None)
+        from app.backend.database import engine as _db_engine
+
+        await _db_engine.dispose()
 
 
 def _global_exception_handler(exc_type, exc_value, exc_traceback):
@@ -429,6 +471,10 @@ class RateLimitMiddleware(BaseHTTPMiddleware):
                     continue
                 if prefix == "/api/tasks" and request.method == "GET":
                     continue
+                # Reading stored results (/api/lookup/stored, /api/lookup/{ioc}/raw)
+                # starts no provider work and must not consume the submission quota.
+                if prefix == "/api/lookup" and request.method == "GET":
+                    continue
 
                 client_ip = request.client.host if request.client else "unknown"
                 if _trusted_proxy(request):
@@ -572,47 +618,48 @@ async def adapter_health():
     return {"adapters": all_breaker_states()}
 
 
+_ADAPTER_CREDENTIAL_FIELDS = {
+    "MalwareBazaar": "malwarebazaar_api_key",
+    "ThreatFox": "threatfox_api_key",
+    "URLhaus": "urlhaus_api_key",
+    "VirusTotal": "virustotal_api_key",
+    "AbuseIPDB": "abuseipdb_api_key",
+    "urlscan.io": "urlscanio_api_key",
+    "Tria.ge": "triage_api_key",
+    "Hybrid Analysis": "hybridanalysis_api_key",
+    "GreyNoise": "greynoise_api_key",
+    "AlienVault OTX": "alienvault_otx_api_key",
+    "Shodan": "shodan_api_key",
+    "Censys": "censys_api_key",
+    "IPinfo": "ipinfo_api_key",
+    "AbstractAPI": "abstractapi_api_key",
+    "Hunter.io": "hunterio_api_key",
+    "NVD": "nvd_api_key",
+    "Etherscan": "etherscan_api_key",
+    "ChainAbuse": "chainabuse_api_key",
+    "FileScan.io": "filescan_api_key",
+    "Hudson Rock": "hudson_api_key",
+}
+
+
 @app.get("/api/sources", response_model=dict)
 async def source_inventory():
     """Safe source inventory: reports configuration state, never credentials."""
     from app.backend.adapters.base import is_valid_api_key
 
-    env_file = Path(__file__).resolve().parent.parent.parent / ".env"
-    env_file_names: set[str] = set()
-    if env_file.exists():
-        for line in env_file.read_text(encoding="utf-8").splitlines():
-            line = line.strip()
-            if line and not line.startswith("#") and "=" in line:
-                env_file_names.add(line.split("=", 1)[0].strip())
-    credential_names = {
-        "MalwareBazaar": ["MB_AUTH_KEY", "ABUSH_CH_AUTH_KEY", "ABUSE_CH_AUTH_KEY", "ABUSE_CH_API_KEY", "ABUSECH_API_KEY", "ABUSECH_AUTH_KEY"],
-        "ThreatFox": ["THREATFOX_API_KEY", "MB_AUTH_KEY", "ABUSH_CH_AUTH_KEY", "ABUSE_CH_AUTH_KEY", "ABUSE_CH_API_KEY", "ABUSECH_API_KEY", "ABUSECH_AUTH_KEY"],
-        "URLhaus": ["URLHAUS_API_KEY", "MB_AUTH_KEY", "ABUSH_CH_AUTH_KEY", "ABUSE_CH_AUTH_KEY", "ABUSE_CH_API_KEY", "ABUSECH_API_KEY", "ABUSECH_AUTH_KEY"],
-        "VirusTotal": ["VT_API_KEY"], "AbuseIPDB": ["ABUSEIPDB_API_KEY", "AbuseDB_API_KEY"],
-        "urlscan.io": ["URL_SCAN_API_KEY"], "Tria.ge": ["TRIAGE_API_KEY", "TRIA_GE_API_KEY"],
-        "Hybrid Analysis": ["HA_API_KEY"], "GreyNoise": ["GREYNOISE_API_KEY"],
-        "AlienVault OTX": ["OTX_API_KEY", "ALIENVAULT_OTX_KEY"], "Shodan": ["SHODAN_API_KEY"],
-        "SecurityTrails": ["SECURITYTRAILS_API_KEY"], "PhishTank": ["PHISHTANK_API_KEY"],
-        "Spur.us": ["SPUR_US_API_KEY"], "Censys": ["CENSYS_API_KEY"],
-        "IPinfo": ["IPINFO_API_KEY", "IPINFO_ACCESS_TOKEN"],
-        "AbstractAPI": ["ABSTRACTAPI_API_KEY", "ABSTRACT_API_KEY"],
-        "Hunter.io": ["HUNTERIO_API_KEY", "HUNTER_IO_API_KEY", "HUNTER_API_KEY"],
-        "Hudson Rock": [],  # Public Cavalier API — no key required
-        "HIBP Pwned Passwords": [],
-    }
     sources = []
     for adapter in ADAPTERS:
         key = getattr(adapter, "api_key", None)
         requires_key = key is not None and not getattr(adapter, "public_without_key", False)
         enabled_by_policy = settings.is_source_enabled(adapter.name)
-        env_names = credential_names.get(adapter.name, [])
-        env_name = next((name for name in env_names if name in os.environ or name in env_file_names), env_names[0] if env_names else None)
+        field_name = _ADAPTER_CREDENTIAL_FIELDS.get(adapter.name)
+        env_name, origin = settings.credential_origin(field_name) if field_name else (None, None)
+        if env_name is None and field_name:
+            alias = type(settings).model_fields[field_name].validation_alias
+            env_name = alias.choices[0] if isinstance(alias, AliasChoices) else str(alias)
         configured = is_valid_api_key(key) if key is not None else True
         if configured and key:
-            if env_name and env_name in env_file_names and env_name not in os.environ:
-                credential_source = ".env"
-            else:
-                credential_source = "environment"
+            credential_source = ".env" if origin == ".env" else "environment"
         elif not requires_key or getattr(adapter, "public_without_key", False):
             credential_source = "public_no_key"
         else:
@@ -734,7 +781,7 @@ async def _load_stored_response(task_id: str, db: AsyncSession) -> LookupRespons
     result = await db.execute(
         select(LookupResult)
         .where(LookupResult.task_id == task_id)
-        .order_by(LookupResult.created_at.desc())
+        .order_by(LookupResult.created_at.desc(), LookupResult.id.desc())
         .limit(1)
     )
     row = result.scalar_one_or_none()
@@ -863,6 +910,20 @@ async def start_lookup(request: LookupRequest, db: AsyncSession = Depends(get_db
 
     global _pending_lookups
     _get_lookup_semaphore()
+    inflight_key = (effective_type, target_ioc, bool(fp_override))
+    if not request.refresh:
+        existing_id = _inflight_lookups.get(inflight_key)
+        existing = await get_task_redis(existing_id) if existing_id else None
+        if existing is not None and existing.status not in TERMINAL_TASK_STATES:
+            return TaskStatusResponse(
+                task_id=existing.task_id,
+                status=existing.status,
+                progress=existing.progress,
+                stages=existing.to_dict()["stages"],
+                ioc_value=target_ioc,
+                normalized=target_ioc,
+                ioc_type=effective_type,
+            )
     if _pending_lookups >= settings.max_pending_lookups:
         raise HTTPException(status_code=429, detail="Lookup queue is full; retry later")
     _pending_lookups += 1
@@ -875,16 +936,23 @@ async def start_lookup(request: LookupRequest, db: AsyncSession = Depends(get_db
     }
     if request.refresh:
         analysis_kwargs["bypass_cache"] = True
+    pending_task = register_pending_task(
+        task_id, target_ioc, effective_type, password_prehashed=effective_type == "password",
+    )
     try:
         task = asyncio.create_task(_run_queued_lookup(target_ioc, **analysis_kwargs))
     except Exception:
         _pending_lookups = max(0, _pending_lookups - 1)
         raise
+    task._ioc_task_id = task_id  # type: ignore[attr-defined]
+    register_running_task(task_id, task)
+    _inflight_lookups[inflight_key] = task_id
     _lookup_tasks.add(task)
     task.add_done_callback(_lookup_task_done)
     return TaskStatusResponse(
         task_id=task_id,
         status="pending",
+        stages=pending_task.to_dict()["stages"],
         ioc_value=target_ioc,
         normalized=target_ioc,
         ioc_type=effective_type,
@@ -921,12 +989,23 @@ SSE_QUEUE_TIMEOUT = 2.0
 
 @app.get("/api/tasks/{task_id}/stream")
 async def stream_task(task_id: str, request: Request):
+    # Subscribe before reading the task state so a task that finishes in
+    # between still delivers its "done" event to this queue.
     queue = get_task_queue(task_id)
+    task = await get_task_redis(task_id)
+    if task is None:
+        cleanup_task_queue(task_id)
+        raise HTTPException(status_code=404, detail="Task not found")
 
     async def event_generator():
         last_heartbeat = asyncio.get_running_loop().time()
         last_event = asyncio.get_running_loop().time()
         try:
+            if task.status in TERMINAL_TASK_STATES:
+                # Already finished: report it instead of idling until timeout.
+                payload = {"status": task.status, "progress": task.progress, "error": task.error}
+                yield f"event: done\ndata: {json.dumps(payload)}\n\n"
+                return
             while True:
                 if await request.is_disconnected():
                     break
@@ -934,6 +1013,8 @@ async def stream_task(task_id: str, request: Request):
                     event, data = await asyncio.wait_for(queue.get(), timeout=SSE_QUEUE_TIMEOUT)
                     yield f"event: {event}\ndata: {json.dumps(data)}\n\n"
                     last_event = asyncio.get_running_loop().time()
+                    if event == "done":
+                        break
                 except asyncio.TimeoutError:
                     now = asyncio.get_running_loop().time()
                     if now - last_event >= SSE_IDLE_TIMEOUT:
@@ -953,6 +1034,10 @@ async def stream_task(task_id: str, request: Request):
 async def get_task_result(task_id: str, db: AsyncSession = Depends(get_db)):
     task = await get_task_redis(task_id)
     if task:
+        if task.status == "error":
+            raise HTTPException(status_code=409, detail=f"Analysis failed: {task.error or 'unknown error'}")
+        if task.status == "cancelled":
+            raise HTTPException(status_code=409, detail="Analysis was cancelled")
         if task.status != "done":
             raise HTTPException(status_code=425, detail="Analysis not yet complete")
         return _task_to_response(task)
@@ -1143,27 +1228,47 @@ async def remove_ioc_from_investigation(inv_id: int, ii_id: int, db: AsyncSessio
 
 @app.get("/api/recent", response_model=list[RecentIOCResponse])
 async def recent_lookups(db: AsyncSession = Depends(get_db)):
+    # History is ordered by the most recent lookup of each indicator, so a
+    # re-scanned IOC moves to the top, and reports that lookup's verdict and
+    # time.  Only summary columns are read: loading every stored full_response
+    # (the IOC.lookup_results relationship) just to pick the newest was heavy.
+    latest_id = (
+        select(LookupResult.ioc_id, func.max(LookupResult.id).label("latest_id"))
+        .group_by(LookupResult.ioc_id)
+        .subquery()
+    )
     stmt = (
-        select(IOC)
-        .options(selectinload(IOC.lookup_results))
-        .order_by(IOC.created_at.desc())
+        select(
+            IOC.id,
+            IOC.value,
+            IOC.ioc_type,
+            IOC.created_at,
+            LookupResult.composite_verdict,
+            LookupResult.composite_score,
+            LookupResult.composite_confidence,
+            LookupResult.created_at,
+        )
+        .outerjoin(latest_id, latest_id.c.ioc_id == IOC.id)
+        .outerjoin(LookupResult, LookupResult.id == latest_id.c.latest_id)
+        .order_by(
+            func.coalesce(LookupResult.created_at, IOC.created_at).desc(),
+            func.coalesce(LookupResult.id, 0).desc(),
+            IOC.id.desc(),
+        )
         .limit(50)
     )
-    result = await db.execute(stmt)
-    iocs = result.unique().scalars().all()
+    rows = (await db.execute(stmt)).all()
     out = []
-    for ioc in iocs:
-        latest = None
-        if ioc.lookup_results:
-            latest = max(ioc.lookup_results, key=lambda lr: lr.created_at or "")
+    for ioc_id, value, ioc_type, ioc_created, verdict, score, confidence, scanned_at in rows:
+        timestamp = scanned_at or ioc_created
         out.append(RecentIOCResponse(
-            id=ioc.id,
-            value=ioc.value,
-            ioc_type=ioc.ioc_type,
-            verdict=latest.composite_verdict if latest else None,
-            score=latest.composite_score if latest else None,
-            confidence=latest.composite_confidence if latest else None,
-            created_at=ioc.created_at.isoformat() if ioc.created_at else None,
+            id=ioc_id,
+            value=value,
+            ioc_type=ioc_type,
+            verdict=verdict,
+            score=score,
+            confidence=confidence,
+            created_at=timestamp.isoformat() if timestamp else None,
         ))
     return out
 
@@ -1184,7 +1289,7 @@ async def get_recent_result(ioc_id: int, db: AsyncSession = Depends(get_db)):
     stmt = (
         select(LookupResult)
         .where(LookupResult.ioc_id == ioc_id)
-        .order_by(LookupResult.created_at.desc())
+        .order_by(LookupResult.created_at.desc(), LookupResult.id.desc())
         .limit(1)
     )
     result = await db.execute(stmt)
@@ -1198,15 +1303,29 @@ async def get_recent_result(ioc_id: int, db: AsyncSession = Depends(get_db)):
         raise HTTPException(status_code=500, detail="Corrupted stored result")
 
 
+def _stored_ioc_value(value: str) -> str:
+    """The IOC.value a completed lookup of ``value`` is stored under.
+
+    Lookups persist the classifier-normalized value (lower-cased domain,
+    canonical URL, password digest), so a raw refang is not enough to find
+    them again.  Falls back to the refanged input for unrecognized values.
+    """
+    refanged = _normalize_ioc(value)
+    try:
+        return _feedback_value(value)
+    except HTTPException:
+        return refanged
+
+
 @app.get("/api/lookup/stored")
 async def get_stored_lookup(ioc: str, db: AsyncSession = Depends(get_db)):
     """Fetch previously stored result by IOC value if already analyzed, preserving API key quotas."""
-    normalized = _normalize_ioc(ioc)
+    normalized = _stored_ioc_value(ioc)
     stmt = (
         select(LookupResult)
         .join(IOC, IOC.id == LookupResult.ioc_id)
         .where(IOC.value == normalized)
-        .order_by(LookupResult.created_at.desc())
+        .order_by(LookupResult.created_at.desc(), LookupResult.id.desc())
         .limit(1)
     )
     result = await db.execute(stmt)
@@ -1223,12 +1342,12 @@ async def get_stored_lookup(ioc: str, db: AsyncSession = Depends(get_db)):
 
 @app.get("/api/lookup/{ioc}/raw")
 async def get_raw_lookup(ioc: str, db: AsyncSession = Depends(get_db)):
-    normalized = _normalize_ioc(ioc)
+    normalized = _stored_ioc_value(ioc)
     result = await db.execute(
         select(LookupResult)
         .join(IOC, IOC.id == LookupResult.ioc_id)
         .where(IOC.value == normalized)
-        .order_by(LookupResult.created_at.desc())
+        .order_by(LookupResult.created_at.desc(), LookupResult.id.desc())
         .limit(1)
     )
     row = result.scalar_one_or_none()
@@ -1402,7 +1521,7 @@ async def get_batch_status(batch_id: str):
 async def get_batch_result(batch_id: str):
     batch = get_batch(batch_id)
     if batch:
-        if batch.status not in {"done", "cancelled"}:
+        if batch.status not in {"done", "cancelled", "error"}:
             raise HTTPException(status_code=425, detail="Batch analysis not yet complete")
         result = _normalize_batch_payload(
             consolidate_batch_results(batch),
@@ -1415,7 +1534,7 @@ async def get_batch_result(batch_id: str):
         return result
     db_result = await get_batch_from_db(batch_id)
     if db_result:
-        if db_result.get("status") not in {"done", "completed", "cancelled"}:
+        if db_result.get("status") not in {"done", "completed", "cancelled", "error"}:
             raise HTTPException(status_code=425, detail="Batch analysis not yet complete")
         return db_result
     raise HTTPException(status_code=404, detail="Batch not found")
@@ -1506,7 +1625,8 @@ async def get_batch_ioc_result(batch_id: str, ioc: str, db: AsyncSession = Depen
 
 @app.get("/api/batch/{batch_id}/stream")
 async def stream_batch(batch_id: str, request: Request):
-    if not get_batch(batch_id):
+    batch = get_batch(batch_id)
+    if not batch:
         raise HTTPException(status_code=404, detail="Batch not found")
     queue = acquire_batch_queue(batch_id)
 
@@ -1514,6 +1634,12 @@ async def stream_batch(batch_id: str, request: Request):
         last_heartbeat = asyncio.get_running_loop().time()
         last_event = asyncio.get_running_loop().time()
         try:
+            if batch.status in {"done", "cancelled", "error"}:
+                # Finished before the client subscribed: report it and close
+                # instead of idling until the SSE timeout.
+                payload = {"batch_id": batch_id, "status": batch.status, "progress": 100.0, "error": batch.error}
+                yield f"event: batch_done\ndata: {json.dumps(payload)}\n\n"
+                return
             while True:
                 if await request.is_disconnected():
                     break
@@ -1521,6 +1647,8 @@ async def stream_batch(batch_id: str, request: Request):
                     event, data = await asyncio.wait_for(queue.get(), timeout=SSE_QUEUE_TIMEOUT)
                     yield f"event: {event}\ndata: {json.dumps(data)}\n\n"
                     last_event = asyncio.get_running_loop().time()
+                    if event in {"batch_done", "batch_error"}:
+                        break
                 except asyncio.TimeoutError:
                     now = asyncio.get_running_loop().time()
                     if now - last_event >= SSE_IDLE_TIMEOUT:
@@ -1810,12 +1938,10 @@ async def _auto_score_ioc(normalized: str, ioc_id: int, db: AsyncSession, ioc_ty
         )
 
     if task.status == "done" and task.composite:
-        score = task.composite.score if hasattr(task.composite, "score") else 0
-        verdict = task.composite.verdict if hasattr(task.composite, "verdict") else "unknown"
-        confidence = task.composite.confidence if hasattr(task.composite, "confidence") else "low"
-
-        response_dict = json.loads(_task_to_response(task).model_dump_json())
-
+        # Same fields and payload the pipeline persists (DV-1: the
+        # final_assessment verdict, not the reputation-only composite), so a
+        # saved result never differs from the live one.
+        score, verdict, confidence = persisted_verdict_fields(task)
         await upsert_lookup_result(
             db,
             ioc_id=ioc_id,
@@ -1823,7 +1949,7 @@ async def _auto_score_ioc(normalized: str, ioc_id: int, db: AsyncSession, ioc_ty
             composite_score=score,
             composite_verdict=verdict,
             composite_confidence=confidence,
-            full_response=json.dumps(response_dict),
+            full_response=json.dumps(task_response_payload(task), default=str),
             source_count=len(task.results),
         )
         return True
@@ -1898,12 +2024,10 @@ async def save_lookup_result(body: LookupRequest, db: AsyncSession = Depends(get
         )
 
     if task.status == "done" and task.composite:
-        score = task.composite.score if hasattr(task.composite, "score") else 0
-        verdict = task.composite.verdict if hasattr(task.composite, "verdict") else "unknown"
-        confidence = task.composite.confidence if hasattr(task.composite, "confidence") else "low"
-
-        response_dict = json.loads(_task_to_response(task).model_dump_json())
-
+        # Same fields and payload the pipeline persists (DV-1: the
+        # final_assessment verdict, not the reputation-only composite), so a
+        # saved result never differs from the live one.
+        score, verdict, confidence = persisted_verdict_fields(task)
         await upsert_lookup_result(
             db,
             ioc_id=ioc_id,
@@ -1911,7 +2035,7 @@ async def save_lookup_result(body: LookupRequest, db: AsyncSession = Depends(get
             composite_score=score,
             composite_verdict=verdict,
             composite_confidence=confidence,
-            full_response=json.dumps(response_dict),
+            full_response=json.dumps(task_response_payload(task), default=str),
             source_count=len(task.results),
         )
 

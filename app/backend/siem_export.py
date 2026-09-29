@@ -3,6 +3,8 @@ from datetime import datetime, timezone
 
 from jsonschema import Draft202012Validator
 
+from app.backend.stix_export import provider_evidence_rows
+
 _ECS_EVENT_SCHEMA = {
     "type": "object",
     "required": ["@timestamp", "event", "threat"],
@@ -29,6 +31,8 @@ def _ts() -> str:
 def _verdict_severity(verdict: str) -> int:
     if verdict in {"malicious", "breached", "compromised", "critical", "high"}:
         return 10
+    if verdict == "anonymization":
+        return 3
     if verdict in {"suspicious", "medium", "low"}:
         return 6
     if verdict in {"clean", "benign", "not_breached", "harmless", "whitelisted"}:
@@ -52,15 +56,17 @@ def export_splunk(response: dict) -> str:
     results = response.get("results", [])
 
     lines = []
-    for r in results:
+    # Only providers that answered are exported; the per-provider verdict is
+    # the provider's assessed role (context is not exported as malicious).
+    for r, r_verdict in provider_evidence_rows(response):
         source = r.get("source", "unknown")
-        r_verdict = r.get("verdict", "unknown")
         r_score = r.get("raw_score", 0)
         fields = [
             f"source={_escape_splunk(source)}",
             f"ioc_value={_escape_splunk(ioc_value)}",
             f"ioc_type={_escape_splunk(ioc_type)}",
             f"verdict={_escape_splunk(r_verdict)}",
+            f"provider_verdict={_escape_splunk(r.get('verdict', 'unknown'))}",
             f"composite_verdict={_escape_splunk(verdict)}",
             f"assessment_domain={_escape_splunk(assessment.get('assessment_domain', 'ioc_reputation'))}",
             f"final_assessment_verdict={_escape_splunk(assessment.get('final_verdict', verdict))}",
@@ -109,7 +115,7 @@ def export_ecs(response: dict) -> str:
         if geoip.get("asn"):
             base["as"] = {"number": geoip["asn"]}
 
-    for r in results:
+    for r, r_verdict in provider_evidence_rows(response):
         event = {**base,
             "source": {"address": ioc_value},
             "threat": {
@@ -121,12 +127,13 @@ def export_ecs(response: dict) -> str:
             },
             "event": {
                 **base["event"],
-                "severity": _verdict_severity(r.get("verdict", "unknown")),
+                "severity": _verdict_severity(r_verdict),
             },
             "ioc_platform": {
                 **base["ioc_platform"],
                 "source": r.get("source", ""),
-                "source_verdict": r.get("verdict", ""),
+                "source_verdict": r_verdict,
+                "provider_verdict": r.get("verdict", ""),
                 "source_score": r.get("raw_score"),
             },
         }
@@ -150,16 +157,17 @@ def export_leef(response: dict) -> str:
     results = response.get("results", [])
 
     lines = []
-    for r in results:
+    for r, r_verdict in provider_evidence_rows(response):
         src = r.get("source", "unknown")
         pairs = [
             ("devTime", _ts()),
             ("cat", "IOC Lookup"),
-            ("severity", str(_verdict_severity(r.get("verdict", "unknown")))),
+            ("severity", str(_verdict_severity(r_verdict))),
             ("iocValue", ioc_value),
             ("iocType", ioc_type),
             ("source", src),
-            ("verdict", r.get("verdict", "unknown")),
+            ("verdict", r_verdict),
+            ("providerVerdict", r.get("verdict", "unknown")),
             ("compositeVerdict", verdict),
             ("assessmentDomain", assessment.get("assessment_domain", "ioc_reputation")),
             ("finalAssessmentVerdict", assessment.get("final_verdict", verdict)),

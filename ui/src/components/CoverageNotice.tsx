@@ -1,21 +1,30 @@
 import type { LookupResponse } from "../services/api";
+import { titleCase } from "../lib/format";
+
+const COMPLETENESS_PROBLEMS = new Set(["error", "not_configured", "unavailable", "timeout", "rate_limited"]);
 
 export default function CoverageNotice({ result }: { result: LookupResponse }) {
-  const notes = result.enrichment?.analysis_notes ?? [];
+  const notes = (result.enrichment?.analysis_notes ?? []).filter((note): note is string => typeof note === "string" && note.trim() !== "");
   const errors = Object.entries(result.enrichment?.completeness ?? {})
-    .filter(([, status]) => status === "error" || status.startsWith("http_") || status === "not_configured" || status === "unavailable");
+    .filter(([, status]) => typeof status === "string" && (COMPLETENESS_PROBLEMS.has(status) || status.startsWith("http_")));
   const assessment = result.final_assessment;
-  const providerFailures = assessment
-    ? [...assessment.rate_limited_sources, ...assessment.unavailable_sources, ...assessment.error_sources.filter((source) => !assessment.rate_limited_sources.includes(source))]
-    : [];
+  const failedProviders = assessment
+    ? new Set([
+      ...(assessment.rate_limited_sources ?? []),
+      ...(assessment.unavailable_sources ?? []),
+      ...(assessment.error_sources ?? []),
+    ])
+    : new Set<string>();
   const domain = assessment?.assessment_domain ?? "ioc_reputation";
-  const hasSuccessfulData = result.results.some((r) => r.execution_state === "success" && r.status !== "not_found");
+  const results = Array.isArray(result.results) ? result.results : [];
+  const hasSuccessfulData = results.some((r) => r.execution_state === "success" && r.status !== "not_found");
+  const evaluated = Number(assessment?.evidence_summary?.evaluated_providers ?? 0) || 0;
   const noCoverage =
     domain === "ioc_reputation" &&
-    result.composite.sources_contributing === 0 &&
-    (assessment?.evidence_summary?.evaluated_providers ?? 0) === 0 &&
+    (result.composite?.sources_contributing ?? 0) === 0 &&
+    evaluated === 0 &&
     !hasSuccessfulData;
-  if (notes.length === 0 && errors.length === 0 && providerFailures.length === 0 && !noCoverage) return null;
+  if (notes.length === 0 && errors.length === 0 && failedProviders.size === 0 && !noCoverage) return null;
 
   return (
     <div className="bg-bg-card border border-border rounded-lg p-4 text-sm">
@@ -33,12 +42,13 @@ export default function CoverageNotice({ result }: { result: LookupResponse }) {
       {notes.map((note) => <p key={note} className="text-text-primary mb-1">{note}</p>)}
       {errors.length > 0 && (
         <p className="text-text-secondary">
-          Coverage unavailable or not configured: {errors.map(([name, status]) => `${name} (${status})`).join(", ")}. These do not represent a malicious/clean verdict.
+          Enrichment incomplete: {errors.map(([name, status]) => `${titleCase(name)} (${status.replace(/_/g, " ")})`).join(", ")}. Missing enrichment is not a malicious or clean signal.
         </p>
       )}
-      {assessment && providerFailures.length > 0 && (
+      {assessment && failedProviders.size > 0 && (
         <p className="text-text-secondary mt-2">
-          Provider coverage is incomplete: {providerFailures.join(", ")}. These failures are excluded from reputation scoring; current coverage is {Math.round(assessment.coverage * 100)}%.
+          {failedProviders.size} provider{failedProviders.size === 1 ? "" : "s"} could not answer ({[...failedProviders].join(", ")}); see
+          Provider problems below. They are excluded from scoring, so coverage is {Math.round((Number(assessment.coverage) || 0) * 100)}%.
         </p>
       )}
     </div>

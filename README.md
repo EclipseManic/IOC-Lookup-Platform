@@ -19,7 +19,7 @@ The project is designed to run directly on one computer with Python, SQLite, and
 ## Intelligence sources and what “free” means
 
 The application never contains provider credentials. Adapter credentials are
-loaded from process environment variables and `.env` through `app/backend/config.py`.
+loaded from the repo `.env` file (primary) and process environment variables (fallback) through `app/backend/config.py`.
 The `/api/sources` endpoint and the Source coverage panel show each provider's
 IOC coverage, whether it is public or key-backed, and whether its configured
 credential came from `.env` or the process environment. Secret values are never
@@ -99,16 +99,16 @@ npm run build
 
 ## Configure intelligence sources
 
-**Empty `.env` is normal.** This is a single-user local tool — credentials are read from **system environment variables first** (never stored on disk). `.env` is only an optional fallback. Keep `HOST=127.0.0.1`; if another device must reach the service, set `ALLOW_NETWORK_BIND=true`, use a strong `API_KEYS` value, and set an HTTPS `BASE_URL` behind a trusted TLS reverse proxy.
+**`.env` is the primary configuration source.** This is a single-user local tool — every setting, including provider credentials, is read from the repo `.env` first; process/system environment variables are only a fallback for values `.env` does not set. `.env` is gitignored. Keep `HOST=127.0.0.1`; if another device must reach the service, set `ALLOW_NETWORK_BIND=true`, use a strong `API_KEYS` value, and set an HTTPS `BASE_URL` behind a trusted TLS reverse proxy.
 
 ```powershell
-# Recommended: set keys in your shell (PowerShell)
-$env:VT_API_KEY="your_key"; $env:ABUSEIPDB_API_KEY="..."; python run.py
-
-# Alternative: add to .env as literal, ${REF} or bare env-var name
+# Recommended: put keys in .env as a literal, ${REF} or bare env-var name
 # VT_API_KEY=actual_key
 # VT_API_KEY=${MY_VT_KEY}
-# VT_API_KEY=my_vt_key   # resolves my_vt_key from system env
+# VT_API_KEY=my_vt_key   # resolves my_vt_key (.env first, then system env)
+
+# Fallback: variables set in the shell are used only when .env does not set them
+$env:VT_API_KEY="your_key"; python run.py
 ```
 
 Missing keys do not prevent the application from starting; unavailable adapters are reported as skipped or unknown. Check `/api/sources` or the Sources panel to see `credential_source: environment | .env | public_no_key`.
@@ -132,8 +132,10 @@ Common variables include:
 | `IPINFO_API_KEY` | IPinfo |
 
 Credential priority — every API key is resolved as follows:
-1. System environment variable (e.g. `VT_API_KEY`) — always wins, never stored on disk.
-2. `.env` file value, which can be the literal key, an explicit reference (`VT_API_KEY=${MY_VT_KEY}`), or a bare reference to a system env variable (`VT_API_KEY=my_vt_key`).
+1. `.env` file value under any of the key's accepted names — the literal key, an explicit reference (`VT_API_KEY=${MY_VT_KEY}`), or a bare reference to another variable (`VT_API_KEY=my_vt_key`). References resolve through `.env` first, then the process environment.
+2. Process/system environment variable (e.g. `VT_API_KEY`) — used only when `.env` does not provide the key.
+
+Set `IOC_ENV_FILE` to load a different file, or to an empty value to disable file loading (the test suite does this so it never reads real credentials).
 
 Additional app-level settings:
 
@@ -155,10 +157,10 @@ Additional app-level settings:
 
 Summary:
 
-- Provider keys are resolved from the environment before `.env`; see `.env.example` for the complete list.
+- Provider keys are resolved from `.env` before the process environment; see `.env.example` for the complete list.
 - HIBP password lookups use the k-anonymity range API and do not require a key.
 - Host-artifact types (`mutex`, `named_pipe`, `registry_key`, `service_name`, `ssdeep`) now query Hybrid Analysis / Tria.ge search when keys are present, otherwise show structural enrichment as `context only`.
-- The sample `.env` ships empty — add keys to system env or `.env` as you prefer.
+- The sample `.env.example` ships empty — copy it to `.env` and add your keys there.
 
 The local SQLite database is stored at `data/ioc_platform.db`. Cached task and adapter data is stored under `.cache/`.
 

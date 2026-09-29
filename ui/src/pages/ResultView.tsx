@@ -1,5 +1,9 @@
 import { useMemo, useState } from "react";
-import type { LookupResponse, NormalizedResult } from "../services/api";
+import type { EthereumContext, LookupResponse, NormalizedResult } from "../services/api";
+import { buildHeadline, isCredentialDomain, type HeadlineMetric, type MetricTone } from "../lib/assessmentView";
+import { formatDate, formatDateTime, formatDuration, formatNumber, formatPercent, titleCase } from "../lib/format";
+import { buildProviderRows, groupProviderRows } from "../lib/providerEvidence";
+import { getVerdictBand } from "../lib/verdictColors";
 import type { ResultSourceMeta } from "../hooks/useLookup";
 import type { NavigateEvent } from "../App";
 import AbuseReportsPanel from "../components/AbuseReportsPanel";
@@ -7,6 +11,7 @@ import ConsensusBar from "../components/ConsensusBar";
 import ContextIntelCard, { hasContextIntel } from "../components/ContextIntelCard";
 import CoverageNotice from "../components/CoverageNotice";
 import EnrichmentPanel from "../components/EnrichmentPanel";
+import EthereumWalletCard from "../components/EthereumWalletCard";
 import EvidencePanel from "../components/EvidencePanel";
 import ExportMenu, { ExportTab } from "../components/ExportMenu";
 import PanelBoundary from "../components/PanelBoundary";
@@ -16,16 +21,13 @@ import HostVulnerabilityMatrix from "../components/HostVulnerabilityMatrix";
 import InfostealerExposureCard from "../components/InfostealerExposureCard";
 import RelationshipGraph from "../components/RelationshipGraph";
 import ScoreRing from "../components/ScoreRing";
-import SourceCard from "../components/SourceCard";
+import ProviderEvidenceList from "../components/ProviderEvidenceList";
 import SubdomainsCard from "../components/SubdomainsCard";
 import TabBar, { type TabName } from "../components/TabBar";
 import VerdictBadge from "../components/VerdictBadge";
 import WebPreviewCard from "../components/WebPreviewCard";
 import WhoisCard from "../components/WhoisCard";
 
-function titleCase(value: string): string {
-  return value.replace(/_/g, " ").replace(/\b\w/g, (character) => character.toUpperCase());
-}
 
 function hashType(value: string): "md5" | "sha1" | "sha256" {
   if (value.length === 32) return "md5";
@@ -39,53 +41,23 @@ function defangValue(text: string): string {
     .replace(/\./g, "[.]");
 }
 
-/**
- * Coerce an unknown enrichment value into a display string. Missing / non-numeric
- * values render as an em dash rather than crashing or printing "NaN".
- */
-function fmtMetric(value: unknown, suffix = ""): string {
-  if (value === null || value === undefined || value === "") return "—";
-  const numeric = Number(value);
-  if (!Number.isFinite(numeric)) return "—";
-  const formatted = numeric.toLocaleString(undefined, { maximumFractionDigits: 8 });
-  return suffix ? `${formatted} ${suffix}` : formatted;
-}
+const METRIC_TONES: Record<MetricTone, string> = {
+  danger: "text-red-400",
+  warn: "text-amber-400",
+  ok: "text-emerald-400",
+  info: "text-sky-300",
+  neutral: "text-text-primary",
+};
 
-function hasProviderData(result: NormalizedResult): boolean {
-  return (
-    result.execution_state === "success" &&
-    result.status !== "not_found" &&
-    (Object.keys(result.raw_data ?? {}).length > 0 ||
-      result.verdict !== "unknown" ||
-      result.tags.length > 0 ||
-      result.reports_count != null)
-  );
-}
-
-function StatCard({
-  label,
-  value,
-  detail,
-  accent = "text-text-primary",
-  subtext,
-}: {
-  label: string;
-  value: string;
-  detail?: string;
-  accent?: string;
-  subtext?: string;
-}) {
+function StatCard({ metric }: { metric: HeadlineMetric }) {
   return (
     <div className="rounded-xl border border-border/80 bg-bg-card/70 p-3.5 flex flex-col justify-between transition-colors hover:border-border">
       <div>
-        <div className="text-[10px] font-bold uppercase tracking-wider text-text-secondary">{label}</div>
-        <div className={`mt-1 text-lg font-extrabold tracking-tight ${accent}`}>{value}</div>
+        <div className="text-[10px] font-bold uppercase tracking-wider text-text-secondary">{metric.label}</div>
+        <div className={`mt-1 text-lg font-extrabold tracking-tight ${METRIC_TONES[metric.tone ?? "neutral"]}`}>{metric.value}</div>
       </div>
-      {(detail || subtext) && (
-        <div className="mt-2 text-[11px] text-text-secondary border-t border-border/40 pt-1.5 flex items-center justify-between">
-          {detail && <span>{detail}</span>}
-          {subtext && <span className="font-mono text-[10px] text-accent/80">{subtext}</span>}
-        </div>
+      {metric.detail && (
+        <div className="mt-2 border-t border-border/40 pt-1.5 text-[11px] text-text-secondary">{metric.detail}</div>
       )}
     </div>
   );
@@ -137,7 +109,7 @@ function RawDataView({ results }: { results: NormalizedResult[] }) {
                 </span>
               </div>
               <div className="flex items-center gap-2 text-[10px] text-text-secondary font-mono">
-                {item.latency_ms != null && <span>{Math.round(item.latency_ms)}ms</span>}
+                {item.latency_ms != null && <span>{formatDuration(item.latency_ms)}</span>}
                 <span className="rounded bg-bg-elevated px-1.5 py-0.5 border border-border/60">JSON</span>
               </div>
             </summary>
@@ -161,69 +133,28 @@ export default function ResultView({
   meta?: ResultSourceMeta;
 }) {
   const [tab, setTab] = useState<TabName>("Investigation");
-  const [providerFilter, setProviderFilter] = useState<"all" | "flagged" | "clean" | "no_data">("all");
-  const [providerSearch, setProviderSearch] = useState("");
   const [copiedRaw, setCopiedRaw] = useState(false);
   const [copiedDefanged, setCopiedDefanged] = useState(false);
 
-  const assessment = result.final_assessment;
-  const rawVerdict = assessment?.final_verdict || result.composite.verdict;
-  const domain = assessment?.assessment_domain || "ioc_reputation";
+  const assessment = result.final_assessment ?? null;
+  const results = useMemo(() => (Array.isArray(result.results) ? result.results : []), [result.results]);
   const rescanType = result.password_prehashed ? "password_sha1" : result.ioc_type;
-
-  // For credential_exposure domain: surface breached or not_breached
-  const verdict = domain === "credential_exposure"
-    ? (rawVerdict === "breached" || rawVerdict === "compromised" || result.results.some((r) => r.verdict === "breached" || r.verdict === "compromised" || r.verdict === "malicious")
-        ? "breached"
-        : (rawVerdict === "not_breached" || rawVerdict === "not_pwned" || rawVerdict === "clean" || rawVerdict === "benign")
-        ? "not_breached"
-        : rawVerdict)
-    : rawVerdict;
-
-  const score = assessment?.normalized_score ?? result.composite.score;
-  const confidence = assessment?.confidence || result.composite.confidence;
-  const expected = Number(
-    assessment?.evidence_summary?.expected_providers ??
-      assessment?.provider_breakdown?.length ??
-      result.results.length
+  const grouped = useMemo(
+    () => groupProviderRows(buildProviderRows(results, assessment?.provider_breakdown)),
+    [results, assessment?.provider_breakdown],
   );
-
-  const returned = useMemo(() => result.results.filter(hasProviderData), [result.results]);
-  const noData = useMemo(() => result.results.filter((item) => !hasProviderData(item)), [result.results]);
-
-  const flaggedList = useMemo(() => {
-    return returned.filter((item) =>
-      ["malicious", "suspicious", "compromised", "breached", "pwned", "high", "critical"].includes(
-        item.normalized_verdict || item.verdict
-      )
-    );
-  }, [returned]);
-
-  const cleanList = useMemo(() => {
-    return returned.filter((item) =>
-      ["clean", "benign", "harmless", "whitelisted", "not_pwned", "not_breached", "low"].includes(
-        item.normalized_verdict || item.verdict
-      )
-    );
-  }, [returned]);
-
-  const flaggedCount = flaggedList.length;
-
-  const analysisSeconds = useMemo(() => {
-    const latencies = result.results.map((item) => item.latency_ms ?? 0);
-    return Math.max(...latencies, 0) / 1000;
-  }, [result.results]);
-
-  const displayScore =
-    rawVerdict === "context_only"
-      ? "Context only"
-      : domain === "credential_exposure"
-      ? (verdict === "breached" ? "Breached" : "Not Breached")
-      : domain === "ioc_reputation" || !assessment?.assessment_domain
-      ? `${Math.round(score)}/100`
-      : domain === "vulnerability"
-      ? (result.enrichment?.cve?.cvss_score != null ? `CVSS ${result.enrichment.cve.cvss_score}/10` : `${Math.round(score)}/100`)
-      : `${Math.round(score)}/100`;
+  const headline = useMemo(() => buildHeadline(result, grouped), [result, grouped]);
+  const { verdict, domain } = headline;
+  const verdictBand = getVerdictBand(verdict);
+  const visibleResults = useMemo(
+    () => results.filter((item) => (item.execution_state || item.status) !== "not_applicable"),
+    [results],
+  );
+  const emptyFindingsText = isCredentialDomain(domain)
+    ? "No provider reported an exposure record. Absence from the queried breach sources is not proof the credential is safe."
+    : domain === "vulnerability"
+    ? "No vulnerability record was returned by the CVE providers."
+    : "No provider returned a verdict for this indicator. Not-found and failed providers are not evidence of benignness.";
 
   const handleCopyRaw = () => {
     void navigator.clipboard?.writeText(result.normalized);
@@ -238,21 +169,8 @@ export default function ResultView({
   };
 
   const handleNodeClick = (value: string) => onNewSearch(value);
-
-  // Filtered providers based on tab & search query
-  const displayedProviders = useMemo(() => {
-    let base = result.results;
-    if (providerFilter === "flagged") base = flaggedList;
-    else if (providerFilter === "clean") base = cleanList;
-    else if (providerFilter === "no_data") base = noData;
-    else base = returned;
-
-    if (providerSearch.trim()) {
-      const q = providerSearch.toLowerCase();
-      return base.filter((r) => r.source.toLowerCase().includes(q) || (r.provider_summary ?? "").toLowerCase().includes(q));
-    }
-    return base;
-  }, [result.results, providerFilter, flaggedList, cleanList, noData, returned, providerSearch]);
+  // Counterparties, funders and creators on the wallet card are always ETH addresses.
+  const handleEthPivot = (value: string) => onNewSearch(value, "eth");
 
   // Determine if domain-aware technical intelligence exists for the right column
   const enrichment = result.enrichment;
@@ -263,7 +181,13 @@ export default function ResultView({
   const isCred = result.ioc_type === "email" || result.ioc_type === "username"
     || result.ioc_type === "password" || result.ioc_type === "password_sha1";
   const isCve = result.ioc_type === "cve";
-  const isCrypto = result.ioc_type === "btc" || result.ioc_type === "eth";
+  const ethereumWallet =
+    result.ioc_type === "eth" && enrichment?.extra?.ethereum && typeof enrichment.extra.ethereum === "object"
+      ? (enrichment.extra.ethereum as EthereumContext)
+      : null;
+  // An ETH wallet renders as a full-width card above the columns, so only a
+  // BTC wallet (or an ETH lookup without wallet data) needs the right column.
+  const isCrypto = result.ioc_type === "btc" || (result.ioc_type === "eth" && !ethereumWallet);
   // "Context" indicator types: the backend produces structured enrichment.extra.*
   // data for these (ASN routing, MITRE ATT&CK metadata, host artifacts, file
   // hashes, filenames/paths, user-agents, MACs, fuzzy hashes). They previously
@@ -291,7 +215,6 @@ export default function ResultView({
     enrichment?.cve ||
     enrichment?.geoip ||
     enrichment?.extra?.bitcoin ||
-    enrichment?.extra?.ethereum ||
     hasContextIntel(enrichment?.extra)
   );
 
@@ -345,7 +268,7 @@ export default function ResultView({
             <div>
               <span className="font-bold text-sky-100">Historical Snapshot: </span>
               <span className="text-sky-300/80">
-                Loaded instant pre-calculated analysis {meta.scannedAt ? `(originally scanned ${new Date(meta.scannedAt).toLocaleString()})` : ""}. No external API keys were billed.
+                Loaded instant pre-calculated analysis {meta.scannedAt ? `(originally scanned ${formatDateTime(meta.scannedAt)})` : ""}. No external API keys were billed.
               </span>
             </div>
           </div>
@@ -444,77 +367,67 @@ export default function ResultView({
           </div>
 
           <div className="flex items-center gap-3">
-            <VerdictBadge verdict={verdict} size="md" />
+            <VerdictBadge verdict={verdict} size="md" label={headline.verdictLabel} />
           </div>
         </div>
 
-        {/* Hero Metrics & Score Ring */}
+        {/* Hero Metrics & Score Ring: every value comes from final_assessment */}
         <div className="grid grid-cols-1 gap-6 p-6 lg:grid-cols-12 items-center">
-          {/* Left Ring and Primary Assessment */}
           <div className="flex items-center gap-5 lg:col-span-4 border-b border-border/60 pb-5 lg:border-b-0 lg:border-r lg:pb-0 lg:pr-6">
-            <div className="shrink-0 drop-shadow-[0_0_15px_rgba(56,189,248,0.2)]">
-              <ScoreRing score={Math.max(0, Math.min(100, score))} size={86} />
+            <div className="shrink-0">
+              <ScoreRing score={headline.score} verdict={verdict} size={86} />
             </div>
             <div className="min-w-0 flex-1">
               <div className="text-[10px] font-bold uppercase tracking-wider text-text-secondary">
-                Threat Verdict
+                {headline.domainLabel} verdict
               </div>
-              <div className={`mt-0.5 text-2xl font-black uppercase tracking-tight ${
-                verdict === "breached" || verdict === "compromised" || verdict.includes("malicious") || verdict === "critical" || verdict === "high"
-                  ? "text-rose-400 drop-shadow-[0_0_12px_rgba(244,63,94,0.3)]"
-                  : verdict === "not_breached" || verdict === "clean" || verdict === "benign" || verdict === "not_pwned" || verdict === "low"
-                  ? "text-emerald-400 drop-shadow-[0_0_12px_rgba(16,185,129,0.3)]"
-                  : verdict === "suspicious" || verdict === "medium"
-                  ? "text-amber-400"
-                  : "text-slate-300"
-              }`}>
-                {titleCase(verdict)}
+              <div
+                data-testid="headline-verdict"
+                className={`mt-0.5 text-2xl font-black uppercase tracking-tight ${
+                  verdictBand === "malicious" ? "text-rose-400" : verdictBand === "suspicious" ? "text-amber-400" : verdictBand === "benign" ? "text-emerald-400" : "text-slate-300"
+                }`}
+              >
+                {headline.verdictLabel}
               </div>
-              <div className="mt-1 flex items-center gap-2 text-xs text-text-secondary">
-                <span className="font-semibold text-text-primary">{displayScore}</span>
-                <span>·</span>
-                <span>{domain ? titleCase(domain) : "Composite Reputation"}</span>
+              <div className="mt-1 flex flex-wrap items-center gap-x-2 text-xs text-text-secondary">
+                <span className="font-semibold text-text-primary" data-testid="headline-score">{headline.scoreText}</span>
+                {headline.score !== null && <span>· {headline.scoreCaption}</span>}
               </div>
+              {headline.needsReview && (
+                <div className="mt-1.5 inline-flex rounded border border-amber-500/40 bg-amber-500/10 px-1.5 py-0.5 text-[10px] font-semibold uppercase tracking-wider text-amber-300">
+                  Analyst review recommended
+                </div>
+              )}
             </div>
           </div>
 
-          {/* Key Metrics Grid */}
           <div className="grid grid-cols-2 gap-3 sm:grid-cols-4 lg:col-span-8">
-            <StatCard
-              label="Confidence"
-              value={titleCase(confidence)}
-              detail={assessment?.confidence_score != null ? `${Math.round(assessment.confidence_score * 100)}% reliability` : "Calibrated"}
-              accent={confidence === "high" ? "text-emerald-400" : confidence === "medium" ? "text-sky-300" : "text-amber-400"}
-            />
-            <StatCard
-              label="Provider Consensus"
-              value={`${flaggedCount}/${returned.length}`}
-              detail={flaggedCount > 0 ? `${flaggedCount} engines flagged` : "0 detections recorded"}
-              accent={flaggedCount > 0 ? "text-red-400" : "text-emerald-400"}
-            />
-            <StatCard
-              label="Engine Coverage"
-              value={`${returned.length}/${expected || result.results.length}`}
-              detail={`${noData.length} no-data / inactive`}
-              accent="text-sky-300"
-            />
-            <StatCard
-              label="Latency & Provenance"
-              value={`${analysisSeconds.toFixed(1)}s`}
-              detail={result.results.some((r) => r.cached) ? "Cached signals mixed" : "100% Live lookup"}
-            />
+            {headline.metrics.map((metric) => <StatCard key={metric.label} metric={metric} />)}
           </div>
         </div>
 
-        {/* Analyst Executive Guidance Banner */}
-        {result.executive_summary && (
-          <div className="border-t border-border/80 bg-bg-secondary/40 px-6 py-3.5 text-xs leading-relaxed text-text-secondary flex items-start gap-3">
-            <span className="shrink-0 rounded bg-accent/15 px-2 py-0.5 text-[10px] font-bold uppercase tracking-wider text-accent border border-accent/30 mt-0.5">
-              Analyst Brief
-            </span>
-            <p className="text-text-primary/90 font-medium">
-              {result.executive_summary}
-            </p>
+        {/* Why this verdict: the assessment reason, then the narrative summary */}
+        {(headline.reason || result.executive_summary) && (
+          <div className="border-t border-border/80 bg-bg-secondary/40 px-6 py-3.5 text-xs leading-relaxed text-text-secondary space-y-1.5">
+            {headline.reason && (
+              <p className="flex items-start gap-3">
+                <span className="shrink-0 rounded bg-accent/15 px-2 py-0.5 text-[10px] font-bold uppercase tracking-wider text-accent border border-accent/30 mt-0.5">
+                  Why
+                </span>
+                <span className="text-text-primary/90 font-medium" data-testid="headline-reason">{headline.reason}</span>
+              </p>
+            )}
+            {headline.reviewReasons.length > 0 && (
+              <ul className="list-disc space-y-0.5 pl-16 text-amber-200/90">
+                {headline.reviewReasons.map((item) => <li key={item}>{item}</li>)}
+              </ul>
+            )}
+            {result.executive_summary && result.executive_summary.trim() !== headline.reason.trim() && (
+              <details className="pl-12">
+                <summary className="cursor-pointer text-[11px] font-semibold text-text-secondary hover:text-text-primary">Analyst brief</summary>
+                <p className="mt-1 text-text-primary/80">{result.executive_summary}</p>
+              </details>
+            )}
           </div>
         )}
       </section>
@@ -528,7 +441,7 @@ export default function ResultView({
         onChange={setTab}
         badges={{
           Relationships: result.relationships?.length || 0,
-          "Raw Data": result.results?.length || 0,
+          "Raw Data": visibleResults.length,
         }}
       />
 
@@ -536,107 +449,21 @@ export default function ResultView({
       <div id="result-panel" role="tabpanel" aria-label={`${tab} results`}>
         {tab === "Investigation" && (
           <div className="space-y-6">
-            {/* Global Source Consensus Visual Distribution Bar */}
-            <ConsensusBar results={result.results} />
+            {domain === "ioc_reputation" && grouped.findings.length > 1 && (
+              <ConsensusBar results={grouped.findings.flatMap((row) => (row.result ? [row.result] : []))} />
+            )}
+
+            {ethereumWallet && (
+              <PanelBoundary label="Ethereum wallet">
+                <EthereumWalletCard wallet={ethereumWallet} onPivot={handleEthPivot} />
+              </PanelBoundary>
+            )}
 
             {/* Unified 2-Column Responsive Workspace */}
             <div className="grid grid-cols-1 gap-6 lg:grid-cols-12 items-start">
               {/* LEFT COLUMN: Threat Feeds & Provider Consensus */}
               <div className={`space-y-4 ${showRightColumn ? "lg:col-span-7" : "lg:col-span-12"}`}>
-                {/* Providers Header & Filter Bar */}
-                <div className="rounded-xl border border-border bg-bg-card p-4 space-y-3">
-                  <div className="flex flex-wrap items-center justify-between gap-3">
-                    <div>
-                      <h3 className="text-xs font-bold uppercase tracking-[0.14em] text-text-primary">
-                        Provider Threat Intelligence
-                      </h3>
-                      <p className="mt-0.5 text-[11px] text-text-secondary">
-                        Real-time threat feeds, blocklists, and detection engines.
-                      </p>
-                    </div>
-
-                    <div className="flex items-center gap-2">
-                      <input
-                        type="text"
-                        placeholder="Search provider..."
-                        value={providerSearch}
-                        onChange={(e) => setProviderSearch(e.target.value)}
-                        className="rounded-lg border border-border bg-bg-elevated px-2.5 py-1 text-xs text-text-primary placeholder:text-text-secondary/60 focus:border-accent focus:outline-none w-36 sm:w-44"
-                      />
-                    </div>
-                  </div>
-
-                  {/* Filter Pills */}
-                  <div className="flex flex-wrap items-center gap-1.5 border-t border-border/60 pt-3">
-                    <button
-                      type="button"
-                      onClick={() => setProviderFilter("all")}
-                      className={`rounded-lg px-2.5 py-1 text-xs font-semibold transition-colors ${
-                        providerFilter === "all"
-                          ? "bg-accent/15 text-accent border border-accent/40"
-                          : "bg-bg-elevated text-text-secondary border border-border/70 hover:text-text-primary"
-                      }`}
-                    >
-                      Active ({returned.length})
-                    </button>
-                    <button
-                      type="button"
-                      onClick={() => setProviderFilter("flagged")}
-                      className={`rounded-lg px-2.5 py-1 text-xs font-semibold transition-colors flex items-center gap-1.5 ${
-                        providerFilter === "flagged"
-                          ? "bg-red-500/20 text-red-300 border border-red-500/50"
-                          : "bg-bg-elevated text-text-secondary border border-border/70 hover:text-text-primary"
-                      }`}
-                    >
-                      <span className={`h-1.5 w-1.5 rounded-full ${flaggedCount > 0 ? "bg-red-400" : "bg-text-secondary"}`} />
-                      Flagged ({flaggedCount})
-                    </button>
-                    <button
-                      type="button"
-                      onClick={() => setProviderFilter("clean")}
-                      className={`rounded-lg px-2.5 py-1 text-xs font-semibold transition-colors ${
-                        providerFilter === "clean"
-                          ? "bg-emerald-500/20 text-emerald-300 border border-emerald-500/50"
-                          : "bg-bg-elevated text-text-secondary border border-border/70 hover:text-text-primary"
-                      }`}
-                    >
-                      Clean / Benign ({cleanList.length})
-                    </button>
-                    {noData.length > 0 && (
-                      <button
-                        type="button"
-                        onClick={() => setProviderFilter("no_data")}
-                        className={`rounded-lg px-2.5 py-1 text-xs font-semibold transition-colors ${
-                          providerFilter === "no_data"
-                            ? "bg-slate-500/20 text-slate-300 border border-slate-500/50"
-                            : "bg-bg-elevated text-text-secondary border border-border/70 hover:text-text-primary"
-                        }`}
-                      >
-                        No Data ({noData.length})
-                      </button>
-                    )}
-                  </div>
-                </div>
-
-                {/* Provider Cards List */}
-                {displayedProviders.length > 0 ? (
-                  <div className="grid grid-cols-1 gap-3">
-                    {displayedProviders.map((item) => (
-                      <SourceCard key={item.source} result={item} />
-                    ))}
-                  </div>
-                ) : domain === "credential_exposure" ? (
-                  <div className="rounded-xl border border-emerald-500/30 bg-emerald-500/5 p-6 text-center">
-                    <h4 className="text-sm font-bold text-emerald-300">✓ Clean Credential Signal</h4>
-                    <p className="mt-1 text-xs text-text-secondary">
-                      No public exposure records observed in queried threat databases.
-                    </p>
-                  </div>
-                ) : (
-                  <div className="rounded-xl border border-border bg-bg-card p-8 text-center text-xs text-text-secondary">
-                    No providers match the selected filter.
-                  </div>
-                )}
+                <ProviderEvidenceList grouped={grouped} emptyFindingsText={emptyFindingsText} />
 
                 {/* Correlated Malware Indicators (AlienVault OTX / URLhaus) */}
                 {Boolean((enrichment?.malware_urls?.length ?? 0) > 0 || (enrichment?.associated_hashes?.length ?? 0) > 0) && (
@@ -829,24 +656,38 @@ export default function ResultView({
                         {enrichment?.cve?.cvss_score != null && (
                           <div className="flex justify-between border-b border-border/40 pb-1.5">
                             <span className="text-text-secondary">CVSS Score:</span>
-                            <span className="font-bold text-red-400">{enrichment.cve.cvss_score} ({enrichment.cve.cvss_severity ?? "N/A"})</span>
+                            <span className="font-bold text-red-400">
+                              {formatNumber(enrichment.cve.cvss_score, { maxFractionDigits: 1 })}
+                              {enrichment.cve.cvss_severity ? ` (${titleCase(enrichment.cve.cvss_severity.toLowerCase())})` : ""}
+                            </span>
                           </div>
                         )}
                         {enrichment?.cve?.epss_score != null && (
                           <div className="flex justify-between border-b border-border/40 pb-1.5">
-                            <span className="text-text-secondary">EPSS Exploit Probability:</span>
-                            <span className="font-mono text-amber-400">{((enrichment.cve.epss_score as number) * 100).toFixed(2)}%</span>
+                            <span className="text-text-secondary">EPSS exploit probability:</span>
+                            <span className="font-mono text-amber-400">
+                              {formatPercent(enrichment.cve.epss_score, 1)}
+                              {enrichment.cve.epss_percentile != null ? ` · ${formatPercent(enrichment.cve.epss_percentile, 0)} pctl` : ""}
+                            </span>
+                          </div>
+                        )}
+                        {enrichment?.cve?.cvss_vector && (
+                          <div className="flex justify-between gap-3 border-b border-border/40 pb-1.5">
+                            <span className="text-text-secondary">Vector:</span>
+                            <span className="break-all text-right font-mono text-[11px] text-text-primary">{enrichment.cve.cvss_vector}</span>
                           </div>
                         )}
                         {enrichment?.cve?.is_in_kev && (
                           <div className="rounded bg-red-500/15 border border-red-500/30 p-2 text-[11px] text-red-300 font-semibold">
-                            ⚠ Known Exploited Vulnerability (CISA KEV) active threat
+                            Listed in CISA Known Exploited Vulnerabilities
+                            {enrichment.cve.kev_date_added ? ` (added ${formatDate(enrichment.cve.kev_date_added)})` : ""}
                           </div>
                         )}
-                        {enrichment?.cve?.affected_products && enrichment.cve.affected_products.length > 0 && (
+                        {Array.isArray(enrichment?.cve?.affected_products) && enrichment.cve.affected_products.length > 0 && (
                           <div className="text-[11px] text-text-secondary pt-1">
                             <span className="font-semibold text-text-primary">Affected products:</span>{" "}
                             {enrichment.cve.affected_products.slice(0, 3).join(", ")}
+                            {enrichment.cve.affected_products.length > 3 ? ` +${enrichment.cve.affected_products.length - 3} more` : ""}
                           </div>
                         )}
                       </div>
@@ -869,7 +710,7 @@ export default function ResultView({
                   )}
 
                   {/* CRYPTO WALLET METRICS */}
-                  {Boolean(enrichment?.extra?.bitcoin || enrichment?.extra?.ethereum) && (
+                  {Boolean(enrichment?.extra?.bitcoin) && (
                     <section className="rounded-xl border border-border bg-bg-card p-4 space-y-3">
                       <div className="flex items-center justify-between border-b border-border/60 pb-2">
                         <h4 className="text-xs font-bold uppercase tracking-wider text-text-primary">
@@ -880,7 +721,7 @@ export default function ResultView({
 
                       {/* BITCOIN */}
                       {Boolean(enrichment?.extra?.bitcoin) && (() => {
-                        const btc = (enrichment?.extra?.bitcoin as Record<string, unknown>) ?? {};
+                        const btc = (enrichment?.extra?.bitcoin as unknown as Record<string, unknown>) ?? {};
                         const recent = Array.isArray(btc.recent_transactions)
                           ? (btc.recent_transactions as Record<string, unknown>[])
                           : [];
@@ -896,20 +737,20 @@ export default function ResultView({
                               <div className="flex justify-between">
                                 <span className="text-text-secondary">Balance:</span>
                                 <span className="text-text-primary font-bold">
-                                  {fmtMetric(btc.final_balance_btc, "BTC")}
+                                  {formatNumber(btc.final_balance_btc, { unit: "BTC", maxFractionDigits: 8 })}
                                 </span>
                               </div>
                               <div className="flex justify-between">
                                 <span className="text-text-secondary">Transactions:</span>
-                                <span className="text-text-primary">{fmtMetric(btc.n_tx)}</span>
+                                <span className="text-text-primary">{formatNumber(btc.n_tx)}</span>
                               </div>
                               <div className="flex justify-between">
                                 <span className="text-text-secondary">Total Received:</span>
-                                <span className="text-emerald-400">{fmtMetric(btc.total_received_btc, "BTC")}</span>
+                                <span className="text-emerald-400">{formatNumber(btc.total_received_btc, { unit: "BTC", maxFractionDigits: 8 })}</span>
                               </div>
                               <div className="flex justify-between">
                                 <span className="text-text-secondary">Total Sent:</span>
-                                <span className="text-rose-400">{fmtMetric(btc.total_sent_btc, "BTC")}</span>
+                                <span className="text-rose-400">{formatNumber(btc.total_sent_btc, { unit: "BTC", maxFractionDigits: 8 })}</span>
                               </div>
                             </div>
                             {recent.length > 0 && (
@@ -929,7 +770,7 @@ export default function ResultView({
                                           {hash ? `${hash.slice(0, 18)}…` : "—"}
                                         </span>
                                         <span className="shrink-0 text-text-secondary">
-                                          {fmtMetric(tx.result_btc, "BTC")}
+                                          {formatNumber(tx.result_btc, { unit: "BTC", maxFractionDigits: 8 })}
                                         </span>
                                       </div>
                                     );
@@ -941,60 +782,6 @@ export default function ResultView({
                         );
                       })()}
 
-                      {/* ETHEREUM */}
-                      {Boolean(enrichment?.extra?.ethereum) && (() => {
-                        const eth = (enrichment?.extra?.ethereum as Record<string, unknown>) ?? {};
-                        const recent = Array.isArray(eth.recent_transactions)
-                          ? (eth.recent_transactions as Record<string, unknown>[])
-                          : [];
-                        return (
-                          <div className={`space-y-2 text-xs ${enrichment?.extra?.bitcoin ? "border-t border-border/40 pt-3" : ""}`}>
-                            <div className="flex items-center gap-1.5">
-                              <span className="rounded bg-indigo-500/15 px-1.5 py-0.5 text-[10px] font-bold uppercase tracking-wider text-indigo-300 border border-indigo-500/30">
-                                ETH
-                              </span>
-                              <span className="text-[10px] text-text-secondary">Ethereum</span>
-                            </div>
-                            <div className="space-y-1.5 font-mono">
-                              <div className="flex justify-between">
-                                <span className="text-text-secondary">Balance:</span>
-                                <span className="text-text-primary font-bold">
-                                  {fmtMetric(eth.balance_eth, "ETH")}
-                                </span>
-                              </div>
-                              <div className="flex justify-between">
-                                <span className="text-text-secondary">Transactions:</span>
-                                <span className="text-text-primary">{fmtMetric(eth.transaction_count)}</span>
-                              </div>
-                            </div>
-                            {recent.length > 0 && (
-                              <div className="space-y-1 pt-1">
-                                <span className="text-[10px] uppercase tracking-wider text-text-secondary block">
-                                  Recent Transactions ({recent.length})
-                                </span>
-                                <div className="max-h-32 overflow-y-auto space-y-1 font-mono text-[11px]">
-                                  {recent.map((tx, i) => {
-                                    const hash = tx.hash != null ? String(tx.hash) : "";
-                                    return (
-                                      <div
-                                        key={hash || i}
-                                        className="flex items-center justify-between gap-2 rounded bg-bg-elevated/60 px-2 py-1 border border-border/50"
-                                      >
-                                        <span className="truncate text-slate-300" title={hash}>
-                                          {hash ? `${hash.slice(0, 18)}…` : "—"}
-                                        </span>
-                                        <span className="shrink-0 text-text-secondary">
-                                          {fmtMetric(tx.value_eth, "ETH")}
-                                        </span>
-                                      </div>
-                                    );
-                                  })}
-                                </div>
-                              </div>
-                            )}
-                          </div>
-                        );
-                      })()}
                     </section>
                   )}
 
@@ -1033,7 +820,11 @@ export default function ResultView({
         {/* Dedicated Deep-Dive Tabs */}
         {tab === "Enrichment" && (
           <PanelBoundary label="Enrichment">
-            <EnrichmentPanel enrichment={result.enrichment} iocType={result.ioc_type} />
+            <EnrichmentPanel
+              enrichment={result.enrichment}
+              iocType={result.ioc_type}
+              onPivot={handleEthPivot}
+            />
           </PanelBoundary>
         )}
 
@@ -1045,7 +836,7 @@ export default function ResultView({
 
         {tab === "Raw Data" && (
           <PanelBoundary label="Raw data">
-            <RawDataView results={result.results} />
+            <RawDataView results={visibleResults} />
           </PanelBoundary>
         )}
 

@@ -2,11 +2,19 @@ import asyncio
 import random
 import time
 from contextlib import asynccontextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 from app.backend.logger import get_logger
 
 logger = get_logger("rate_limiter")
+
+# Provider pacing windows.  Module-level so tests can shrink them; the
+# production values match the per-minute / per-day quotas the adapters declare
+# in their ``RateLimitConfig``.
+PROVIDER_WINDOW_SECONDS = 60.0
+PROVIDER_DAY_SECONDS = 86400.0
+# Upper bound for a provider-supplied Retry-After we will honor.
+MAX_PROVIDER_PENALTY_SECONDS = 86400.0
 
 
 @dataclass
@@ -15,6 +23,33 @@ class RateLimitDecision:
     retry_count: int = 0
     retry_after_seconds: float | None = None
     reason: str = ""
+
+
+@dataclass
+class SlotReservation:
+    """Outcome of asking the provider scheduler for a request slot.
+
+    ``granted`` reservations carry the monotonic ``slot_time`` at which the
+    request may be sent; ``wait_seconds`` is how long the caller waited (or has
+    to wait) for it.  A denied reservation reports ``retry_after_seconds``: the
+    wait that would have been required, which did not fit the caller's budget.
+    """
+
+    granted: bool
+    wait_seconds: float = 0.0
+    retry_after_seconds: float | None = None
+    reason: str = ""
+    slot_time: float | None = None
+
+
+@dataclass
+class _ProviderSchedule:
+    # Sorted monotonic send times (past requests and future reservations).
+    minute: list[float] = field(default_factory=list)
+    day: list[float] = field(default_factory=list)
+    last_slot: float = float("-inf")
+    # Provider-requested back-off (Retry-After / 429) shared by all lookups.
+    blocked_until: float = 0.0
 
 
 class RateLimiter:
@@ -56,6 +91,7 @@ return 1
         self._provider_slot_limits: dict[str, int] = {}
         self._last_request: dict[str, float] = {}
         self._interval_locks: dict[str, asyncio.Lock] = {}
+        self._schedules: dict[str, _ProviderSchedule] = {}
 
     async def _connect(self):
         import redis.asyncio as aioredis
@@ -325,6 +361,153 @@ return 1
                 interval_lock.release()
         return (time.monotonic() - started) * 1000.0
 
+    # --- Provider request scheduler -------------------------------------
+    #
+    # One schedule per provider, shared by every single lookup and batch in
+    # this process.  Instead of rejecting a request as soon as the sliding
+    # window is full (which made concurrent lookups fail with rate_limited
+    # immediately), a caller *reserves* the earliest send time that respects
+    # the provider's per-minute and per-day quota, its minimum interval and
+    # any Retry-After back-off the provider asked for.  Reservations are FIFO,
+    # so concurrent callers get distinct slots without a thundering herd.  A
+    # caller only receives ``rate_limited`` when that slot is further away than
+    # the time it can afford to wait (its remaining IOC deadline).
+    #
+    # The app runs as a single process, so this schedule is process-local by
+    # design; the Redis-backed ``acquire``/``acquire_provider`` helpers above
+    # remain for request-level limiting.
+
+    def _provider_schedule(self, source: str) -> _ProviderSchedule:
+        schedule = self._schedules.get(source)
+        if schedule is None:
+            schedule = _ProviderSchedule()
+            self._schedules[source] = schedule
+        return schedule
+
+    def reserve_provider(
+        self,
+        source: str,
+        requests_per_minute: int,
+        requests_per_day: int = 0,
+        *,
+        minimum_interval: float = 0.0,
+        max_wait: float = 0.0,
+    ) -> SlotReservation:
+        """Reserve the earliest permitted send time for one provider request.
+
+        The reservation is recorded only when the required wait fits inside
+        ``max_wait``; otherwise nothing is consumed and the required wait is
+        returned as ``retry_after_seconds``.  The computation contains no
+        ``await``, so it is atomic on the event loop.
+        """
+        now = time.monotonic()
+        window = float(PROVIDER_WINDOW_SECONDS)
+        day = float(PROVIDER_DAY_SECONDS)
+        schedule = self._provider_schedule(source)
+        schedule.minute = [t for t in schedule.minute if t > now - window]
+        schedule.day = [t for t in schedule.day if t > now - day]
+        minute_limit = max(1, int(requests_per_minute or 1))
+        daily_limit = max(0, int(requests_per_day or 0))
+
+        earliest = max(now, schedule.blocked_until)
+        reason = "provider_retry_after" if schedule.blocked_until > now else "rate_limited"
+        interval = max(0.0, float(minimum_interval or 0.0))
+        if interval and schedule.last_slot != float("-inf"):
+            earliest = max(earliest, schedule.last_slot + interval)
+        if schedule.minute:
+            # FIFO: never jump ahead of an existing reservation.
+            earliest = max(earliest, schedule.minute[-1])
+        if len(schedule.minute) >= minute_limit:
+            earliest = max(earliest, schedule.minute[-minute_limit] + window)
+        if daily_limit and len(schedule.day) >= daily_limit:
+            day_earliest = schedule.day[-daily_limit] + day
+            if day_earliest > earliest:
+                earliest = day_earliest
+                reason = "daily_quota_exhausted"
+
+        wait = max(0.0, earliest - now)
+        if wait > max(0.0, float(max_wait or 0.0)):
+            return SlotReservation(False, retry_after_seconds=round(wait, 3), reason=reason)
+        schedule.minute.append(earliest)
+        if daily_limit:
+            schedule.day.append(earliest)
+        schedule.last_slot = max(schedule.last_slot, earliest)
+        return SlotReservation(True, wait_seconds=wait, slot_time=earliest)
+
+    def release_provider(self, source: str, slot_time: float | None) -> None:
+        """Return a reservation that was never used (caller cancelled/gave up)."""
+        if slot_time is None:
+            return
+        schedule = self._schedules.get(source)
+        if schedule is None or slot_time <= time.monotonic():
+            # The slot's send time has passed: treat it as consumed.
+            return
+        for values in (schedule.minute, schedule.day):
+            try:
+                values.remove(slot_time)
+            except ValueError:
+                pass
+        if schedule.last_slot == slot_time:
+            schedule.last_slot = schedule.minute[-1] if schedule.minute else float("-inf")
+
+    def penalize_provider(self, source: str, retry_after_seconds: float | None) -> None:
+        """Honor a provider's Retry-After for every lookup in this process."""
+        if retry_after_seconds is None:
+            return
+        try:
+            delay = min(max(0.0, float(retry_after_seconds)), MAX_PROVIDER_PENALTY_SECONDS)
+        except (TypeError, ValueError):
+            return
+        if delay <= 0:
+            return
+        schedule = self._provider_schedule(source)
+        schedule.blocked_until = max(schedule.blocked_until, time.monotonic() + delay)
+
+    def provider_blocked_for(self, source: str) -> float:
+        schedule = self._schedules.get(source)
+        if schedule is None:
+            return 0.0
+        return max(0.0, schedule.blocked_until - time.monotonic())
+
+    async def wait_for_reservation(
+        self,
+        source: str,
+        reservation: SlotReservation,
+        *,
+        max_wait: float,
+    ) -> SlotReservation:
+        """Sleep until a granted reservation's send time.
+
+        If the provider asked us to back off while we were waiting, the extra
+        delay is honored when it still fits ``max_wait`` (measured from the
+        start of this call); otherwise the reservation is released and a denied
+        reservation is returned.  Cancellation releases the unused slot.
+        """
+        if not reservation.granted:
+            return reservation
+        started = time.monotonic()
+        try:
+            delay = (reservation.slot_time or started) - started
+            if delay > 0:
+                await asyncio.sleep(delay)
+            blocked = self.provider_blocked_for(source)
+            if blocked > 0:
+                spent = time.monotonic() - started
+                if spent + blocked > max(0.0, max_wait):
+                    self.release_provider(source, reservation.slot_time)
+                    return SlotReservation(
+                        False,
+                        wait_seconds=spent,
+                        retry_after_seconds=round(blocked, 3),
+                        reason="provider_retry_after",
+                    )
+                await asyncio.sleep(blocked)
+        except asyncio.CancelledError:
+            self.release_provider(source, reservation.slot_time)
+            raise
+        reservation.wait_seconds = time.monotonic() - started
+        return reservation
+
     @asynccontextmanager
     async def provider_slot(self, source: str, concurrency_limit: int = 2, timeout: float = 0.0):
         """Limit in-flight requests independently for each provider."""
@@ -355,3 +538,4 @@ return 1
         self._provider_slots.clear()
         self._provider_slot_limits.clear()
         self._interval_locks.clear()
+        self._schedules.clear()

@@ -34,13 +34,86 @@ export function clearRuntimeApiKey(): void {
 export class ApiError extends Error {
   status: number;
   detail?: string;
+  retryAfterSeconds?: number;
 
-  constructor(message: string, status: number, detail?: string) {
+  constructor(message: string, status: number, detail?: string, retryAfterSeconds?: number) {
     super(message);
     this.name = "ApiError";
     this.status = status;
     this.detail = detail;
+    this.retryAfterSeconds = retryAfterSeconds;
   }
+}
+
+/** `detail` marker for a request that never reached the backend. */
+export const NETWORK_ERROR_DETAIL = "network";
+/** `detail` marker for a request aborted by the client-side timeout. */
+export const TIMEOUT_DETAIL = "timeout";
+
+function parseRetryAfter(value: string | null): number | undefined {
+  if (!value) return undefined;
+  const seconds = Number(value);
+  if (Number.isFinite(seconds) && seconds >= 0) return seconds;
+  const date = Date.parse(value);
+  if (Number.isFinite(date)) return Math.max(0, Math.round((date - Date.now()) / 1000));
+  return undefined;
+}
+
+/**
+ * Read a human-readable error detail from a failed response. FastAPI errors are
+ * JSON (`{"detail": ...}`), but the auth and rate-limit middleware answer with
+ * text/plain bodies, which used to be discarded — leaving the analyst with a bare
+ * "Request failed: 429".
+ */
+async function readErrorDetail(res: Response): Promise<string | undefined> {
+  let text = "";
+  try {
+    text = await res.text();
+  } catch {
+    return undefined;
+  }
+  const trimmed = text.trim();
+  if (!trimmed) return undefined;
+  try {
+    const body = JSON.parse(trimmed) as unknown;
+    if (body && typeof body === "object" && "detail" in body) {
+      const detail = (body as { detail: unknown }).detail;
+      if (typeof detail === "string") return detail;
+      if (Array.isArray(detail)) {
+        const parts = detail
+          .map((item) => (item && typeof item === "object" && "msg" in item ? String((item as { msg: unknown }).msg) : ""))
+          .filter(Boolean);
+        return parts.length ? parts.join("; ") : undefined;
+      }
+    }
+    return undefined;
+  } catch {
+    // Plain-text body (middleware responses). Ignore HTML error pages.
+    return trimmed.startsWith("<") ? undefined : trimmed.slice(0, 300);
+  }
+}
+
+/** Analyst-facing message for a failed request, by status. */
+function describeFailure(status: number, detail: string | undefined, retryAfter: number | undefined): string {
+  const retry = retryAfter != null ? ` Retry in ${Math.round(retryAfter)}s.` : "";
+  if (status === 401) return "Authentication required: enter the local API key for this instance.";
+  if (status === 403) return detail || "This action is not permitted by the server configuration.";
+  if (status === 404) return detail || "Not found on the server.";
+  if (status === 429) {
+    return `${detail || "Too many requests: the platform's lookup rate limit was reached."}${retry}`.trim();
+  }
+  if (status === 502 || status === 503 || status === 504) {
+    return detail ? `Backend unavailable (${status}): ${detail}` : `Backend unavailable (HTTP ${status}). Check that the IOC platform server is running.`;
+  }
+  if (status >= 500) return detail ? `Server error (${status}): ${detail}` : `Server error (HTTP ${status}).`;
+  return detail || `Request failed (HTTP ${status}).`;
+}
+
+/** Best-effort human message for any error thrown by this module. */
+export function errorMessage(error: unknown, fallback = "Request failed"): string {
+  if (error instanceof ApiError) return error.message || error.detail || fallback;
+  if (error instanceof Error && error.message) return error.message;
+  return fallback;
 }
 
 interface RequestOptions extends RequestInit {
@@ -71,20 +144,23 @@ async function request<T>(path: string, options: RequestOptions = {}): Promise<T
       if (res.status === 401 && typeof window !== "undefined") {
         window.dispatchEvent(new Event(AUTH_REQUIRED_EVENT));
       }
-      let detail: string | undefined;
-      try {
-        const body = await res.json();
-        detail = typeof body.detail === "string" ? body.detail : undefined;
-      } catch {
-        // ignore body parse failure
-      }
-      throw new ApiError(`Request failed: ${res.status}`, res.status, detail);
+      const detail = await readErrorDetail(res);
+      const retryAfter = parseRetryAfter(res.headers.get("Retry-After"));
+      throw new ApiError(describeFailure(res.status, detail, retryAfter), res.status, detail, retryAfter);
     }
     if (res.status === 204) return undefined as T;
     return (await res.json()) as T;
   } catch (err) {
+    if (err instanceof ApiError) throw err;
     if (err instanceof DOMException && err.name === "AbortError") {
-      throw new ApiError(`Request timed out after ${timeoutMs}ms`, 0, "timeout");
+      throw new ApiError(`The server did not answer within ${Math.round(timeoutMs / 1000)}s.`, 0, TIMEOUT_DETAIL);
+    }
+    if (err instanceof TypeError) {
+      // fetch() rejects with a TypeError when the backend is unreachable.
+      throw new ApiError("Cannot reach the IOC platform backend. Check that the server is running.", 0, NETWORK_ERROR_DETAIL);
+    }
+    if (err instanceof SyntaxError) {
+      throw new ApiError("The server returned an unreadable response.", 0, "invalid_response");
     }
     throw err;
   } finally {
@@ -107,7 +183,7 @@ export async function fetchProtectedImage(path: string): Promise<string> {
     return URL.createObjectURL(await res.blob());
   } catch (err) {
     if (err instanceof DOMException && err.name === "AbortError") {
-      throw new ApiError("Image request timed out", 0, "timeout");
+      throw new ApiError("Image request timed out", 0, TIMEOUT_DETAIL);
     }
     throw err;
   } finally {
@@ -465,9 +541,109 @@ export interface CryptoContext {
   recent_transactions?: Record<string, unknown>[];
 }
 
+// Etherscan address-page + V2 API wallet context (backend etherscan_page.py).
+export interface EthParty {
+  address?: string | null;
+  label?: string | null;
+}
+
+export interface EthTxRef {
+  tx_hash?: string | null;
+  age?: string;
+}
+
+export interface EthLabel {
+  name: string;
+  slug?: string;
+  description?: string;
+}
+
+export interface EthToken {
+  name: string;
+  symbol?: string | null;
+  standard?: string | null;
+  contract?: string | null;
+  amount?: number | null;
+  value_usd?: number | null;
+  price_usd?: number | null;
+}
+
+export interface EthChainHolding {
+  chain: string;
+  chain_id?: string;
+  token_count?: number | null;
+  value_usd: number;
+  share_pct?: number | null;
+  share_below_pct?: boolean;
+  native_symbol?: string;
+  native_balance?: number;
+}
+
+export interface EthTransaction {
+  hash?: string | null;
+  method?: string | null;
+  block?: number | null;
+  time?: number | null;
+  datetime_utc?: string | null;
+  direction?: "IN" | "OUT" | "SELF" | string | null;
+  from?: EthParty;
+  to?: EthParty;
+  value_eth?: number | null;
+  value_usd?: number | null;
+  fee_eth?: number | null;
+  failed?: boolean;
+}
+
+export interface EthCounterparty {
+  address: string;
+  label?: string | null;
+  tx_count: number;
+}
+
+export interface EthereumContext {
+  address: string;
+  account_type?: "address" | "contract";
+  public_name_tag?: string;
+  ens_name?: string;
+  website?: string;
+  labels?: EthLabel[];
+  risk_labels?: string[];
+  warnings?: string[];
+  balance_eth?: number | null;
+  balance_usd?: number | null;
+  eth_price_usd?: number | null;
+  token_holdings_usd?: number | null;
+  token_holdings_is_lower_bound?: boolean;
+  token_count?: number | null;
+  token_list_size?: number;
+  tokens?: EthToken[];
+  multichain_portfolio_usd?: number | null;
+  multichain_address_count?: number | null;
+  net_worth_eth?: number | null;
+  active_chain_count?: number;
+  chains?: EthChainHolding[];
+  multichain_source?: "etherscan_page" | "etherscan_v2_native";
+  multichain_chains_checked?: number;
+  multichain_chains_unsupported?: string[];
+  funded_by?: EthParty & EthTxRef;
+  contract_creator?: EthParty & EthTxRef;
+  token_tracker?: string;
+  latest_tx_sent?: EthTxRef;
+  first_tx_sent?: EthTxRef;
+  transaction_count?: number | null;
+  transaction_count_is_lower_bound?: boolean;
+  pending_transactions?: number | null;
+  recent_transactions?: EthTransaction[];
+  unique_counterparties?: number;
+  tagged_counterparties?: EthCounterparty[];
+  risky_counterparties?: EthCounterparty[];
+  data_sources?: string[];
+  source_link?: string;
+}
+
 export interface EnrichmentExtra {
   bitcoin?: CryptoContext;
-  ethereum?: CryptoContext;
+  ethereum?: EthereumContext;
   asn?: AsnContext;
   mitre_attack?: MitreAttackContext;
   host_artifact?: HostArtifactContext;
@@ -1072,6 +1248,10 @@ export interface RecentIOC {
   score: number | null;
   confidence: string | null;
   created_at: string | null;
+  /** Optional authoritative final_assessment fields, when the backend provides them. */
+  final_verdict?: string | null;
+  final_score?: number | null;
+  assessment_domain?: string | null;
 }
 
 export async function getRecentIOCs(): Promise<RecentIOC[]> {

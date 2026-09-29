@@ -1,7 +1,6 @@
 import ipaddress
 import os
 import re
-import sys
 from pathlib import Path
 
 from dotenv import dotenv_values
@@ -14,35 +13,30 @@ from app.backend.thresholds import (
     OVERRIDE_MIN_MALICIOUS_WEIGHT,
 )
 
-_DEFAULT_ENV_FILE = Path(__file__).resolve().parent.parent.parent / ".env"
+PROJECT_ENV_FILE = Path(__file__).resolve().parent.parent.parent / ".env"
+
+
+def _default_env_file() -> str | None:
+    """The repo ``.env`` is the primary configuration source.
+
+    ``IOC_ENV_FILE`` points at a different file; an empty value disables file
+    loading entirely (the test suite uses this to stay off real credentials).
+    """
+    override = os.environ.get("IOC_ENV_FILE")
+    if override is not None:
+        return override.strip() or None
+    return str(PROJECT_ENV_FILE)
+
+
+_DEFAULT_ENV_FILE = _default_env_file()
 
 _ENV_VAR_NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 _REFERENCE_RE = re.compile(r"^\$(?:\{([A-Za-z_][A-Za-z0-9_]*)\}|([A-Za-z_][A-Za-z0-9_]*))$")
+_PLACEHOLDER_VALUES = frozenset({"null", "none", "placeholder", "undefined", "true", "false", "1", "0"})
 
-
-def _sync_windows_env():
-    """Sync fresh user environment variables from Windows Registry into os.environ.
-    Ensures newly added/updated API keys in Windows System Settings are picked up immediately.
-    """
-    if sys.platform != "win32":
-        return
-    try:
-        import winreg
-        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, r"Environment") as key:
-            i = 0
-            while True:
-                try:
-                    name, val, _ = winreg.EnumValue(key, i)
-                    if isinstance(val, str) and val.strip() and name not in os.environ:
-                        os.environ[name] = val.strip()
-                    i += 1
-                except OSError:
-                    break
-    except Exception:
-        pass
-
-
-_sync_windows_env()
+CREDENTIAL_ORIGIN_DOTENV = ".env"
+CREDENTIAL_ORIGIN_ENVIRONMENT = "environment"
+CREDENTIAL_ORIGIN_EXPLICIT = "explicit"
 
 
 def _dotenv_map(env_file) -> dict[str, str]:
@@ -57,43 +51,76 @@ def _dotenv_map(env_file) -> dict[str, str]:
     return dotenv_values(env_file, interpolate=False) or {}
 
 
-def resolve_credential(alias: str, *, env_file=None, environ: dict | None = None) -> str:
-    """Resolve an API key with the system environment first, then the .env file."""
+def _clean_credential(value: object) -> str:
+    text = str(value or "").strip()
+    return "" if text.lower() in _PLACEHOLDER_VALUES else text
+
+
+def resolve_credential_with_origin(
+    names, *, env_file=_DEFAULT_ENV_FILE, environ: dict | None = None,
+) -> tuple[str, str | None, str | None]:
+    """Resolve the first configured alias, ``.env`` before the process environment.
+
+    Every alias is tried against ``.env`` before any alias is tried against the
+    process environment, so a key in ``.env`` can never be shadowed by a stale
+    system variable under a different alias.  A ``.env`` value may be a literal,
+    ``${NAME}``/``$NAME``, or a bare variable name; references resolve through
+    ``.env`` first and then the process environment.
+
+    Returns ``(value, alias_name, origin)``; ``("", None, None)`` when unset.
+    """
     env = os.environ if environ is None else environ
     dotenv = _dotenv_map(env_file)
-    seen: set[str] = set()
+    if isinstance(names, str):
+        names = [names]
 
-    def _resolve(name: str) -> str:
+    def _from_dotenv(name: str, seen: set[str]) -> str:
         if name in seen:
             return ""
         seen.add(name)
-        system = (env.get(name) or "").strip()
-        if system.lower() in ("null", "none", "placeholder", "undefined", "true", "false", "1", "0"):
-            system = ""
-        if system:
-            return system
-        raw = (dotenv.get(name) or "").strip()
-        if raw.lower() in ("null", "none", "placeholder", "undefined", "true", "false", "1", "0"):
-            raw = ""
+        raw = _clean_credential(dotenv.get(name))
         if not raw:
             return ""
         m = _REFERENCE_RE.match(raw)
         if m:
-            return _resolve(m.group(1) or m.group(2))
-        if _ENV_VAR_NAME_RE.match(raw) and (raw in env or raw in dotenv):
-            return _resolve(raw)
-        return raw
+            target = m.group(1) or m.group(2)
+        elif _ENV_VAR_NAME_RE.match(raw) and (raw in env or raw in dotenv):
+            target = raw
+        else:
+            return raw
+        return _from_dotenv(target, seen) or _clean_credential(env.get(target))
 
-    return _resolve(alias)
+    for name in names:
+        value = _from_dotenv(name, set())
+        if value:
+            return value, name, CREDENTIAL_ORIGIN_DOTENV
+    for name in names:
+        value = _clean_credential(env.get(name))
+        if value:
+            return value, name, CREDENTIAL_ORIGIN_ENVIRONMENT
+    return "", None, None
+
+
+def resolve_credential(alias: str, *, env_file=_DEFAULT_ENV_FILE, environ: dict | None = None) -> str:
+    """Resolve one API key name: ``.env`` first, process environment as fallback."""
+    return resolve_credential_with_origin([alias], env_file=env_file, environ=environ)[0]
 
 
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(
-        env_file=str(Path(__file__).resolve().parent.parent.parent / ".env"),
+        env_file=_DEFAULT_ENV_FILE,
         env_file_encoding="utf-8",
         extra="ignore",
         populate_by_name=True,
     )
+
+    @classmethod
+    def settings_customise_sources(
+        cls, settings_cls, init_settings, env_settings, dotenv_settings, file_secret_settings,
+    ):
+        # .env is the primary configuration source; the process environment is
+        # only a fallback for values the file does not set.
+        return init_settings, dotenv_settings, env_settings, file_secret_settings
 
     database_url: str = Field(
         "sqlite+aiosqlite:///./data/ioc_platform.db",
@@ -124,6 +151,9 @@ class Settings(BaseSettings):
     censys_organization_id: str = Field("", alias="CENSYS_ORGANIZATION_ID")
     ipinfo_api_key: str = Field("", validation_alias=AliasChoices("IPINFO_API_KEY", "IPINFO_ACCESS_TOKEN"))
     etherscan_api_key: str = Field("", alias="ETHERSCAN_API_KEY")
+    # Scrape the public etherscan.io address page for labels, valuation,
+    # holdings, multichain portfolio and funding source (no key needed).
+    etherscan_page_enrichment: bool = Field(True, alias="ETHERSCAN_PAGE_ENRICHMENT")
     chainabuse_api_key: str = Field("", validation_alias=AliasChoices("CHAIN_BUSE_API", "CHAINABUSE_API_KEY", "CHAINABUSE_API"))
     filescan_api_key: str = Field("", alias="FILESCAN_API_KEY")
     hudson_api_key: str = Field("", validation_alias=AliasChoices("HUDSON_API_KEY", "HUDSON_ROCK_API_KEY", "HUDSONROCK_API_KEY"))
@@ -184,10 +214,16 @@ class Settings(BaseSettings):
     def __init__(self, **values):
         if "database_url" in values:
             values["DATABASE_URL"] = values.pop("database_url")
+        explicit = {name for name in values if not name.startswith("_")}
         super().__init__(**values)
-        self._active_env_file = values.get("_env_file", str(_DEFAULT_ENV_FILE))
-        self._resolve_api_keys()
+        self._active_env_file = values.get("_env_file", _DEFAULT_ENV_FILE)
+        self._credential_origins: dict[str, tuple[str | None, str | None]] = {}
+        self._resolve_api_keys(explicit)
         self._validate_required()
+
+    def credential_origin(self, field_name: str) -> tuple[str | None, str | None]:
+        """``(alias_name, origin)`` that supplied a credential field; never the value."""
+        return self._credential_origins.get(field_name, (None, None))
 
     def is_source_enabled(self, source_name: str) -> bool:
         allowed = {name.strip().lower() for name in self.enabled_sources.split(",") if name.strip()}
@@ -211,25 +247,22 @@ class Settings(BaseSettings):
             raise ValueError("HISTORY_RETENTION_DAYS must be >= 1")
         return value
 
-    def _resolve_api_keys(self):
+    def _resolve_api_keys(self, explicit: set[str]):
         for field_name, info in type(self).model_fields.items():
-            if not field_name.endswith("_api_key"):
+            if not (field_name.endswith("_api_key") or field_name in _EXTRA_CREDENTIAL_FIELDS):
                 continue
             alias = info.validation_alias
             if alias is None:
                 continue
             choices = list(alias.choices) if isinstance(alias, AliasChoices) else [str(alias)]
-            resolved = ""
-            for name in choices:
-                resolved = resolve_credential(name, env_file=self._active_env_file)
-                if resolved:
-                    break
-            if resolved:
-                setattr(self, field_name, resolved)
-            else:
-                curr = getattr(self, field_name, "")
-                if curr and curr.strip().lower() in ("null", "none", "placeholder"):
-                    setattr(self, field_name, "")
+            if field_name in explicit or explicit.intersection(choices):
+                value = _clean_credential(getattr(self, field_name, ""))
+                setattr(self, field_name, value)
+                self._credential_origins[field_name] = (None, CREDENTIAL_ORIGIN_EXPLICIT if value else None)
+                continue
+            resolved, name, origin = resolve_credential_with_origin(choices, env_file=self._active_env_file)
+            setattr(self, field_name, resolved)
+            self._credential_origins[field_name] = (name, origin)
 
     def _validate_required(self):
         if not self.database_url:
@@ -277,6 +310,8 @@ def _is_loopback_host(host: str) -> bool:
     except ValueError:
         return False
 
+
+_EXTRA_CREDENTIAL_FIELDS = frozenset({"censys_organization_id"})
 
 _API_KEY_FIELDS = (
     "virustotal_api_key",

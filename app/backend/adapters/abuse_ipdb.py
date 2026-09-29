@@ -1,8 +1,8 @@
-import asyncio
 import threading
 import time
 
-from app.backend.adapters.base import NormalizedResult, RateLimitConfig, SourceAdapter, is_valid_api_key, retry_after_seconds
+from app.backend.adapters._http import MalformedResponse, failure, http_failure, malformed, not_configured, read_json
+from app.backend.adapters.base import NormalizedResult, RateLimitConfig, SourceAdapter, is_valid_api_key
 
 from app.backend.config import settings
 from app.backend.logger import get_logger
@@ -25,6 +25,8 @@ ABUSEIPDB_CATEGORIES: dict[int, str] = {
 class AbuseIPDBAdapter(SourceAdapter):
     name = "AbuseIPDB"
     supported_types = ["ipv4", "ipv6"]
+    produces_reputation = True
+    # Free tier: 1,000 /check requests per day.
     rate_limit = RateLimitConfig(requests_per_minute=30, requests_per_day=1000)
 
     DAILY_LIMIT = 1000
@@ -33,11 +35,7 @@ class AbuseIPDBAdapter(SourceAdapter):
     _remaining = 0
     _reset_time = 0
 
-    _blacklist: dict[str, int] = {}
-    _blacklist_updated: float = 0
-    _blacklist_lock = asyncio.Lock()
     _daily_quota_lock = threading.Lock()
-    BLACKLIST_TTL = 86400  # 24h (free tier limit)
 
     def __init__(self):
         self.api_key = settings.abuseipdb_api_key
@@ -71,66 +69,22 @@ class AbuseIPDBAdapter(SourceAdapter):
             if reset:
                 self._reset_time = int(reset)
         except Exception as exc:
-            logger.debug("AbuseIPDB rate-limit header parse failed: %s", exc)
-
-    async def _refresh_blacklist(self):
-        if time.time() - self._blacklist_updated < self.BLACKLIST_TTL:
-            return
-        async with self._blacklist_lock:
-            if time.time() - self._blacklist_updated < self.BLACKLIST_TTL:
-                return
-            if not is_valid_api_key(self.api_key):
-                return
-            try:
-                client = self._get_client()
-                resp = await client.get(
-                    "https://api.abuseipdb.com/api/v2/blacklist",
-                    params={"confidenceMinimum": 90, "limit": 10000},
-                    headers={"Key": self.api_key, "Accept": "application/json"},
-                    timeout=30,
-                )
-                if resp.status_code == 200:
-                    items = resp.json().get("data", [])
-                    self._blacklist = {
-                        item["ipAddress"]: item.get("abuseConfidenceScore", 100)
-                        for item in items if isinstance(item, dict) and "ipAddress" in item
-                    }
-                    self._blacklist_updated = time.time()
-            except Exception as exc:
-                logger.warning("AbuseIPDB blacklist refresh failed: %s", exc)
+            logger.debug("AbuseIPDB rate-limit header parse failed: %r", exc)
 
     async def lookup(self, ioc_value: str, ioc_type: str) -> NormalizedResult:
         if not is_valid_api_key(self.api_key):
-            return NormalizedResult(
-                ioc=ioc_value, ioc_type=ioc_type, source=self.name,
-                verdict="unknown", tags=["no_api_key_configured"],
-            )
+            return not_configured(self.name, ioc_value, ioc_type)
 
         if not self._check_daily_quota():
-            return NormalizedResult(
-                ioc=ioc_value, ioc_type=ioc_type, source=self.name,
-                verdict="unknown", tags=["daily_quota_exhausted"],
+            return failure(
+                self.name, ioc_value, ioc_type, "unavailable", ["daily_quota_exhausted"],
+                f"AbuseIPDB daily quota ({self.DAILY_LIMIT} checks) used up locally", request_made=False,
             )
 
-        await self._refresh_blacklist()
-        bl_score = self._blacklist.get(ioc_value)
-        if bl_score is not None:
-            if not self._consume_daily_quota():
-                return NormalizedResult(
-                    ioc=ioc_value, ioc_type=ioc_type, source=self.name,
-                    verdict="unknown", tags=["daily_quota_exhausted"],
-                )
-            score = bl_score / 100.0
-            confidence = "high" if bl_score >= 95 else "medium"
-            return NormalizedResult(
-                ioc=ioc_value, ioc_type=ioc_type, source=self.name,
-                verdict="malicious", confidence=confidence,
-                raw_score=round(score, 4),
-                tags=["blacklist_hit", f"abuse_confidence:{bl_score}"],
-                source_link=f"https://www.abuseipdb.com/check/{ioc_value}",
-                reports_count=1,
-            )
-
+        # One /check request per lookup.  The former /blacklist prefetch
+        # (10k rows, separate 5/day quota) was retried on every lookup after
+        # a failure and delayed the first lookup by up to 30 s; /check already
+        # carries the abuse confidence score.
         client = self._get_client()
         resp = await client.get(
                 "https://api.abuseipdb.com/api/v2/check",
@@ -143,89 +97,62 @@ class AbuseIPDBAdapter(SourceAdapter):
                 timeout=15,
             )
 
-        if resp.status_code == 401:
-            return NormalizedResult(
-                ioc=ioc_value, ioc_type=ioc_type, source=self.name,
-                verdict="error", tags=["invalid_api_key"],
-            )
-        if resp.status_code == 429:
-            return NormalizedResult(
-                ioc=ioc_value, ioc_type=ioc_type, source=self.name,
-                verdict="unknown", tags=["rate_limited"], http_status=resp.status_code,
-                retry_after_seconds=retry_after_seconds(resp),
-            )
-        if resp.status_code != 200:
-            return NormalizedResult(
-                ioc=ioc_value, ioc_type=ioc_type, source=self.name,
-                verdict="error", tags=[f"http_{resp.status_code}"],
-            )
+        failed = http_failure(self.name, ioc_value, ioc_type, resp)
+        if failed is not None:
+            return failed
 
         self._update_rate_headers(resp)
-        if not self._consume_daily_quota():
-            return NormalizedResult(
-                ioc=ioc_value, ioc_type=ioc_type, source=self.name,
-                verdict="unknown", tags=["daily_quota_exhausted"],
-            )
+        self._consume_daily_quota()
+        try:
+            payload = read_json(resp)
+        except MalformedResponse as exc:
+            return malformed(self.name, ioc_value, ioc_type, exc.reason, resp.status_code)
+        data = payload.get("data") if isinstance(payload, dict) else None
+        if not isinstance(data, dict):
+            return malformed(self.name, ioc_value, ioc_type, http_status=resp.status_code)
 
-        data = resp.json().get("data", {})
-        score = data.get("abuseConfidenceScore", 0) / 100.0
+        abuse_score = data.get("abuseConfidenceScore", 0)
+        abuse_score = int(abuse_score) if isinstance(abuse_score, (int, float)) and not isinstance(abuse_score, bool) else 0
+        score = abuse_score / 100.0
         total_reports = data.get("totalReports", 0)
+        total_reports = int(total_reports) if isinstance(total_reports, (int, float)) and not isinstance(total_reports, bool) else 0
         last_reported = data.get("lastReportedAt")
+        whitelisted = bool(data.get("isWhitelisted"))
 
         if score >= 0.5:
             verdict = "malicious"
         elif score >= 0.25:
             verdict = "suspicious"
+        elif whitelisted:
+            verdict = "whitelisted"
+        elif total_reports == 0:
+            # No reports at all is absence of evidence, not a clean bill.
+            verdict = "undetected"
         else:
             verdict = "clean"
 
         confidence = "high" if total_reports > 10 else "medium" if total_reports > 0 else "low"
 
         tags = []
-        isp = data.get("isp", "")
-        country = data.get("countryCode", "")
-        domain = data.get("domain", "")
-        usage = data.get("usageType", "")
-        if isp:
-            tags.append(f"ISP: {isp}")
-        if country:
-            tags.append(f"Country: {country}")
-        if usage:
-            tags.append(f"Usage: {usage}")
-        if total_reports:
-            tags.append(f"total_reports: {total_reports}")
-        if last_reported:
-            tags.append(f"last_reported: {last_reported[:10]}")
-
-        if domain:
-            tags.append(f"domain: {domain}")
-
-        hostnames = data.get("hostnames", [])
-        for h in hostnames[:5]:
-            if h:
-                tags.append(f"hostname: {h}")
-
         if data.get("isTor", False):
             tags.append("tor_exit_node")
-
-        if data.get("isWhitelisted", False):
+        if whitelisted:
             tags.append("whitelisted")
-
-        if data.get("ipVersion", 4) == 6:
-            tags.append("ipv6")
-
-        categories = list(data.get("categories", {}).values()) if isinstance(data.get("categories"), dict) else []
 
         reports = data.get("reports", []) or []
         reports_out = []
-        for r in reports[:20]:
+        category_names: list[str] = []
+        for r in reports[:20] if isinstance(reports, list) else []:
             if isinstance(r, dict):
-                raw_cats = list(r.get("categories", []) or [])
-                cat_names = [ABUSEIPDB_CATEGORIES.get(c, f"Category {c}") for c in raw_cats if isinstance(c, int)]
+                raw_cats = [c for c in (r.get("categories", []) or []) if isinstance(c, int)]
+                cat_names = [ABUSEIPDB_CATEGORIES.get(c, f"Category {c}") for c in raw_cats]
+                for name in cat_names:
+                    if name not in category_names:
+                        category_names.append(name)
                 reports_out.append({
                     "categories": raw_cats,
                     "category_names": cat_names,
-                    "comment": r.get("comment", ""),
+                    "comment": str(r.get("comment") or "")[:300],
                     "reported_at": r.get("reportedAt", ""),
                     "reporter_country": r.get("reporterCountryCode", ""),
                 })
@@ -238,13 +165,31 @@ class AbuseIPDBAdapter(SourceAdapter):
             confidence=confidence,
             raw_score=round(score, 4),
             tags=tags,
-            categories=categories,
+            categories=category_names,
             first_seen=None,
             last_seen=self._parse_dt(last_reported) if last_reported else None,
             source_link=f"https://www.abuseipdb.com/check/{ioc_value}",
             reports_count=total_reports,
             reports=reports_out,
-            raw_data=data,
+            provider_summary=f"Abuse score {abuse_score}/100 from {total_reports} report{'s' if total_reports != 1 else ''}"
+            + (" (whitelisted)" if whitelisted else ""),
+            raw_data={
+                "abuse_confidence_score": abuse_score,
+                "total_reports": total_reports,
+                "num_distinct_users": data.get("numDistinctUsers"),
+                "last_reported_at": last_reported,
+                "is_whitelisted": whitelisted,
+                "is_tor": bool(data.get("isTor")),
+                "is_public": data.get("isPublic"),
+                "ip_version": data.get("ipVersion"),
+                "isp": data.get("isp"),
+                "usage_type": data.get("usageType"),
+                "domain": data.get("domain"),
+                "hostnames": list(data.get("hostnames") or [])[:5],
+                "country_code": data.get("countryCode"),
+                # Same shape as ``reports`` (the UI's AbuseReport type).
+                "reports": reports_out,
+            },
         )
 
     def _parse_dt(self, val: str):

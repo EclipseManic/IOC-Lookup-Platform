@@ -103,7 +103,8 @@ class BlockchainInfoAdapter(SourceAdapter):
             "transaction_count": address_payload.get("n_tx", len(transactions)),
         }
         tx_count = int(raw_data["transaction_count"] or 0)
-        tags = [f"balance_btc:{final_balance / 100_000_000:.8f}", f"transactions:{tx_count}"]
+        # Balance and transaction count are typed values (raw_data, reports_count).
+        tags = ["active_address"] if tx_count or final_balance or received else ["empty_address"]
         return NormalizedResult(
             ioc=ioc_value, ioc_type=ioc_type, source=self.name,
             verdict="unknown", status="found", tags=tags, reports_count=tx_count,

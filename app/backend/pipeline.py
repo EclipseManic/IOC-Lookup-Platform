@@ -6,6 +6,7 @@ import re
 import threading
 import time
 import uuid
+from contextlib import asynccontextmanager, nullcontext
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from typing import Optional
@@ -60,7 +61,7 @@ from app.backend.evidence import normalize_provider_result
 from app.backend.provider_capabilities import build_provider_plan
 from app.backend.enrichment import enrich, normalize_cve_enrichment
 from app.backend.executive_summary import generate_executive_summary
-from app.backend.logger import get_logger
+from app.backend.logger import describe_exception, get_logger
 from app.backend.scorer import aggregate_evidence, compute_composite
 
 logger = get_logger("pipeline")
@@ -113,6 +114,12 @@ ADAPTERS = _init_adapters()
 
 PIPELINE_TIMEOUT = 60.0
 ADAPTER_TIMEOUT = 20.0
+# Time a provider call needs after waiting for a rate-limit slot.  A lookup
+# only waits for a slot when at least this much of the IOC deadline (or the
+# provider budget, if smaller) remains afterwards.
+MIN_PROVIDER_CALL_WINDOW = 5.0
+
+
 @dataclass
 class StageInfo:
     name: str
@@ -229,17 +236,26 @@ def task_response_payload(task: AnalysisTask) -> dict:
 _tasks: dict[str, AnalysisTask] = {}
 _task_queues: dict[str, asyncio.Queue] = {}
 _running_tasks: dict[str, asyncio.Task] = {}
-_lock = asyncio.Lock()
 _dict_lock = threading.Lock()
-_cache_locks: dict[str, asyncio.Lock] = {}
+# provider cache key -> [lock, users]; entries are dropped when unused so the
+# map does not grow with every IOC ever looked up.
+_cache_locks: dict[str, list] = {}
 
 
-def _lock_for(key: str) -> asyncio.Lock:
-    lock = _cache_locks.get(key)
-    if lock is None:
-        lock = asyncio.Lock()
-        _cache_locks[key] = lock
-    return lock
+@asynccontextmanager
+async def _cache_key_lock(key: str):
+    entry = _cache_locks.get(key)
+    if entry is None:
+        entry = [asyncio.Lock(), 0]
+        _cache_locks[key] = entry
+    entry[1] += 1
+    try:
+        async with entry[0]:
+            yield
+    finally:
+        entry[1] -= 1
+        if entry[1] <= 0 and _cache_locks.get(key) is entry:
+            _cache_locks.pop(key, None)
 
 cache: CacheLayer | None = None
 rate_limiter: RateLimiter | None = None
@@ -289,6 +305,11 @@ _ENRICHMENT_TTL_BY_TYPE = {
 }
 _ENRICHMENT_TTL_DEFAULT = 1800
 
+# Bump when a type's enrichment payload shape changes, so the stale-snapshot
+# fallback below can never serve a pre-change payload. eth v2: Etherscan
+# address page (labels, holdings, multichain portfolio).
+_ENRICHMENT_SCHEMA_VERSION = {"eth": 2}
+
 
 def _enrichment_has_payload(enr: "EnrichmentData | None") -> bool:
     """True when enrichment carries usable data (structured payload or a typed
@@ -331,7 +352,8 @@ async def _run_enrichment_cached(
     fallback.  Returns ``(enrichment, error_message)`` where ``error_message`` is
     non-None only when the live call failed AND no cached snapshot could be
     served — the caller emits that as the Enrichment stage error event."""
-    enrich_key = f"enrich:{ioc_type}:{normalized.lower().strip()}"
+    version = _ENRICHMENT_SCHEMA_VERSION.get(ioc_type)
+    enrich_key = f"enrich:{ioc_type}:{f'v{version}:' if version else ''}{normalized.lower().strip()}"
     ttl = _ENRICHMENT_TTL_BY_TYPE.get(ioc_type, _ENRICHMENT_TTL_DEFAULT)
 
     # 1. Fresh cache hit — skip the network entirely (a live re-scan bypasses).
@@ -533,16 +555,67 @@ def _failure_result(ioc: str, ioc_type: str, source: str, state: str, tag: str, 
 
 
 def _retryable_result(result: NormalizedResult) -> bool:
+    """True for transient provider failures worth another attempt.
+
+    Timeouts are deliberately not retried: the attempt already used the
+    provider's whole time budget, and a second attempt would hold the lookup
+    for another full budget.  An upstream rate limit (the provider answered
+    429) is retried through the shared scheduler, which first honors the
+    provider's Retry-After and gives up when that does not fit the deadline.
+    """
     state = result.execution_state
-    if state in {"rate_limited", "timeout"}:
+    if state == "rate_limited":
+        return bool(result.request_made)
+    if state != "error":
+        return False
+    tags = {str(tag).lower() for tag in (result.tags or [])}
+    if any(tag in {"request_error", "connection_error"} or tag.startswith("http_5") for tag in tags):
+        return True
+    return bool(result.http_status and 500 <= int(result.http_status) < 600)
+
+
+_OUTAGE_TAGS = {"request_error", "connection_error", "feed_unavailable", "timeout"}
+
+
+def _is_provider_outage(result: NormalizedResult) -> bool:
+    """Whether a result should count toward the provider's circuit breaker.
+
+    Only provider-side failures of a request we actually sent count:
+    transport errors, 5xx responses and provider timeouts.  Our own throttling
+    (rate-limit waits, concurrency queueing, deadline aborts), upstream 429s
+    (handled by the shared scheduler's back-off), missing/invalid keys and
+    adapter parsing bugs must not open the circuit, because an open circuit
+    turns every other lookup's result for that provider into "circuit_open".
+    """
+    if not result.request_made:
+        return False
+    state = result.execution_state
+    if state == "timeout":
         return True
     if state != "error":
         return False
     tags = {str(tag).lower() for tag in (result.tags or [])}
-    return any(
-        tag == "request_error" or tag.startswith("http_5")
-        for tag in tags
-    )
+    if tags & _OUTAGE_TAGS or any(tag.startswith("http_5") for tag in tags):
+        return True
+    return bool(result.http_status and int(result.http_status) >= 500)
+
+
+def _provider_budget(adapter) -> float:
+    """Wall-clock budget for one whole provider lookup call.
+
+    ``PROVIDER_TIMEOUT_SECONDS`` (default 20s).  ``RateLimitConfig.timeout_seconds``
+    is the adapter's per-HTTP-request timeout, enforced by the adapter's own
+    client call; several adapters make more than one request per lookup, so it
+    is not used as the budget for the whole call (a 10s cap made multi-request
+    adapters such as OTX and Hudson Rock time out even when every request
+    succeeded).  The caller additionally bounds the budget by the remaining
+    IOC deadline.
+    """
+    configured = getattr(settings, "provider_timeout_seconds", ADAPTER_TIMEOUT)
+    try:
+        return max(0.1, float(configured or ADAPTER_TIMEOUT))
+    except (TypeError, ValueError):
+        return ADAPTER_TIMEOUT
 
 
 def _retry_delay(result: NormalizedResult, retry_number: int, adapter) -> float:
@@ -579,6 +652,8 @@ def _finalize_assessment(task: AnalysisTask, assessment: IOCAssessment) -> IOCAs
             if observation.execution_state not in {"success", "not_found"}
         ])
     assessment.evidence_summary["providers_aggregated"] = len(assessment.provider_breakdown)
+    # Applicability lives in the provider plan; task.results no longer carries
+    # one synthetic not_applicable row per unsupported provider.
     assessment.evidence_summary["not_applicable_providers"] = len([
         item for item in task_plan if not item.get("applicable", True)
     ])
@@ -593,6 +668,402 @@ def _finalize_assessment(task: AnalysisTask, assessment: IOCAssessment) -> IOCAs
     return assessment
 
 
+def _is_cacheable_result(result: NormalizedResult) -> bool:
+    """Only real intelligence (success / not_found) is cached.
+
+    A rate limit, timeout, error or health failure is never cached: it is not
+    IOC intelligence and would poison later lookups.
+    """
+    return not (
+        result.execution_state not in {"success", "not_found"}
+        or bool(getattr(result, "error", None))
+        or any(t in (result.tags or []) for t in ("error", "rate_limited", "timeout", "circuit_breaker", "failed", "service_unavailable"))
+    )
+
+
+async def _call_provider(task: AnalysisTask, adapter, ioc_value: str, ioc_type: str, deadline: float) -> NormalizedResult:
+    """Run one provider lookup under the shared scheduler and the IOC deadline.
+
+    1. Reserve a request slot from the process-wide provider scheduler (per
+       minute / per day quota, minimum interval, provider Retry-After).  The
+       lookup waits for the slot when the wait still leaves time for the call
+       before the IOC deadline; otherwise it reports ``rate_limited`` with the
+       required wait as ``retry_after_seconds``.
+    2. Take one of the provider's concurrency slots (held only for the call).
+    3. Call the adapter, bounded by the provider budget and the deadline.
+    4. Retry transient failures (transport errors, 5xx, upstream 429) within
+       ``max_retries`` and the deadline.  Timeouts are not retried.
+
+    Always returns a result; only cancellation propagates.
+    """
+    stage_name = adapter.name
+    started = time.monotonic()
+    rate = adapter.rate_limit
+    budget = _provider_budget(adapter)
+    call_window = min(budget, MIN_PROVIDER_CALL_WINDOW)
+    max_retries = max(0, int(getattr(rate, "max_retries", 2)))
+    attempts = 0
+    queue_wait = 0.0
+    final_result: NormalizedResult | None = None
+    limiter = rate_limiter
+
+    while True:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0.05:
+            break
+        max_wait = max(0.0, remaining - call_window)
+
+        # 1. Shared rate-limit slot.
+        if limiter is not None and hasattr(limiter, "reserve_provider"):
+            reservation = limiter.reserve_provider(
+                adapter.name,
+                getattr(rate, "requests_per_minute", 30),
+                getattr(rate, "requests_per_day", 0),
+                minimum_interval=float(getattr(rate, "minimum_interval_seconds", 0.0) or 0.0),
+                max_wait=max_wait,
+            )
+            if reservation.granted and reservation.wait_seconds >= 1.0:
+                message = f"Waiting {reservation.wait_seconds:.0f}s for a {adapter.name} rate-limit slot"
+                await _update_stage(task, stage_name, "running", message)
+                await _emit_stage_event(task, stage_name, "running", message)
+            reservation = await limiter.wait_for_reservation(adapter.name, reservation, max_wait=max_wait)
+            queue_wait += reservation.wait_seconds
+            if not reservation.granted:
+                if final_result is not None and final_result.request_made:
+                    # Keep the provider's own answer (e.g. its 429) as the
+                    # observation; the retry simply did not fit the deadline.
+                    break
+                final_result = _failure_result(
+                    ioc_value, ioc_type, adapter.name, "rate_limited", reservation.reason or "rate_limited",
+                    retry_count=attempts, retry_after=reservation.retry_after_seconds,
+                    request_made=False, started=started,
+                )
+                final_result.provider_summary = (
+                    f"Not queried: the next {adapter.name} request slot is "
+                    f"{reservation.retry_after_seconds or 0:.0f}s away, beyond this lookup's deadline"
+                )
+                logger.info(
+                    "Provider %s throttled for %s: next slot in %.1fs exceeds remaining %.1fs (%s)",
+                    adapter.name, ioc_type, reservation.retry_after_seconds or 0.0, max_wait,
+                    reservation.reason or "rate_limited",
+                )
+                break
+
+        # 2. Concurrency slot + 3. provider call.
+        if limiter is not None and hasattr(limiter, "provider_slot"):
+            slot_cm = limiter.provider_slot(
+                adapter.name,
+                getattr(rate, "concurrency_limit", 2),
+                timeout=max(0.1, deadline - time.monotonic() - call_window),
+            )
+        else:
+            slot_cm = nullcontext()
+        slot_acquired = False
+        queue_started = time.monotonic()
+        provider_timeout = budget
+        call_started = queue_started
+        try:
+            async with slot_cm:
+                slot_acquired = True
+                queue_wait += time.monotonic() - queue_started
+                await _update_stage(task, stage_name, "running", f"Querying {adapter.name}")
+                provider_timeout = max(0.1, min(budget, deadline - time.monotonic()))
+                call_started = time.monotonic()
+                result = await asyncio.wait_for(
+                    adapter.lookup(ioc_value, ioc_type),
+                    timeout=provider_timeout,
+                )
+            if isinstance(result, Exception):
+                raise result
+            if not isinstance(result, NormalizedResult):
+                result = NormalizedResult.model_validate(result)
+            result = normalize_provider_result(result, task.assessment_domain)
+            result.network_latency_ms = round((time.monotonic() - call_started) * 1000.0, 2)
+            result = _result_metadata(result, started=started, retry_count=attempts)
+        except asyncio.TimeoutError:
+            if not slot_acquired:
+                final_result = _failure_result(
+                    ioc_value, ioc_type, adapter.name, "unavailable", "queue_wait_timeout",
+                    retry_count=attempts, request_made=False, started=started,
+                )
+                final_result.provider_summary = "Not queried: no free concurrency slot before the deadline"
+            else:
+                final_result = _failure_result(
+                    ioc_value, ioc_type, adapter.name, "timeout", "timeout",
+                    retry_count=attempts, request_made=True, started=started,
+                )
+                final_result.provider_summary = f"No response within {provider_timeout:.0f}s"
+                logger.warning(
+                    "Provider %s timed out after %.1fs for %s (attempt %s)",
+                    adapter.name, provider_timeout, ioc_type, attempts + 1,
+                )
+            break
+        except httpx.TimeoutException as exc:
+            final_result = _failure_result(
+                ioc_value, ioc_type, adapter.name, "timeout", "timeout",
+                retry_count=attempts, request_made=True, started=started,
+            )
+            final_result.provider_summary = f"Request timed out ({type(exc).__name__})"
+            logger.warning(
+                "Provider %s request timed out for %s (attempt %s): %s",
+                adapter.name, ioc_type, attempts + 1, describe_exception(exc),
+            )
+            break
+        except (httpx.RequestError, ConnectionError, OSError) as exc:
+            logger.warning(
+                "Provider %s request failed for %s (attempt %s): %s",
+                adapter.name, ioc_type, attempts + 1, describe_exception(exc),
+            )
+            result = _failure_result(
+                ioc_value, ioc_type, adapter.name, "error", "request_error",
+                retry_count=attempts, request_made=True, started=started,
+            )
+            result.provider_summary = f"Request failed ({type(exc).__name__})"
+        except Exception as exc:
+            logger.warning(
+                "Provider %s raised %s for %s",
+                adapter.name, describe_exception(exc), ioc_type, exc_info=True,
+            )
+            final_result = _failure_result(
+                ioc_value, ioc_type, adapter.name, "error", "adapter_exception",
+                retry_count=attempts, request_made=True, started=started,
+            )
+            final_result.tags.append(f"exception_type:{exc.__class__.__name__}")
+            final_result.provider_summary = f"Adapter error ({type(exc).__name__})"
+            break
+
+        final_result = result
+        if result.execution_state == "rate_limited" and result.request_made:
+            # The provider itself refused: share its back-off with every other
+            # lookup so they wait instead of burning more requests into 429s.
+            penalty = result.retry_after_seconds
+            if penalty is None:
+                per_minute = max(1, int(getattr(rate, "requests_per_minute", 30) or 30))
+                penalty = max(1.0, _rate_window_seconds() / per_minute)
+            if limiter is not None and hasattr(limiter, "penalize_provider"):
+                limiter.penalize_provider(adapter.name, penalty)
+        if not _retryable_result(result) or attempts >= max_retries:
+            break
+        if result.execution_state != "rate_limited":
+            delay = _retry_delay(result, attempts + 1, adapter)
+            if time.monotonic() + delay + call_window >= deadline:
+                break
+            attempts += 1
+            logger.info(
+                "Retrying provider %s for %s in %.1fs (attempt %s/%s)",
+                adapter.name, ioc_type, delay, attempts, max_retries,
+            )
+            await asyncio.sleep(delay)
+        else:
+            attempts += 1
+        # For an upstream 429 the next reservation waits for the provider's
+        # back-off, or reports that it does not fit the deadline.
+
+    if final_result is None:
+        final_result = _failure_result(
+            ioc_value, ioc_type, adapter.name,
+            "aborted_due_to_ioc_deadline", "aborted_due_to_ioc_deadline",
+            retry_count=attempts, request_made=False, started=started,
+        )
+    final_result.retry_count = max(int(final_result.retry_count or 0), attempts)
+    final_result.queue_wait_ms = round(queue_wait * 1000.0, 2)
+    final_result.assessment_domain = task.assessment_domain
+    return normalize_provider_result(final_result, task.assessment_domain)
+
+
+def _rate_window_seconds() -> float:
+    from app.backend import rate_limiter as rate_limiter_module
+
+    return float(getattr(rate_limiter_module, "PROVIDER_WINDOW_SECONDS", 60.0))
+
+
+def _mark_cached(result: NormalizedResult, ck: str, *, stale: bool) -> NormalizedResult:
+    """Describe a cached provider answer as served by *this* lookup."""
+    if "cached" not in result.tags:
+        result.tags = list(result.tags or []) + ["cached"]
+    result.cached = True
+    status = "stale" if stale else "cached"
+    freshness = "historical" if stale else "cached"
+    result.cache_status = status
+    if not stale:
+        # These fields describe this lookup, not the original request that
+        # populated the cache.
+        result.request_made = False
+        result.latency_ms = 0.0
+        result.network_latency_ms = 0.0
+        result.queue_wait_ms = 0.0
+    result.retrieved_at = datetime.now(timezone.utc)
+    cache_reference = result.cache_created_at or result.observed_at
+    if cache_reference is not None:
+        if cache_reference.tzinfo is None:
+            cache_reference = cache_reference.replace(tzinfo=timezone.utc)
+        result.cache_age = max(0.0, (result.retrieved_at - cache_reference).total_seconds())
+    result.freshness_class = freshness
+    result.stale = stale
+    result.cache_metadata.cached = True
+    result.cache_metadata.cache_key = ck
+    result.cache_metadata.cache_age = result.cache_age
+    result.cache_metadata.retrieved_at = result.retrieved_at
+    result.cache_metadata.freshness_class = freshness
+    result.cache_metadata.stale = stale
+    result.cache_metadata.status = status
+    return result
+
+
+def _stamp_cache_metadata(result: NormalizedResult, ck: str, ttl: int) -> None:
+    cache_now = datetime.now(timezone.utc)
+    result.cache_key = ck
+    result.cache_created_at = cache_now
+    result.retrieved_at = cache_now
+    result.expires_at = cache_now + timedelta(seconds=ttl)
+    result.source_timestamp = result.source_timestamp or result.last_seen or result.first_seen
+    result.cache_status = "fresh"
+    result.freshness_class = "fresh"
+    result.stale = False
+    result.cache_metadata.cached = False
+    result.cache_metadata.cache_key = ck
+    result.cache_metadata.cache_created_at = cache_now
+    result.cache_metadata.retrieved_at = cache_now
+    result.cache_metadata.observed_at = result.observed_at
+    result.cache_metadata.expires_at = result.expires_at
+    result.cache_metadata.source_timestamp = result.source_timestamp
+
+
+def _private_ip_assessment(task: AnalysisTask, normalized: str, ioc_type: str) -> None:
+    """Score a private/reserved address without any external lookup."""
+    private_result = NormalizedResult(
+        ioc=normalized, ioc_type=ioc_type, source="reserved_ip",
+        verdict="unknown", execution_state="unavailable",
+        request_made=False, tags=["private_ip", "no_external_lookup"],
+    )
+    task.results = [private_result]
+    task.enrichment = EnrichmentData(
+        completeness={"external_reputation": "skipped"},
+        analysis_notes=["Private, reserved, or unspecified address; no external reputation lookup was performed."],
+    )
+    task.final_assessment = aggregate_evidence(
+        normalized, ioc_type, task.results, task.enrichment, provider_plan=task.provider_plan
+    )
+    task.final_assessment = _finalize_assessment(task, task.final_assessment)
+    task.provider_health = task.final_assessment.provider_health
+    task.final_assessment.reason = "This is a private, reserved, or unspecified address; external reputation was not queried."
+    task.composite = compute_composite(
+        task.results,
+        ioc=normalized,
+        ioc_type=ioc_type,
+        enrichment=task.enrichment,
+        assessment=task.final_assessment,
+    )
+    for stage in task.stages:
+        if stage.status in {"pending", "running"}:
+            stage.status = "skipped"
+            stage.message = stage.message or "Not needed for a private address"
+            stage.progress = 1.0
+
+
+def _is_private_address(normalized: str, ioc_type: str) -> bool:
+    if ioc_type not in ("ipv4", "ipv6"):
+        return False
+    try:
+        addr = ipaddress.ip_address(normalized)
+    except ValueError:
+        return False
+    return not addr.is_global or addr.is_reserved or addr.is_unspecified
+
+
+def _build_relationships(task: AnalysisTask, normalized: str, enrichment: EnrichmentData | None) -> list[dict]:
+    relationships = []
+    relationship_keys: set[str] = set()
+    for r in task.results:
+        for rel_ioc, rel_type in r.related_iocs:
+            rel_ioc_clean = str(rel_ioc).strip()
+            if not rel_ioc_clean or rel_ioc_clean.lower() in {"other", "unknown", "none", "n/a", "null"}:
+                continue
+            fingerprint = f"{normalized}|{rel_ioc_clean.lower()}|{rel_type.lower()}"
+            if fingerprint in relationship_keys:
+                continue
+            relationship_keys.add(fingerprint)
+            relationships.append({
+                "source_ioc": normalized,
+                "target_ioc": rel_ioc_clean,
+                "relationship": rel_type,
+                "via_source": r.source,
+                "confidence": "medium",
+                "evidence_type": "reference" if rel_type == "reference" else "observed_relationship",
+                "observed_at": (r.observed_at or r.source_timestamp).isoformat() if (r.observed_at or r.source_timestamp) else None,
+                "provenance": r.provenance_family or r.source,
+                "relationship_fingerprint": fingerprint,
+                "evidence_hash": r.evidence_hash,
+            })
+
+    enrichment_rels = enrichment.relationships if enrichment and enrichment.relationships else []
+    for relationship in enrichment_rels:
+        fingerprint = relationship.get("relationship_fingerprint") or f"{relationship.get('source_ioc', normalized)}|{relationship.get('target_ioc', '')}|{relationship.get('relationship', '')}".lower()
+        if fingerprint not in relationship_keys:
+            relationship_keys.add(fingerprint)
+            relationship["relationship_fingerprint"] = fingerprint
+            relationships.append(relationship)
+    return relationships
+
+
+async def _persist_completed_task(task: AnalysisTask) -> None:
+    """Write a completed lookup to SQLite before it is reported as done.
+
+    Persisting first means history (/api/recent, /api/lookup/stored) and the
+    UI's follow-up /api/save always see exactly the result the live task
+    returned, instead of racing it.
+    """
+    try:
+        from app.backend.database import persist_lookup, persisted_verdict_fields
+
+        # DV-1: persist the authoritative final_assessment verdict/score, not
+        # the reputation-only composite.
+        score, verdict, confidence = persisted_verdict_fields(task)
+        await persist_lookup(
+            value=task.normalized,
+            ioc_type=task.ioc_type or "unknown",
+            task_id=task.task_id,
+            composite_score=score,
+            composite_verdict=verdict,
+            composite_confidence=confidence,
+            full_response=json.dumps(task_response_payload(task), default=str),
+            source_count=len(task.results),
+        )
+    except asyncio.CancelledError:
+        raise
+    except Exception as exc:
+        logger.warning("Failed to persist task %s to SQLite: %s", task.task_id, describe_exception(exc))
+
+
+async def _publish_terminal_state(task: AnalysisTask, status: str) -> None:
+    """Make a finished task visible (memory, task cache, SSE) exactly once."""
+    tid = task.task_id
+    # In-memory state first (no await), so pollers see the terminal state
+    # even if the cache write below is interrupted.
+    task.status = status
+    task.progress = 100.0
+    for stage in task.stages:
+        if stage.status == "running":
+            stage.status = "skipped" if status != "done" else "done"
+            stage.progress = 1.0
+    with _dict_lock:
+        _tasks[tid] = task
+    if cache is not None:
+        try:
+            await cache.save_task(tid, task.to_dict(), TASK_TTL)
+            if status == "done" and task.ioc_type:
+                await cache.set(
+                    cache_key("save", task.ioc_type, task.normalized),
+                    {"task_id": tid},
+                    TASK_TTL,
+                )
+        except Exception as exc:
+            logger.warning("Failed to cache task %s: %s", tid, describe_exception(exc))
+    if status in {"error", "cancelled"} and task.error:
+        await _emit_error_event(task, "Pipeline", task.error)
+    await _emit_done_event(task)
+
+
 async def run_analysis(
     ioc_value: str,
     task_id: Optional[str] = None,
@@ -605,13 +1076,8 @@ async def run_analysis(
     tid = task_id or uuid.uuid4().hex[:12]
     configured_deadline = ioc_deadline if ioc_deadline is not None else getattr(settings, "ioc_deadline_seconds", PIPELINE_TIMEOUT)
     deadline = time.monotonic() + max(0.1, float(configured_deadline))
-    # Stages start minimal; the provider stages are derived dynamically from the
-    # actual provider plan once the IOC is classified (see _rebuild_stages_from_plan
-    # below). This replaces the old fixed 24-entry list, which both (a) omitted
-    # newer adapters (Etherscan, ChainAbuse, Blockchain.info, FileScan, Hudson
-    # Rock, HIBP, cve.org) so their work was invisible, and (b) rendered a wall of
-    # irrelevant "skipped" rows for every provider that does not apply to the
-    # indicator type (e.g. all the malware feeds on a crypto-wallet lookup).
+    # Stages start minimal; the provider stages are derived dynamically from
+    # the provider plan once the IOC is classified (_rebuild_stages_from_plan).
     stages = [
         StageInfo("Classify & Normalize"),
         StageInfo("Enrichment"),
@@ -637,14 +1103,23 @@ async def run_analysis(
         status="pending",
         password_prehashed=password_prehashed,
     )
+    previous = get_task(tid)
+    if previous is not None:
+        # Keep the submission time of a task registered while it was queued.
+        task.created_at = previous.created_at
 
     with _dict_lock:
         _tasks[tid] = task
-    async with _lock:
-        if cache is not None:
+    if cache is not None:
+        try:
             await cache.save_task(tid, task.to_dict(), TASK_TTL)
+        except Exception as exc:
+            logger.debug("Initial task cache write failed for %s: %s", tid, describe_exception(exc))
 
     _register_running(tid)
+    final_status = "error"
+    runners: list[asyncio.Task] = []
+    cancelled: asyncio.CancelledError | None = None
     try:
         task.status = "classifying"
         task.progress = 2.0
@@ -662,727 +1137,411 @@ async def run_analysis(
         task.ioc_type = ioc_type
         task.normalized = normalized
         task.assessment_domain = route_assessment_domain(ioc_type, normalized).domain
-        # Build the provider plan once and reuse it for the serialized plan, the
-        # dynamic stage list, and the execution filter below.
+        # Build the provider plan once and reuse it for the serialized plan,
+        # the dynamic stage list, and the execution filter below.
         plan = build_provider_plan(ADAPTERS, ioc_type, normalized)
         task.provider_plan = [item.as_dict() for item in plan]
-        # Derive stage rows from the applicable providers so the UI shows exactly
-        # the work that will run (crypto/HIBP/cve.org included) with no wall of
-        # irrelevant "skipped" rows.
         _rebuild_stages_from_plan(task, plan, ioc_type)
 
         await _update_stage(task, "Classify & Normalize", "done", f"Classified as {ioc_type}", 1.0)
         await _emit_stage_event(task, "Classify & Normalize", "done", f"Classified as {ioc_type}", 1.0)
 
-        if ioc_type in ("ipv4", "ipv6"):
-            try:
-                addr = ipaddress.ip_address(normalized)
-                if not addr.is_global or addr.is_reserved or addr.is_unspecified:
-                    private_result = NormalizedResult(
-                        ioc=normalized, ioc_type=ioc_type, source="reserved_ip",
-                        verdict="unknown", execution_state="unavailable",
-                        request_made=False, tags=["private_ip", "no_external_lookup"],
-                    )
-                    task.results = [private_result]
-                    task.enrichment = EnrichmentData(
-                        completeness={"external_reputation": "skipped"},
-                        analysis_notes=["Private, reserved, or unspecified address; no external reputation lookup was performed."],
-                    )
-                    task.final_assessment = aggregate_evidence(
-                        normalized, ioc_type, task.results, task.enrichment,
-                    )
-                    task.final_assessment = _finalize_assessment(task, task.final_assessment)
-                    task.provider_health = task.final_assessment.provider_health
-                    task.final_assessment.reason = "This is a private, reserved, or unspecified address; external reputation was not queried."
-                    task.composite = compute_composite(
-                        task.results,
-                        ioc=normalized,
-                        ioc_type=ioc_type,
-                        enrichment=task.enrichment,
-                        assessment=task.final_assessment,
-                    )
-                    task.status = "done"
-                    task.progress = 100.0
-                    _unregister_running(tid)
-                    return task
-
-            except ValueError:
-                pass
-
-        from app.backend.adapters.base import is_valid_api_key
-
-        # ``plan`` was already built above and drives task.provider_plan and the
-        # dynamic stage list; reuse it here for the execution filter.
-        applicable_names = {item.provider for item in plan if item.applicable}
-        matching = [a for a in ADAPTERS if a.name in applicable_names]
-
-        # Keep explicit unavailable records for relevant providers.  A source
-        # that is disabled, unconfigured, or quota-blocked must be visible in
-        # the audit trail instead of silently disappearing from coverage.
-        unavailable_results: list[NormalizedResult] = [
-            NormalizedResult(
-                ioc=normalized, ioc_type=ioc_type, source=item.provider,
-                verdict="unknown", provider_verdict="not_applicable", normalized_verdict="unknown",
-                execution_state="not_applicable", status="not_applicable", assessment_domain=task.assessment_domain,
-                request_made=False, tags=["unsupported_provider_type"],
-            )
-            for item in plan if not item.applicable
-        ]
-        key_filtered = []
-        for a in matching:
-            if not settings.is_source_enabled(a.name):
-                unavailable_results.append(_failure_result(
-                    normalized, ioc_type, a.name, "unavailable", "disabled_by_policy",
-                    request_made=False,
-                ))
-                for s in task.stages:
-                    if s.name == a.name:
-                        s.status = "skipped"
-                        s.message = "Disabled by source policy"
-                        s.progress = 1.0
-                continue
-            key = getattr(a, 'api_key', None)
-            if (
-                key is not None
-                and not is_valid_api_key(key)
-                and not getattr(a, "public_without_key", False)
-            ):
-                unavailable_results.append(_failure_result(
-                    normalized, ioc_type, a.name, "unavailable", "no_api_key_configured",
-                    request_made=False,
-                ))
-                for s in task.stages:
-                    if s.name == a.name:
-                        s.status = "skipped"
-                        s.message = "No API key"
-                        s.progress = 1.0
-            else:
-                key_filtered.append(a)
-        matching = key_filtered
-
-        for s in task.stages:
-            if s.name == "CVE Intelligence":
-                continue
-            if s.name not in ("Classify & Normalize", "Enrichment", "Scoring & Relations"):
-                adapter_match = any(a.name == s.name for a in matching)
-                if not adapter_match:
-                    s.status = "skipped"
-                    s.progress = 1.0
-
-        task.status = "querying"
-        coros = [(a, normalized, ioc_type) for a in matching]
-
-        result_map: dict[str, NormalizedResult] = {r.source: r for r in unavailable_results}
-        pipeline_timed_out = False
-
-        async def run_adapter(adapter, ioc_value, ioc_type):
-            stage_name = adapter.name
-            ck = cache_key(adapter.name, ioc_type, ioc_value)
-            async def _execute():
-                await _update_stage(task, stage_name, "running", f"Querying {adapter.name}")
-                started = time.monotonic()
-
-                if not adapter._check_circuit():
-                    nr = _failure_result(
-                        normalized, ioc_type, adapter.name, "unavailable", "circuit_open",
-                        request_made=False, started=started,
-                    )
-                    result_map[adapter.name] = nr
-                    await _update_stage(task, stage_name, "skipped", "Provider unavailable (circuit open)", 1.0)
-                    await _emit_stage_event(task, stage_name, "skipped", "Provider unavailable (circuit open)", 1.0)
-                    await _emit_result_event(task, nr)
-                    return
-
-                attempts = 0
-                max_retries = max(0, int(getattr(adapter.rate_limit, "max_retries", 2)))
-                final_result: NormalizedResult | None = None
-                while True:
-                    slot_acquired = False
-                    queue_started = time.monotonic()
-                    try:
-                        if rate_limiter is not None:
-                            slot_cm = rate_limiter.provider_slot(
-                                adapter.name,
-                                getattr(adapter.rate_limit, "concurrency_limit", 2),
-                                timeout=float(getattr(settings, "queue_wait_timeout_seconds", 10.0)),
-                            )
-                        else:
-                            from contextlib import nullcontext
-                            slot_cm = nullcontext()
-                        # The slot is held only for the actual provider call;
-                        # waiting/backoff never blocks unrelated providers.
-                        with_slot = hasattr(slot_cm, "__aenter__")
-                        if with_slot:
-                            async with slot_cm:
-                                slot_acquired = True
-                                queue_wait_ms = (time.monotonic() - queue_started) * 1000.0
-                                if rate_limiter is not None and hasattr(rate_limiter, "wait_for_interval"):
-                                    queue_wait_ms += await rate_limiter.wait_for_interval(
-                                        adapter.name,
-                                        float(getattr(adapter.rate_limit, "minimum_interval_seconds", 0.0)),
-                                        timeout=float(getattr(settings, "queue_wait_timeout_seconds", 10.0)),
-                                    )
-                                if rate_limiter is not None:
-                                    if hasattr(rate_limiter, "acquire_provider"):
-                                        decision = await rate_limiter.acquire_provider(
-                                            adapter.name,
-                                            adapter.rate_limit.requests_per_minute,
-                                            adapter.rate_limit.requests_per_day,
-                                            timeout=0.0,
-                                        )
-                                    else:
-                                        allowed = await rate_limiter.acquire(
-                                            adapter.name, adapter.rate_limit.requests_per_minute, 60,
-                                        )
-                                        from app.backend.rate_limiter import RateLimitDecision
-                                        decision = RateLimitDecision(allowed, reason="rate_limited" if not allowed else "")
-                                    if not decision.allowed:
-                                        # ── Adaptive rate-limit waiting ─────
-                                        # Instead of immediately failing, wait
-                                        # for the rate-limit window to expire
-                                        # and then retry the provider call.
-                                        wait_secs = decision.retry_after_seconds or float(
-                                            getattr(adapter.rate_limit, "minimum_interval_seconds", 15.0)
-                                        )
-                                        max_wait = float(getattr(adapter.rate_limit, "max_backoff_seconds", 60.0))
-                                        wait_secs = min(wait_secs, max_wait)
-                                        if time.monotonic() + wait_secs < deadline:
-                                            limit_tag = decision.reason or "rate_limited"
-                                            if attempts >= max_retries:
-                                                final_result = _failure_result(
-                                                    normalized, ioc_type, adapter.name, "rate_limited", limit_tag,
-                                                    retry_count=attempts,
-                                                    retry_after=decision.retry_after_seconds,
-                                                    request_made=False,
-                                                    started=started,
-                                                )
-                                                break
-                                            logger.info(
-                                                "Rate-limited on %s for %s — waiting %.1fs (attempt %s/%s)",
-                                                adapter.name, normalized, wait_secs, attempts + 1, max_retries,
-                                            )
-                                            await _update_stage(
-                                                task, stage_name, "running",
-                                                f"Rate-limited — waiting {wait_secs:.0f}s…",
-                                            )
-                                            await _emit_stage_event(
-                                                task, stage_name, "running",
-                                                f"Rate-limited — waiting {wait_secs:.0f}s…",
-                                            )
-                                            await asyncio.sleep(wait_secs)
-                                            attempts += 1
-                                            continue  # retry the while loop
-                                        # Deadline would be exceeded — give up.
-                                        limit_tag = decision.reason or "rate_limited"
-                                        final_result = _failure_result(
-                                            normalized, ioc_type, adapter.name, "rate_limited", limit_tag,
-                                            retry_count=attempts,
-                                            retry_after=decision.retry_after_seconds,
-                                            request_made=False,
-                                            started=started,
-                                        )
-                                        break
-                                remaining = max(0.1, deadline - time.monotonic())
-                                provider_timeout = min(
-                                    remaining,
-                                    float(getattr(settings, "provider_timeout_seconds", ADAPTER_TIMEOUT)),
-                                    float(getattr(adapter.rate_limit, "timeout_seconds", ADAPTER_TIMEOUT)),
-                                )
-                                result = await asyncio.wait_for(
-                                    adapter.lookup(ioc_value, ioc_type),
-                                    timeout=provider_timeout,
-                                )
-                        else:
-                            queue_wait_ms = 0.0
-                            remaining = max(0.1, deadline - time.monotonic())
-                            result = await asyncio.wait_for(
-                                adapter.lookup(ioc_value, ioc_type),
-                                timeout=min(float(getattr(settings, "provider_timeout_seconds", ADAPTER_TIMEOUT)), remaining),
-                            )
-                        if isinstance(result, Exception):
-                            raise result
-                        if not isinstance(result, NormalizedResult):
-                            result = NormalizedResult.model_validate(result)
-                        result = normalize_provider_result(result, task.assessment_domain)
-                        result.queue_wait_ms = round(queue_wait_ms, 2)
-                        result.network_latency_ms = result.latency_ms
-                        result = _result_metadata(result, started=started, retry_count=attempts)
-                        final_result = result
-                        if _retryable_result(result) and attempts < max_retries:
-                            # Do not retry before a server-provided
-                            # Retry-After deadline.  If that deadline exceeds
-                            # this provider's retry budget, return the
-                            # rate-limited observation instead.
-                            retry_after = result.retry_after_seconds
-                            max_backoff = float(getattr(adapter.rate_limit, "max_backoff_seconds", 8.0))
-                            if retry_after is not None and retry_after > max_backoff:
-                                break
-                            attempts += 1
-                            delay = _retry_delay(result, attempts, adapter)
-                            if time.monotonic() + delay >= deadline:
-                                break
-                            logger.info("Retrying provider %s for %s (attempt %s/%s)", adapter.name, normalized, attempts, max_retries)
-                            await asyncio.sleep(delay)
-                            continue
-                        break
-                    except asyncio.TimeoutError:
-                        timeout_state = "timeout" if slot_acquired else "unavailable"
-                        timeout_tag = "timeout" if slot_acquired else "queue_wait_timeout"
-                        final_result = _failure_result(
-                            normalized, ioc_type, adapter.name, timeout_state, timeout_tag,
-                            retry_count=attempts, request_made=slot_acquired, started=started,
-                        )
-                        if slot_acquired and attempts < max_retries:
-                            attempts += 1
-                            delay = _retry_delay(final_result, attempts, adapter)
-                            if time.monotonic() + delay < deadline:
-                                await asyncio.sleep(delay)
-                                continue
-                        break
-                    except httpx.TimeoutException:
-                        final_result = _failure_result(
-                            normalized, ioc_type, adapter.name, "timeout", "timeout",
-                            retry_count=attempts, request_made=True, started=started,
-                        )
-                        if attempts < max_retries:
-                            attempts += 1
-                            delay = _retry_delay(final_result, attempts, adapter)
-                            if time.monotonic() + delay < deadline:
-                                await asyncio.sleep(delay)
-                                continue
-                        break
-                    except (httpx.RequestError, ConnectionError, OSError):
-                        final_result = _failure_result(
-                            normalized, ioc_type, adapter.name, "error", "request_error",
-                            retry_count=attempts, request_made=True, started=started,
-                        )
-                        if attempts < max_retries:
-                            attempts += 1
-                            delay = _retry_delay(final_result, attempts, adapter)
-                            if time.monotonic() + delay < deadline:
-                                await asyncio.sleep(delay)
-                                continue
-                        break
-                    except Exception as ex:
-                        error_kind = ex.__class__.__name__
-                        final_result = _failure_result(
-                            normalized, ioc_type, adapter.name, "error", "adapter_exception",
-                            retry_count=attempts, request_made=True, started=started,
-                        )
-                        final_result.tags.append(f"exception_type:{error_kind}")
-                        break
-
-                result = final_result or _failure_result(
-                    normalized, ioc_type, adapter.name, "error", "provider_error",
-                    retry_count=attempts, request_made=False, started=started,
-                )
-                result.assessment_domain = task.assessment_domain
-                result.queue_wait_ms = round(locals().get("queue_wait_ms", 0.0), 2)
-                result = normalize_provider_result(result, task.assessment_domain)
-                result_map[adapter.name] = result
-                if result.execution_state in {"error", "timeout", "rate_limited", "unavailable"}:
-                    adapter._record_failure()
-                else:
-                    adapter._record_success()
-                logger.info(
-                    "Provider lookup source=%s state=%s latency_ms=%s retries=%s cache_hit=%s http_status=%s",
-                    adapter.name, result.execution_state, result.latency_ms, result.retry_count,
-                    result.cached, result.http_status,
-                )
-                # Cache successful answers, including not_found answers.  A
-                # health failure or rate-limit or error is NEVER cached because it
-                # is not valid IOC intelligence and would poison future scans.
-                _is_error_result = (
-                    result.execution_state not in {"success", "not_found"}
-                    or bool(getattr(result, "error", None))
-                    or any(t in (result.tags or []) for t in ("error", "rate_limited", "timeout", "circuit_breaker", "failed", "service_unavailable"))
-                )
-                if cache is not None and not _is_error_result:
-                    ttl = int(getattr(adapter.rate_limit, "cache_ttl_seconds", None) or cache_ttl(adapter.name, ioc_type))
-                    cache_now = datetime.now(timezone.utc)
-                    result.cache_key = ck
-                    result.cache_created_at = cache_now
-                    result.retrieved_at = cache_now
-                    result.expires_at = cache_now + timedelta(seconds=ttl)
-                    result.source_timestamp = result.source_timestamp or result.last_seen or result.first_seen
-                    result.cache_status = "fresh"
-                    result.freshness_class = "fresh"
-                    result.stale = False
-                    result.cache_metadata.cached = False
-                    result.cache_metadata.cache_key = ck
-                    result.cache_metadata.cache_created_at = cache_now
-                    result.cache_metadata.retrieved_at = cache_now
-                    result.cache_metadata.observed_at = result.observed_at
-                    result.cache_metadata.expires_at = result.expires_at
-                    result.cache_metadata.source_timestamp = result.source_timestamp
-                    await cache.set(ck, result.model_dump(mode="json"), ttl)
-                stage_status = "done" if result.execution_state in {"success", "not_found"} else "error"
-                stage_message = (
-                    f"{adapter.name} done"
-                    if stage_status == "done"
-                    else f"{result.execution_state.replace('_', ' ').capitalize()}"
-                )
-                await _update_stage(task, stage_name, stage_status, stage_message, 1.0)
-                await _emit_stage_event(task, stage_name, stage_status, stage_message, 1.0)
-                await _emit_result_event(task, result)
-                if stage_status == "error":
-                    await _emit_error_event(task, stage_name, stage_message)
-
-                completed = sum(1 for s in task.stages if s.status in ("done", "error", "skipped"))
-                total_stages = len(task.stages)
-                task.progress = 5.0 + (completed / total_stages) * 55.0 if total_stages > 0 else 60.0
-
-            if cache is not None and not bypass_cache:
-                async with _lock_for(ck):
-                    cache_entry = await cache.get_entry(ck) if hasattr(cache, "get_entry") else None
-                    cached_stale = False
-                    if cache_entry is not None:
-                        cached, cached_stale = cache_entry
-                    else:
-                        cached = await cache.get(ck)
-                    if cached is not None:
-                        result = NormalizedResult(**cached)
-                        # Older cache entries may have been written before
-                        # execution states were explicit. Never reuse an error,
-                        # rate-limit, or health failure. Purge it from cache
-                        # and run a fresh live scan instead.
-                        cached_is_error = (
-                            result.execution_state not in {"success", "not_found"}
-                            or bool(getattr(result, "error", None))
-                            or any(t in (result.tags or []) for t in ("error", "rate_limited", "timeout", "circuit_breaker", "failed", "service_unavailable"))
-                        )
-                        if cached_is_error:
-                            await cache.delete(ck)
-                            cached = None
-                        elif not cached_stale:
-                            if "cached" not in result.tags:
-                                result.tags = list(result.tags or []) + ["cached"]
-                            result.cached = True
-                            result.cache_status = "cached"
-                            # These fields describe this lookup, not the
-                            # original request that populated the cache.
-                            result.request_made = False
-                            result.latency_ms = 0.0
-                            result.network_latency_ms = 0.0
-                            result.queue_wait_ms = 0.0
-                            result.retrieved_at = datetime.now(timezone.utc)
-                            cache_reference = result.cache_created_at or result.retrieved_at or result.observed_at
-                            if cache_reference is not None:
-                                if cache_reference.tzinfo is None:
-                                    cache_reference = cache_reference.replace(tzinfo=timezone.utc)
-                                result.cache_age = max(0.0, (result.retrieved_at - cache_reference).total_seconds())
-                            result.freshness_class = "cached"
-                            result.stale = False
-                            result.cache_metadata.cached = True
-                            result.cache_metadata.cache_key = ck
-                            result.cache_metadata.cache_age = result.cache_age
-                            result.cache_metadata.retrieved_at = result.retrieved_at
-                            result.cache_metadata.freshness_class = "cached"
-                            result.cache_metadata.stale = False
-                            result.cache_metadata.status = "cached"
-                            result_map[adapter.name] = result
-                            await _update_stage(task, stage_name, "done", f"{adapter.name} (cached)", 1.0)
-                            await _emit_stage_event(task, stage_name, "done", f"{adapter.name} (cached)", 1.0)
-                            await _emit_result_event(task, result)
-                            return
-                    await _execute()
-                    if cached is not None and cached_stale:
-                        live_res = result_map.get(adapter.name)
-                        if live_res and live_res.execution_state in {"error", "timeout", "rate_limited"}:
-                            stale_res = NormalizedResult(**cached)
-                            if "cached" not in stale_res.tags:
-                                stale_res.tags = list(stale_res.tags or []) + ["cached"]
-                            stale_res.cached = True
-                            stale_res.cache_status = "stale"
-                            stale_res.freshness_class = "historical"
-                            stale_res.stale = True
-                            stale_res.retrieved_at = datetime.now(timezone.utc)
-                            cache_reference = stale_res.cache_created_at or stale_res.observed_at
-                            if cache_reference is not None:
-                                if cache_reference.tzinfo is None:
-                                    cache_reference = cache_reference.replace(tzinfo=timezone.utc)
-                                stale_res.cache_age = max(0.0, (stale_res.retrieved_at - cache_reference).total_seconds())
-                            stale_res.cache_metadata.cached = True
-                            stale_res.cache_metadata.cache_key = ck
-                            stale_res.cache_metadata.cache_age = stale_res.cache_age
-                            stale_res.cache_metadata.retrieved_at = stale_res.retrieved_at
-                            stale_res.cache_metadata.freshness_class = "historical"
-                            stale_res.cache_metadata.stale = True
-                            stale_res.cache_metadata.status = "stale"
-                            result_map[adapter.name] = stale_res
-            else:
-                await _execute()
-
-        runners = [
-            asyncio.create_task(run_adapter(adapter, value, indicator_type))
-            for adapter, value, indicator_type in coros
-        ]
-        # A provider timeout is isolated inside run_adapter.  Only tasks that
-        # are still pending when the IOC deadline expires are aborted; completed
-        # observations are never relabeled as orchestration failures.
-        if runners:
-            done, pending = await asyncio.wait(runners, timeout=max(0.1, deadline - time.monotonic()))
-            await asyncio.gather(*done, return_exceptions=True)
-            if pending:
-                pipeline_timed_out = True
-                for runner in pending:
-                    runner.cancel()
-                await asyncio.gather(*pending, return_exceptions=True)
-                for adapter in matching:
-                    if adapter.name not in result_map:
-                        result_map[adapter.name] = _failure_result(
-                            normalized, ioc_type, adapter.name,
-                            "aborted_due_to_ioc_deadline", "aborted_due_to_ioc_deadline",
-                            request_made=False,
-                        )
-                for s in task.stages:
-                    if s.status == "running":
-                        s.status = "skipped"
-                        s.message = "Aborted due to IOC deadline"
-                        s.progress = 1.0
-
-        if pipeline_timed_out:
-            task.results = [result_map[a.name] for a in matching if a.name in result_map]
-            task.results.extend(unavailable_results)
-            task.enrichment = EnrichmentData(
-                completeness={"pipeline": "partial"},
-                analysis_notes=["Pipeline timeout: the assessment uses only provider results completed before the deadline."],
-            )
-            task.final_assessment = aggregate_evidence(normalized, ioc_type, task.results, task.enrichment)
-            task.final_assessment = _finalize_assessment(task, task.final_assessment)
-            task.final_assessment.reason = "Partial provider results were available before the IOC deadline; pending providers were aborted without changing completed observations."
-            task.composite = compute_composite(
-                task.results, ioc=normalized, ioc_type=ioc_type,
-                enrichment=task.enrichment, assessment=task.final_assessment,
-            )
-            task.provider_health = task.final_assessment.provider_health
-            task.status = "done"
-            task.error = "Pipeline timeout exceeded; partial result"
-            task.progress = 100.0
-            logger.warning("Pipeline timed out for %s", normalized)
-            await _emit_error_event(task, "Pipeline", "Pipeline timeout exceeded")
-            await _update_stage(task, "Scoring & Relations", "done", "Partial result scored", 1.0)
-            await _emit_done_event(task)
-        else:
-            task.results = [result_map[a.name] for a in matching if a.name in result_map]
-            task.results.extend(unavailable_results)
-
-            task.status = "enriching"
-            task.progress = 65.0
-            await _update_stage(task, "Enrichment", "running", f"Running type-specific enrichment for {ioc_type}")
-
-            enrichment = EnrichmentData()
-            remaining = max(1.0, deadline - time.monotonic())
-            enrichment, enrichment_error = await _run_enrichment_cached(
-                normalized, ioc_type, remaining, bypass_cache
-            )
-            if enrichment_error:
-                await _emit_error_event(task, "Enrichment", enrichment_error)
-            task.enrichment = enrichment
-            if not matching:
-                enrichment.analysis_notes.append(
-                    f"No reputation adapter currently supports {ioc_type}; public structural or contextual enrichment was still collected."
-                )
-            elif not task.results:
-                enrichment.analysis_notes.append(
-                    "Supporting sources were selected, but none returned a usable result."
-                )
-
-            # --- Propagate Structured Intelligence from Adapter Results ---
-            _merge_provider_intel_into_enrichment(task)
-
-            await _update_stage(task, "Enrichment", "done", "Enrichment complete", 1.0)
-            await _emit_stage_event(task, "Enrichment", "done", "Enrichment complete", 1.0)
-
-            if ioc_type == "cve" and enrichment and enrichment.cve:
-                await _update_stage(task, "CVE Intelligence", "running", "Normalizing CVE enrichment data")
-                try:
-                    cve_result = normalize_cve_enrichment(enrichment.cve, normalized)
-                    task.results.append(cve_result)
-                    await _update_stage(task, "CVE Intelligence", "done", "CVE analysis complete", 1.0)
-                except Exception as exc:
-                    await _update_stage(task, "CVE Intelligence", "error", str(exc)[:80], 1.0)
-            else:
-                await _update_stage(task, "CVE Intelligence", "skipped", "Not a CVE IOC", 1.0)
-
+        if _is_private_address(normalized, ioc_type):
             task.status = "scoring"
-            task.progress = 85.0
-            await _update_stage(task, "Scoring & Relations", "running", "Computing composite score")
+            _private_ip_assessment(task, normalized, ioc_type)
+            final_status = "done"
+        else:
+            await _run_lookup(task, plan, normalized, ioc_type, deadline, bypass_cache, fp_override, runners)
+            final_status = "done"
 
-            if fp_override:
-                task.results.insert(
-                    0,
-                    NormalizedResult(
-                        ioc=normalized, ioc_type=task.ioc_type or "unknown",
-                        source="User Feedback",
-                        verdict="clean", raw_score=0.0, confidence="high",
-                        tags=["user_marked_fp"],
-                    ),
-                )
-
-            final_assessment = aggregate_evidence(
-                normalized,
-                task.ioc_type or "unknown",
-                task.results,
-                enrichment,
-            )
-            final_assessment = _finalize_assessment(task, final_assessment)
-            if fp_override:
-                final_assessment.final_verdict = "benign"
-                final_assessment.confidence = "high"
-                final_assessment.normalized_score = 0.0
-                final_assessment.reason = "The IOC was explicitly marked false positive by an analyst."
-                final_assessment.analyst_review_recommended = False
-                final_assessment.needs_review = False
-            composite = compute_composite(
-                task.results,
-                ioc=normalized,
-                ioc_type=task.ioc_type or "unknown",
-                enrichment=enrichment,
-                assessment=final_assessment,
-            )
-            logger.info(
-                "IOC assessment ioc=%s verdict=%s score=%s evidence_strength=%s coverage=%s needs_review=%s",
-                normalized, final_assessment.final_verdict, final_assessment.normalized_score,
-                final_assessment.evidence_strength, final_assessment.coverage,
-                final_assessment.needs_review,
-            )
-            for observation in final_assessment.provider_breakdown:
-                logger.info(
-                    "Evidence contribution source=%s state=%s provider_verdict=%s normalized_verdict=%s contribution=%s weight=%s signal=%s",
-                    observation.source, observation.execution_state, observation.provider_verdict,
-                    observation.normalized_verdict, observation.contribution,
-                    observation.weight, observation.normalized_signal,
-                )
-
-            relationships = []
-            relationship_keys: set[str] = set()
-            for r in task.results:
-                for rel_ioc, rel_type in r.related_iocs:
-                    rel_ioc_clean = str(rel_ioc).strip()
-                    if not rel_ioc_clean or rel_ioc_clean.lower() in {"other", "unknown", "none", "n/a", "null"}:
-                        continue
-                    fingerprint = f"{normalized}|{rel_ioc_clean.lower()}|{rel_type.lower()}"
-                    if fingerprint in relationship_keys:
-                        continue
-                    relationship_keys.add(fingerprint)
-                    relationships.append({
-                        "source_ioc": normalized,
-                        "target_ioc": rel_ioc_clean,
-                        "relationship": rel_type,
-                        "via_source": r.source,
-                        "confidence": "medium",
-                        "evidence_type": "reference" if rel_type == "reference" else "observed_relationship",
-                        "observed_at": (r.observed_at or r.source_timestamp).isoformat() if (r.observed_at or r.source_timestamp) else None,
-                        "provenance": r.provenance_family or r.source,
-                        "relationship_fingerprint": fingerprint,
-                        "evidence_hash": r.evidence_hash,
-                    })
-
-            enrichment_rels = enrichment.relationships if enrichment and enrichment.relationships else []
-            for relationship in enrichment_rels:
-                fingerprint = relationship.get("relationship_fingerprint") or f"{relationship.get('source_ioc', normalized)}|{relationship.get('target_ioc', '')}|{relationship.get('relationship', '')}".lower()
-                if fingerprint not in relationship_keys:
-                    relationship_keys.add(fingerprint)
-                    relationship["relationship_fingerprint"] = fingerprint
-                    relationships.append(relationship)
-
-            task.composite = composite
-            task.final_assessment = final_assessment
-            task.final_assessment.relationships = relationships
-            task.provider_health = final_assessment.provider_health
-            task.relationships = relationships
-            await _update_stage(task, "Scoring & Relations", "done", "Analysis complete", 1.0)
-
-            task.executive_summary = generate_executive_summary(
-                LookupResponse(
-                    input=task.ioc_value,
-                    normalized=task.normalized,
-                    ioc_type=task.ioc_type or "unknown",
-                    composite=composite,
-                    final_assessment=final_assessment,
-                    provider_health=task.provider_health,
-                    enrichment=task.enrichment or EnrichmentData(),
-                    results=task.results,
-                    relationships=relationships,
-                )
-            )
-
-            task.status = "done"
-            task.progress = 100.0
-            await _emit_done_event(task)
-
-    except asyncio.CancelledError:
-        task.status = "cancelled"
+    except asyncio.CancelledError as exc:
+        cancelled = exc
+        final_status = "cancelled"
         task.error = "Analysis cancelled"
-        task.progress = 100.0
         logger.info("Analysis %s cancelled", tid)
-        await _emit_done_event(task)
     except Exception as e:
-        task.status = "error"
-        task.error = str(e)
-        task.progress = 100.0
+        final_status = "error"
+        # Input validation errors are shown to the analyst as-is; anything
+        # else carries its exception type so an empty message is never shown.
+        task.error = str(e) if isinstance(e, ValueError) and str(e) else describe_exception(e, limit=200)
+        logger.warning(
+            "Analysis %s failed for %s: %s", tid, task.ioc_type or ioc_type, task.error,
+            exc_info=not isinstance(e, ValueError),
+        )
+    finally:
+        # Never leave provider or enrichment work running behind a finished,
+        # failed, or cancelled task.
+        leftovers = [r for r in runners if not r.done()]
+        for runner in leftovers:
+            runner.cancel()
+        if leftovers:
+            await asyncio.gather(*leftovers, return_exceptions=True)
 
-    with _dict_lock:
-        _tasks[tid] = task
-    async with _lock:
-        if cache is not None:
-            await cache.save_task(tid, task.to_dict(), TASK_TTL)
-            if task.status == "done" and task.ioc_type:
-                await cache.set(
-                    cache_key("save", task.ioc_type, task.normalized),
-                    {"task_id": tid},
-                    TASK_TTL,
+    try:
+        if final_status == "done" and task.normalized:
+            task.progress = max(task.progress, 95.0)
+            try:
+                await _persist_completed_task(task)
+            except asyncio.CancelledError as exc:
+                # The analysis itself is complete; publish it before honoring
+                # the cancellation so the task never stays non-terminal.
+                cancelled = cancelled or exc
+        await _publish_terminal_state(task, final_status)
+        if final_status == "done" and task.normalized:
+            try:
+                from app.backend.webhooks import queue_lookup_dispatch
+
+                assessment = task.final_assessment
+                verdict = (
+                    assessment.final_verdict
+                    if assessment is not None
+                    else getattr(task.composite, "verdict", "unknown")
                 )
+                score = getattr(task.composite, "score", 0.0) if task.composite else 0.0
+                await queue_lookup_dispatch(tid, task.normalized, verdict, score)
+            except Exception as exc:
+                logger.debug("Webhook completion dispatch skipped for task %s: %s", tid, describe_exception(exc))
+    finally:
+        _unregister_running(tid)
 
-    if task.status == "done" and task.normalized:
-        try:
-            from app.backend.database import async_session, persisted_verdict_fields, upsert_lookup_result
-            from app.backend.models import IOC
-            from sqlalchemy import select
-            async with async_session() as session:
-                val = task.normalized
-                ioc_type = task.ioc_type or "unknown"
-                existing = await session.execute(select(IOC).where(IOC.value == val))
-                ioc_obj = existing.scalar_one_or_none()
-                if not ioc_obj:
-                    ioc_obj = IOC(value=val, ioc_type=ioc_type)
-                    session.add(ioc_obj)
-                    await session.flush()
-                # DV-1: persist the authoritative final_assessment verdict/score,
-                # not the reputation-only composite (which is unknown/0 for
-                # breach/CVE/ASN/artifact domains).
-                score, verdict, confidence = persisted_verdict_fields(task)
-                await upsert_lookup_result(
-                    session,
-                    ioc_id=ioc_obj.id,
-                    task_id=tid,
-                    composite_score=score,
-                    composite_verdict=verdict,
-                    composite_confidence=confidence,
-                    full_response=json.dumps(task_response_payload(task), default=str),
-                    source_count=len(task.results),
-                )
-        except Exception as exc:
-            logger.debug("Failed to auto-persist task %s to SQLite: %s", tid, exc)
-
-    if task.status == "done" and task.normalized:
-        try:
-            from app.backend.webhooks import queue_lookup_dispatch
-
-            assessment = task.final_assessment
-            verdict = (
-                assessment.final_verdict
-                if assessment is not None
-                else getattr(task.composite, "verdict", "unknown")
-            )
-            score = getattr(task.composite, "score", 0.0) if task.composite else 0.0
-            await queue_lookup_dispatch(tid, task.normalized, verdict, score)
-        except Exception as exc:
-            logger.debug("Webhook completion dispatch skipped for task %s: %s", tid, exc)
-
-    _unregister_running(tid)
+    if cancelled is not None:
+        raise cancelled
     return task
+
+
+async def _run_lookup(
+    task: AnalysisTask,
+    plan: list,
+    normalized: str,
+    ioc_type: str,
+    deadline: float,
+    bypass_cache: bool,
+    fp_override: bool,
+    runners: list[asyncio.Task],
+) -> None:
+    """Provider fan-out + enrichment + scoring for one classified IOC."""
+    from app.backend.adapters.base import is_valid_api_key
+
+    applicable_names = {item.provider for item in plan if item.applicable}
+    matching = [a for a in ADAPTERS if a.name in applicable_names]
+
+    # Keep explicit unavailable records for relevant providers.  A source that
+    # is disabled, unconfigured, or quota-blocked must be visible in the audit
+    # trail instead of silently disappearing from coverage.  Providers that do
+    # not apply to this IOC type are recorded only in task.provider_plan.
+    unavailable_results: list[NormalizedResult] = []
+    key_filtered = []
+    for a in matching:
+        if not settings.is_source_enabled(a.name):
+            unavailable_results.append(_failure_result(
+                normalized, ioc_type, a.name, "unavailable", "disabled_by_policy",
+                request_made=False,
+            ))
+            await _update_stage(task, a.name, "skipped", "Disabled by source policy", 1.0)
+            continue
+        key = getattr(a, 'api_key', None)
+        if (
+            key is not None
+            and not is_valid_api_key(key)
+            and not getattr(a, "public_without_key", False)
+        ):
+            unavailable_results.append(_failure_result(
+                normalized, ioc_type, a.name, "unavailable", "no_api_key_configured",
+                request_made=False,
+            ))
+            await _update_stage(task, a.name, "skipped", "No API key", 1.0)
+        else:
+            key_filtered.append(a)
+    matching = key_filtered
+
+    for s in task.stages:
+        if s.name in ("Classify & Normalize", "Enrichment", "Scoring & Relations", "CVE Intelligence"):
+            continue
+        if not any(a.name == s.name for a in matching) and s.status == "pending":
+            s.status = "skipped"
+            s.progress = 1.0
+
+    task.status = "querying"
+    result_map: dict[str, NormalizedResult] = {r.source: r for r in unavailable_results}
+
+    # Enrichment does not depend on provider results, so it runs alongside the
+    # provider fan-out instead of after it; both are bounded by the deadline.
+    enrichment_runner = asyncio.create_task(
+        _run_enrichment_cached(normalized, ioc_type, max(1.0, deadline - time.monotonic()), bypass_cache)
+    )
+    runners.append(enrichment_runner)
+    await _update_stage(task, "Enrichment", "running", f"Running type-specific enrichment for {ioc_type}")
+    await _emit_stage_event(task, "Enrichment", "running", f"Running type-specific enrichment for {ioc_type}")
+
+    async def finish_provider(adapter, result: NormalizedResult, *, cached: bool = False) -> None:
+        result_map[adapter.name] = result
+        if cached:
+            await _update_stage(task, adapter.name, "done", f"{adapter.name} (cached)", 1.0)
+            await _emit_stage_event(task, adapter.name, "done", f"{adapter.name} (cached)", 1.0)
+            await _emit_result_event(task, result)
+        else:
+            stage_status = "done" if result.execution_state in {"success", "not_found"} else "error"
+            stage_message = (
+                f"{adapter.name} done"
+                if stage_status == "done"
+                else result.execution_state.replace("_", " ").capitalize()
+            )
+            if result.execution_state == "unavailable" and "circuit_open" in (result.tags or []):
+                stage_status = "skipped"
+                stage_message = "Provider unavailable (circuit open)"
+            await _update_stage(task, adapter.name, stage_status, stage_message, 1.0)
+            await _emit_stage_event(task, adapter.name, stage_status, stage_message, 1.0)
+            await _emit_result_event(task, result)
+            if stage_status == "error":
+                await _emit_error_event(task, adapter.name, stage_message)
+        completed = sum(1 for s in task.stages if s.status in ("done", "error", "skipped"))
+        total_stages = len(task.stages)
+        task.progress = 5.0 + (completed / total_stages) * 55.0 if total_stages > 0 else 60.0
+
+    async def run_live(adapter, ck: str) -> NormalizedResult:
+        await _update_stage(task, adapter.name, "running", f"Querying {adapter.name}")
+        started = time.monotonic()
+        if not adapter._check_circuit():
+            result = _failure_result(
+                normalized, ioc_type, adapter.name, "unavailable", "circuit_open",
+                request_made=False, started=started,
+            )
+            result.provider_summary = "Skipped: the provider failed repeatedly and is paused briefly"
+            result.assessment_domain = task.assessment_domain
+            return normalize_provider_result(result, task.assessment_domain)
+
+        result = await _call_provider(task, adapter, normalized, ioc_type, deadline)
+        if _is_provider_outage(result):
+            adapter._record_failure()
+        elif result.execution_state in {"success", "not_found"}:
+            adapter._record_success()
+        logger.info(
+            "Provider lookup source=%s state=%s latency_ms=%s queue_wait_ms=%s retries=%s http_status=%s",
+            adapter.name, result.execution_state, result.latency_ms, result.queue_wait_ms,
+            result.retry_count, result.http_status,
+        )
+        if cache is not None and _is_cacheable_result(result):
+            ttl = int(getattr(adapter.rate_limit, "cache_ttl_seconds", None) or cache_ttl(adapter.name, ioc_type))
+            _stamp_cache_metadata(result, ck, ttl)
+            try:
+                await cache.set(ck, result.model_dump(mode="json"), ttl)
+            except Exception as exc:
+                logger.debug("Provider cache write failed for %s: %s", ck, describe_exception(exc))
+        return result
+
+    async def run_adapter(adapter) -> None:
+        ck = cache_key(adapter.name, ioc_type, normalized)
+        if cache is None or bypass_cache:
+            await finish_provider(adapter, await run_live(adapter, ck))
+            return
+        # One live request per provider+IOC at a time: a concurrent lookup of
+        # the same IOC waits here and then reuses the fresh cache entry.
+        async with _cache_key_lock(ck):
+            cached = None
+            cached_stale = False
+            try:
+                cache_entry = await cache.get_entry(ck) if hasattr(cache, "get_entry") else None
+                if cache_entry is not None:
+                    cached, cached_stale = cache_entry
+                else:
+                    cached = await cache.get(ck)
+            except Exception as exc:
+                logger.debug("Provider cache read failed for %s: %s", ck, describe_exception(exc))
+                cached = None
+            cached_result = None
+            if cached is not None:
+                try:
+                    cached_result = NormalizedResult(**cached)
+                except Exception:
+                    cached_result = None
+                # Older cache entries may predate explicit execution states.
+                # Never reuse an error, rate-limit, or health failure.
+                if cached_result is None or not _is_cacheable_result(cached_result):
+                    await cache.delete(ck)
+                    cached_result = None
+            if cached_result is not None and not cached_stale:
+                await finish_provider(adapter, _mark_cached(cached_result, ck, stale=False), cached=True)
+                return
+            live = await run_live(adapter, ck)
+            if cached_result is not None and live.execution_state in {"error", "timeout", "rate_limited", "unavailable"}:
+                # The live request failed: show the expired answer, clearly
+                # labeled as historical, instead of nothing.
+                await finish_provider(adapter, _mark_cached(cached_result, ck, stale=True))
+                return
+            await finish_provider(adapter, live)
+
+    provider_runners = [asyncio.create_task(run_adapter(adapter)) for adapter in matching]
+    runners.extend(provider_runners)
+    pipeline_timed_out = False
+    # A provider timeout is isolated inside _call_provider.  Only runners still
+    # pending at the IOC deadline are aborted; completed observations are kept.
+    if provider_runners:
+        done, pending = await asyncio.wait(provider_runners, timeout=max(0.1, deadline - time.monotonic()))
+        for runner in done:
+            if runner.cancelled():
+                continue
+            exc = runner.exception()
+            if exc is not None:
+                logger.error("Provider orchestration failed: %s", describe_exception(exc), exc_info=exc)
+        if pending:
+            pipeline_timed_out = True
+            for runner in pending:
+                runner.cancel()
+            await asyncio.gather(*pending, return_exceptions=True)
+        for adapter in matching:
+            if adapter.name in result_map:
+                continue
+            if pipeline_timed_out:
+                result = _failure_result(
+                    normalized, ioc_type, adapter.name,
+                    "aborted_due_to_ioc_deadline", "aborted_due_to_ioc_deadline",
+                    request_made=False,
+                )
+                result.provider_summary = "Aborted: the IOC deadline was reached before this provider finished"
+                await _update_stage(task, adapter.name, "skipped", "Aborted due to IOC deadline", 1.0)
+            else:
+                result = _failure_result(
+                    normalized, ioc_type, adapter.name, "error", "orchestration_error",
+                    request_made=False,
+                )
+                await _update_stage(task, adapter.name, "error", "Internal error", 1.0)
+            result.assessment_domain = task.assessment_domain
+            result_map[adapter.name] = normalize_provider_result(result, task.assessment_domain)
+
+    task.results = [result_map[a.name] for a in matching if a.name in result_map]
+    task.results.extend(unavailable_results)
+
+    task.status = "enriching"
+    task.progress = max(task.progress, 65.0)
+    try:
+        enrichment, enrichment_error = await enrichment_runner
+    except Exception as exc:
+        logger.warning("Enrichment failed for %s: %s", ioc_type, describe_exception(exc), exc_info=True)
+        enrichment, enrichment_error = EnrichmentData(), f"Enrichment failed: {describe_exception(exc, limit=120)}"
+    if enrichment is None:
+        enrichment = EnrichmentData()
+    if enrichment_error:
+        await _emit_error_event(task, "Enrichment", enrichment_error)
+    task.enrichment = enrichment
+    if not matching:
+        enrichment.analysis_notes.append(
+            f"No reputation adapter currently supports {ioc_type}; public structural or contextual enrichment was still collected."
+        )
+    elif not task.results:
+        enrichment.analysis_notes.append(
+            "Supporting sources were selected, but none returned a usable result."
+        )
+    if pipeline_timed_out:
+        enrichment.completeness["pipeline"] = "partial"
+        enrichment.analysis_notes.append(
+            "IOC deadline reached: the assessment uses the provider results that completed before the deadline; "
+            "unfinished providers are recorded as aborted."
+        )
+
+    # --- Propagate Structured Intelligence from Adapter Results ---
+    _merge_provider_intel_into_enrichment(task)
+
+    enrichment_stage_status = "error" if enrichment_error else "done"
+    enrichment_stage_message = enrichment_error or "Enrichment complete"
+    await _update_stage(task, "Enrichment", enrichment_stage_status, enrichment_stage_message, 1.0)
+    await _emit_stage_event(task, "Enrichment", enrichment_stage_status, enrichment_stage_message, 1.0)
+
+    if ioc_type == "cve" and enrichment and enrichment.cve:
+        await _update_stage(task, "CVE Intelligence", "running", "Normalizing CVE enrichment data")
+        try:
+            cve_result = normalize_cve_enrichment(enrichment.cve, normalized)
+            task.results.append(cve_result)
+            await _update_stage(task, "CVE Intelligence", "done", "CVE analysis complete", 1.0)
+        except Exception as exc:
+            logger.warning("CVE normalization failed for %s: %s", normalized, describe_exception(exc))
+            await _update_stage(task, "CVE Intelligence", "error", describe_exception(exc, limit=80), 1.0)
+    else:
+        await _update_stage(task, "CVE Intelligence", "skipped", "Not a CVE IOC", 1.0)
+
+    task.status = "scoring"
+    task.progress = max(task.progress, 85.0)
+    await _update_stage(task, "Scoring & Relations", "running", "Computing composite score")
+
+    if fp_override:
+        task.results.insert(
+            0,
+            NormalizedResult(
+                ioc=normalized, ioc_type=task.ioc_type or "unknown",
+                source="User Feedback",
+                verdict="clean", raw_score=0.0, confidence="high",
+                tags=["user_marked_fp"],
+            ),
+        )
+
+    final_assessment = aggregate_evidence(
+        normalized,
+        task.ioc_type or "unknown",
+        task.results,
+        enrichment,
+        provider_plan=task.provider_plan,
+    )
+    final_assessment = _finalize_assessment(task, final_assessment)
+    if fp_override:
+        final_assessment.final_verdict = "benign"
+        final_assessment.confidence = "high"
+        final_assessment.normalized_score = 0.0
+        final_assessment.reason = "The IOC was explicitly marked false positive by an analyst."
+        final_assessment.analyst_review_recommended = False
+        final_assessment.needs_review = False
+        final_assessment.classification = "benign"
+        final_assessment.risk_score = 0.0
+        final_assessment.review_reasons = []
+    if pipeline_timed_out:
+        note = "IOC deadline reached before every provider finished; unfinished providers were aborted."
+        if note not in final_assessment.review_reasons:
+            final_assessment.review_reasons.append(note)
+    composite = compute_composite(
+        task.results,
+        ioc=normalized,
+        ioc_type=task.ioc_type or "unknown",
+        enrichment=enrichment,
+        assessment=final_assessment,
+    )
+    logger.info(
+        "IOC assessment type=%s verdict=%s score=%s evidence_strength=%s coverage=%s needs_review=%s",
+        task.ioc_type, final_assessment.final_verdict, final_assessment.normalized_score,
+        final_assessment.evidence_strength, final_assessment.coverage,
+        final_assessment.needs_review,
+    )
+    for observation in final_assessment.provider_breakdown:
+        logger.debug(
+            "Evidence contribution source=%s state=%s provider_verdict=%s normalized_verdict=%s contribution=%s weight=%s signal=%s",
+            observation.source, observation.execution_state, observation.provider_verdict,
+            observation.normalized_verdict, observation.contribution,
+            observation.weight, observation.normalized_signal,
+        )
+
+    relationships = _build_relationships(task, normalized, enrichment)
+
+    task.composite = composite
+    task.final_assessment = final_assessment
+    task.final_assessment.relationships = relationships
+    task.provider_health = final_assessment.provider_health
+    task.relationships = relationships
+    await _update_stage(task, "Scoring & Relations", "done", "Analysis complete", 1.0)
+
+    task.executive_summary = generate_executive_summary(
+        LookupResponse(
+            input=task.ioc_value,
+            normalized=task.normalized,
+            ioc_type=task.ioc_type or "unknown",
+            composite=composite,
+            final_assessment=final_assessment,
+            provider_health=task.provider_health,
+            enrichment=task.enrichment or EnrichmentData(),
+            results=task.results,
+            relationships=relationships,
+        )
+    )
+    if pipeline_timed_out:
+        task.error = "Pipeline timeout exceeded; partial result"
+        logger.warning("IOC deadline reached for task %s (%s); partial result", task.task_id, ioc_type)
+        await _emit_error_event(task, "Pipeline", "Pipeline timeout exceeded")
 
 
 def get_task(task_id: str) -> Optional[AnalysisTask]:
@@ -1410,10 +1569,70 @@ async def get_task_redis(task_id: str) -> Optional[AnalysisTask]:
     return None
 
 
+TERMINAL_TASK_STATES = frozenset({"done", "error", "cancelled"})
+
+
+def register_pending_task(
+    task_id: str,
+    ioc_value: str,
+    ioc_type: str,
+    *,
+    password_prehashed: bool = False,
+) -> AnalysisTask:
+    """Make a submitted lookup visible before it gets a lookup slot.
+
+    ``POST /api/lookup`` queues analyses behind MAX_CONCURRENT_LOOKUPS.  Without
+    this record a queued task was unknown until ``run_analysis`` started, so
+    polling it returned 404 "Task not found" and the UI gave up on a lookup
+    that was merely waiting.  ``ioc_value`` must already be safe to store
+    (passwords are digested by the caller).
+    """
+    task = AnalysisTask(
+        task_id=task_id,
+        status="pending",
+        ioc_value=ioc_value,
+        normalized=ioc_value,
+        ioc_type=ioc_type,
+        password_prehashed=password_prehashed,
+        stages=[
+            StageInfo("Classify & Normalize", message="Queued: waiting for a free lookup slot"),
+            StageInfo("Enrichment"),
+            StageInfo("Scoring & Relations"),
+        ],
+    )
+    with _dict_lock:
+        _tasks[task_id] = task
+    return task
+
+
+def register_running_task(task_id: str, runner: asyncio.Task) -> None:
+    """Let ``cancel_analysis`` reach a lookup that is still queued."""
+    with _dict_lock:
+        _running_tasks[task_id] = runner
+
+
+def release_running_task(task_id: str, runner: asyncio.Task) -> None:
+    with _dict_lock:
+        if _running_tasks.get(task_id) is runner:
+            _running_tasks.pop(task_id, None)
+
+
+async def mark_task_cancelled(task_id: str, reason: str = "Analysis cancelled") -> None:
+    """Terminal state for a lookup cancelled before run_analysis started."""
+    task = get_task(task_id)
+    if task is not None and task.status not in TERMINAL_TASK_STATES:
+        task.error = reason
+        await _publish_terminal_state(task, "cancelled")
+    _unregister_running(task_id)
+
+
 async def cleanup_old_tasks(max_age: float = 3600):
     now = time.time()
     with _dict_lock:
-        to_remove = [tid for tid, t in _tasks.items() if now - t.created_at > max_age]
+        to_remove = [
+            tid for tid, t in _tasks.items()
+            if now - t.created_at > max_age and t.status in TERMINAL_TASK_STATES
+        ]
         for tid in to_remove:
             _tasks.pop(tid, None)
             _task_queues.pop(tid, None)
@@ -1474,7 +1693,7 @@ async def _emit_error_event(task: AnalysisTask, stage_name: str, message: str):
 
 async def _emit_done_event(task: AnalysisTask):
     await _emit_event(task.task_id, "done", {
-        "status": task.status, "progress": task.progress,
+        "status": task.status, "progress": task.progress, "error": task.error,
     })
 
 

@@ -48,7 +48,8 @@ async def test_abstractapi_deliverable_clean():
     assert result.verdict == "clean"
     assert result.raw_score == 0.0
     assert "deliverability:deliverable" in result.tags
-    assert "quality_score:0.95" in result.tags
+    # The numeric quality score lives in raw_data, not a tag.
+    assert result.raw_data["quality_score"] == 0.95
     assert "abstract:disposable_email" not in result.tags
 
 
@@ -147,8 +148,9 @@ async def test_hunterio_deliverable_clean():
     assert result.verdict == "clean"
     assert result.raw_score == 0.0
     assert "hunter:result:deliverable" in result.tags
-    assert "hunter:score:98" in result.tags
-    assert "hunter:sources_found:2" in result.tags
+    # Score and source count are structured values, not tags.
+    assert result.raw_data["score"] == 98
+    assert result.raw_data["sources_found"] == 2
 
 
 @pytest.mark.asyncio

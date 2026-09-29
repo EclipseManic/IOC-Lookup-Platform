@@ -5,6 +5,8 @@ import InfostealerExposureCard from "./InfostealerExposureCard";
 import WebPreviewCard from "./WebPreviewCard";
 import AbuseReportsPanel from "./AbuseReportsPanel";
 import DataProvenanceBadge from "./DataProvenanceBadge";
+import EthereumWalletCard from "./EthereumWalletCard";
+import type { EthereumContext } from "../services/api";
 
 function formatValue(value: unknown): string {
   if (Array.isArray(value))
@@ -72,19 +74,21 @@ function Stat({
 export default function EnrichmentPanel({
   enrichment,
   iocType,
+  onPivot,
 }: {
   enrichment: EnrichmentData;
   iocType?: string;
+  onPivot?: (value: string) => void;
 }) {
   const sections: [string, object][] = [];
   const extra = enrichment.extra ?? {};
   const bitcoin =
     extra.bitcoin && typeof extra.bitcoin === "object"
-      ? (extra.bitcoin as Record<string, unknown>)
+      ? (extra.bitcoin as unknown as Record<string, unknown>)
       : null;
   const ethereum =
     extra.ethereum && typeof extra.ethereum === "object"
-      ? (extra.ethereum as Record<string, unknown>)
+      ? extra.ethereum
       : null;
 
   if (enrichment.dns) sections.push(["DNS records", enrichment.dns]);
@@ -101,7 +105,7 @@ export default function EnrichmentPanel({
   if (enrichment.redirect_chain?.length)
     sections.push(["Redirect chain", { chain: enrichment.redirect_chain }]);
   if (bitcoin) sections.push(["Bitcoin wallet", bitcoin]);
-  if (ethereum) sections.push(["Ethereum wallet", ethereum]);
+  const ethereumWallet: EthereumContext | null = ethereum;
 
   const consumed = new Set(["bitcoin", "ethereum"]);
   const additional = Object.fromEntries(
@@ -110,7 +114,7 @@ export default function EnrichmentPanel({
   if (Object.keys(additional).length) sections.push(["Additional context", additional]);
 
   const geo = enrichment.geoip;
-  const wallet = bitcoin || ethereum;
+  const wallet = bitcoin;
   const breach = enrichment.breach as Record<string, unknown> | undefined;
   const breachCount = typeof breach?.breach_count === "number" ? breach.breach_count : 0;
   const breachSource = typeof breach?.source === "string" ? breach.source : "None";
@@ -314,6 +318,10 @@ export default function EnrichmentPanel({
       )}
 
       {/* Remaining Standard Sections */}
+      {ethereumWallet && (
+        <EthereumWalletCard wallet={ethereumWallet} onPivot={onPivot} />
+      )}
+
       {sections.map(([title, data]) => (
         <Section key={title} title={title} data={data} />
       ))}

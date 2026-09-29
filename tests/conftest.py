@@ -9,6 +9,11 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 # configured before any application module imports Settings/database.py.
 _TEST_DB_PATH = Path(tempfile.gettempdir()) / f"ioc_platform_pytest_{os.getpid()}.db"
 os.environ["DATABASE_URL"] = f"sqlite+aiosqlite:///{_TEST_DB_PATH.as_posix()}"
+# The repo .env is the app's primary config source and holds real provider
+# credentials; keep the suite deterministic by not loading it, except for the
+# opt-in live provider checks that need those keys.
+if os.environ.get("RUN_LIVE_API_TESTS") != "1":
+    os.environ["IOC_ENV_FILE"] = ""
 
 
 def pytest_sessionstart(session):

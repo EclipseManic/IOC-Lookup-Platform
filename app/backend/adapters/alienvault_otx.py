@@ -1,6 +1,19 @@
+import asyncio
+from datetime import datetime
+
 import httpx
 
-from app.backend.adapters.base import NormalizedResult, RateLimitConfig, SourceAdapter, is_valid_api_key, retry_after_seconds
+from app.backend.adapters._http import (
+    MalformedResponse,
+    describe_exception,
+    exception_result,
+    failure,
+    http_failure,
+    malformed,
+    not_configured,
+    read_json,
+)
+from app.backend.adapters.base import NormalizedResult, RateLimitConfig, SourceAdapter, is_valid_api_key
 from app.backend.config import settings
 from app.backend.logger import get_logger
 
@@ -17,257 +30,188 @@ _TYPE_TO_SEGMENT = {
     "sha1": "file",
     "sha256": "file",
 }
+# OTX ``validation`` sources that mean "this indicator is known-good or a
+# known false positive".  Popularity rankings (alexa, majestic, ...) are kept
+# as context only: popular sites do get compromised.
+_BENIGN_VALIDATION_SOURCES = {"whitelist", "false_positive"}
+_SUB_REQUEST_TIMEOUT = 8.0
+
+
+def _parse_dt(value) -> datetime | None:
+    if not value:
+        return None
+    try:
+        return datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+    except ValueError:
+        return None
 
 
 class AlienVaultOTXAdapter(SourceAdapter):
     name = "AlienVault OTX"
     supported_types = ["ipv4", "ipv6", "domain", "url", "md5", "sha1", "sha256"]
     public_without_key = False
-    rate_limit = RateLimitConfig(requests_per_minute=16, requests_per_day=1000, max_retries=1, timeout_seconds=10.0)
+    produces_reputation = True
+    produces_relationships = True
+    # Keyed DirectConnect API: 10,000 requests/hour.  One lookup issues the
+    # ``general`` request plus up to three concurrent context requests.
+    rate_limit = RateLimitConfig(
+        requests_per_minute=40, requests_per_day=10000, max_retries=1, timeout_seconds=15.0,
+    )
 
     def __init__(self):
         self.api_key = settings.alienvault_otx_api_key
 
+    def _headers(self) -> dict:
+        return {"X-OTX-API-KEY": self.api_key, "Accept": "application/json"}
+
     async def _sub_request(self, url: str) -> dict | None:
-        if not self._check_circuit():
-            return None
+        """Optional context request.  Failures never change the verdict."""
         try:
-            headers = {"X-OTX-API-KEY": self.api_key} if is_valid_api_key(self.api_key) else None
-            resp = await self._get_client().get(
-                url, headers=headers, timeout=10,
-            )
-            if resp.status_code == 200:
-                self._record_success()
-                return resp.json()
-            if resp.status_code == 429:
-                self._record_failure()
-            return None
-        except Exception:
-            self._record_failure()
+            resp = await self._get_client().get(url, headers=self._headers(), timeout=_SUB_REQUEST_TIMEOUT)
+            if resp.status_code != 200:
+                return None
+            data = resp.json()
+            return data if isinstance(data, dict) else None
+        except Exception as exc:
+            logger.debug("OTX context request %s failed: %s", url.rsplit("/", 1)[-1], describe_exception(exc))
             return None
 
     async def lookup(self, ioc_value: str, ioc_type: str) -> NormalizedResult:
         segment = _TYPE_TO_SEGMENT.get(ioc_type)
         if not segment:
-            return NormalizedResult(
-                ioc=ioc_value, ioc_type=ioc_type, source=self.name,
-                verdict="unknown", tags=["unsupported_type"],
+            return failure(
+                self.name, ioc_value, ioc_type, "not_applicable", ["unsupported_type"],
+                f"OTX does not support {ioc_type} lookups", request_made=False,
             )
-
-        # OTX's public endpoint is not a reliable anonymous lookup path: in
-        # some environments it returns a normal 200 response without usable
-        # reputation data instead of a 401.  Surface that condition explicitly
-        # so batch scans account for it as provider unavailability.
+        # OTX's anonymous endpoint returns 200 responses without usable
+        # reputation data, so a key is required for an honest answer.
         if not is_valid_api_key(self.api_key):
-            return NormalizedResult(
-                ioc=ioc_value,
-                ioc_type=ioc_type,
-                source=self.name,
-                verdict="unknown",
-                execution_state="unavailable",
-                tags=["no_api_key_configured", "public_fallback"],
-                request_made=False,
-            )
+            return not_configured(self.name, ioc_value, ioc_type)
 
-        headers = {"X-OTX-API-KEY": self.api_key} if is_valid_api_key(self.api_key) else None
-        client = self._get_client()
+        base = f"https://otx.alienvault.com/api/v1/indicators/{segment}/{ioc_value}"
+        # ``general`` is the only section that carries pulse membership and
+        # validation for every indicator type (``/reputation`` exists for IPs
+        # only and has no pulse data).
         try:
-            resp = await client.get(
-                    f"https://otx.alienvault.com/api/v1/indicators/{segment}/{ioc_value}/reputation",
-                    headers=headers,
-                    timeout=10,
-                )
-        except httpx.TimeoutException:
-            self._record_failure()
-            return NormalizedResult(
-                ioc=ioc_value, ioc_type=ioc_type, source=self.name,
-                verdict="error", tags=["timeout"],
-            )
+            resp = await self._get_client().get(f"{base}/general", headers=self._headers(), timeout=10)
         except httpx.HTTPError as exc:
-            self._record_failure()
-            logger.warning("OTX reputation request failed: %s", exc.__class__.__name__)
-            return NormalizedResult(
-                ioc=ioc_value, ioc_type=ioc_type, source=self.name,
-                verdict="error", tags=["request_error"],
-            )
-
-        if resp.status_code == 401:
-            if not is_valid_api_key(self.api_key):
-                return NormalizedResult(
-                    ioc=ioc_value, ioc_type=ioc_type, source=self.name,
-                    verdict="unknown", status="not_found", tags=["no_api_key_configured","public_fallback"],
-                )
-            return NormalizedResult(
-                ioc=ioc_value, ioc_type=ioc_type, source=self.name,
-                verdict="error", tags=["unauthorized"],
-            )
-        if resp.status_code == 404:
-            return NormalizedResult(
-                ioc=ioc_value, ioc_type=ioc_type, source=self.name,
-                verdict="unknown", raw_score=0.0, status="not_found",
-            )
-        if resp.status_code == 429:
-            return NormalizedResult(
-                ioc=ioc_value, ioc_type=ioc_type, source=self.name,
-                verdict="unknown", tags=["rate_limited"], http_status=resp.status_code,
-                retry_after_seconds=retry_after_seconds(resp),
-            )
-        if resp.status_code != 200:
-            return NormalizedResult(
-                ioc=ioc_value, ioc_type=ioc_type, source=self.name,
-                verdict="error", tags=[f"http_{resp.status_code}"],
-            )
-
-        data = resp.json()
-        pulse_count = data.get("pulse_count", 0)
-        threat_score = data.get("threat_score", 0)
-
-        tags = []
-        if pulse_count > 0:
-            tags.append(f"pulses:{pulse_count}")
-        pulses = data.get("pulses", []) or []
-        for p in pulses[:5]:
-            if isinstance(p, dict):
-                name = p.get("name", "")
-                if name:
-                    tags.append(f"pulse:{name[:60]}")
-                threat_type = p.get("threat_type", "")
-                if threat_type:
-                    tags.append(f"threat_type:{threat_type}")
-
-        all_families = set()
-        all_mitre = set()
+            logger.warning("OTX request failed for %s: %s", ioc_value, describe_exception(exc))
+            return exception_result(self.name, ioc_value, ioc_type, exc)
+        failed = http_failure(self.name, ioc_value, ioc_type, resp)
+        if failed is not None:
+            return failed
         try:
-            general_data = await self._sub_request(
-                f"https://otx.alienvault.com/api/v1/indicators/{segment}/{ioc_value}/general"
-            )
-            if general_data:
-                base_indicator = general_data.get("base_indicator", {})
-                if isinstance(base_indicator, dict):
-                    itype = base_indicator.get("type", "")
-                    if itype: tags.append(f"otx_indicator_type: {itype}")
-                    iid = base_indicator.get("id", "")
-                    if iid: tags.append(f"otx_indicator_id: {iid}")
-                validation = general_data.get("validation", "")
-                if validation: tags.append(f"validation: {validation}")
-                pulse_info = general_data.get("pulse_info", {})
-                related_pulses = pulse_info.get("related_pulses", []) or []
-                for pulse in related_pulses[:5]:
-                    if not isinstance(pulse, dict): continue
-                    pname = pulse.get("name", "")
-                    if pname: tags.append(f"pulse:{pname[:60]}")
-                    for pt in (pulse.get("tags", []) or []):
-                        if pt: all_families.add(pt)
-                    for mf in (pulse.get("malware_families", []) or []):
-                        if mf: all_families.add(mf)
-                    for attack in (pulse.get("attack_ids", []) or []):
-                        if isinstance(attack, dict):
-                            aid = attack.get("id", "")
-                            if aid: all_mitre.add(aid)
-                pc = pulse_info.get("count", 0)
-                if pc > pulse_count: pulse_count = pc
-        except Exception as exc:
-            logger.debug("AlienVault OTX pulse parsing failed: %s", exc)
+            general = read_json(resp)
+        except MalformedResponse as exc:
+            return malformed(self.name, ioc_value, ioc_type, exc.reason, resp.status_code)
+        if not isinstance(general, dict):
+            return malformed(self.name, ioc_value, ioc_type)
+
+        pulse_info = general.get("pulse_info") if isinstance(general.get("pulse_info"), dict) else {}
+        pulses = [p for p in (pulse_info.get("pulses") or []) if isinstance(p, dict)]
+        pulse_count = pulse_info.get("count")
+        pulse_count = int(pulse_count) if isinstance(pulse_count, int) else len(pulses)
+        validation = [v for v in (general.get("validation") or []) if isinstance(v, dict)]
+        benign_validation = [
+            v for v in validation
+            if str(v.get("source") or "").lower() in _BENIGN_VALIDATION_SOURCES
+        ]
+        false_positive = [fp for fp in (general.get("false_positive") or []) if fp]
+
+        families: list[str] = []
+        mitre: set[str] = set()
+        pulse_names: list[str] = []
+        last_seen = None
+        for pulse in pulses:
+            name = str(pulse.get("name") or "").strip()
+            if name and len(pulse_names) < 10:
+                pulse_names.append(name[:120])
+            for family in pulse.get("malware_families") or []:
+                label = family.get("display_name") if isinstance(family, dict) else family
+                if label and str(label) not in families:
+                    families.append(str(label))
+            for attack in pulse.get("attack_ids") or []:
+                attack_id = attack.get("id") if isinstance(attack, dict) else attack
+                if attack_id:
+                    mitre.add(str(attack_id))
+            modified = _parse_dt(pulse.get("modified") or pulse.get("created"))
+            if modified and (last_seen is None or modified > last_seen):
+                last_seen = modified
+
+        # Context sections, fetched concurrently and bounded so they cannot
+        # push the lookup past its deadline.
+        context_sections: list[str] = []
+        if ioc_type in ("ipv4", "ipv6", "domain"):
+            context_sections = ["passive_dns", "url_list", "malware"]
+        sub_results = await asyncio.gather(
+            *(self._sub_request(f"{base}/{section}") for section in context_sections)
+        ) if context_sections else []
+        sections = dict(zip(context_sections, sub_results))
 
         related = []
-        if ioc_type in ("domain", "ipv4"):
-            pd_data = await self._sub_request(
-                f"https://otx.alienvault.com/api/v1/indicators/{segment}/{ioc_value}/passive_dns"
-            )
-            if pd_data:
-                for entry in (pd_data.get("passive_dns", []) or [])[:10]:
-                    if isinstance(entry, dict):
-                        hostname = entry.get("hostname", "")
-                        address = entry.get("address", "")
-                        if hostname and address:
-                            related.append((f"{hostname}:{address}", "passive_dns"))
+        pd_data = sections.get("passive_dns") or {}
+        for entry in (pd_data.get("passive_dns") or [])[:10]:
+            if isinstance(entry, dict):
+                hostname = entry.get("hostname", "")
+                address = entry.get("address", "")
+                if ioc_type == "domain" and address:
+                    related.append((str(address), "resolves_to"))
+                elif hostname:
+                    related.append((str(hostname), "passive_dns"))
+        malware_urls = [
+            str(entry.get("url")) for entry in ((sections.get("url_list") or {}).get("url_list") or [])[:25]
+            if isinstance(entry, dict) and entry.get("url")
+        ]
+        associated_hashes = [
+            str(entry.get("hash")) for entry in ((sections.get("malware") or {}).get("data") or [])[:10]
+            if isinstance(entry, dict) and entry.get("hash")
+        ]
 
-        if ioc_type == "domain":
-            whois_data = await self._sub_request(
-                f"https://otx.alienvault.com/api/v1/indicators/{segment}/{ioc_value}/whois"
-            )
-            if whois_data:
-                for key in ("registrant_name", "registrar", "created"):
-                    val = whois_data.get(key, "")
-                    if val:
-                        tags.append(f"whois_{key}:{str(val)[:80]}")
-
-        extra_data = {}
-        malware_urls: list[str] = []
-        associated_hashes: list[str] = []
-
-        if ioc_type in ("ipv4", "ipv6"):
-            geo_data = await self._sub_request(
-                f"https://otx.alienvault.com/api/v1/indicators/{segment}/{ioc_value}/geo"
-            )
-            if geo_data and isinstance(geo_data, dict):
-                for key in ("country_code", "country_name", "city", "latitude", "longitude", "asn"):
-                    val = geo_data.get(key)
-                    if val:
-                        extra_data[key] = val
-                if extra_data.get("country_name") or extra_data.get("city"):
-                    extra_data["geoip"] = True
-
-        # URL list sub-endpoint: malicious URLs hosted on/associated with this indicator
-        if ioc_type in ("ipv4", "ipv6", "domain"):
-            url_list_data = await self._sub_request(
-                f"https://otx.alienvault.com/api/v1/indicators/{segment}/{ioc_value}/url_list"
-            )
-            if url_list_data and isinstance(url_list_data, dict):
-                for entry in (url_list_data.get("url_list", []) or [])[:25]:
-                    if isinstance(entry, dict):
-                        url = entry.get("url", "")
-                        if url:
-                            malware_urls.append(url)
-
-        # Malware sub-endpoint: file hashes associated with this indicator
-        if ioc_type in ("ipv4", "ipv6", "domain"):
-            malware_data = await self._sub_request(
-                f"https://otx.alienvault.com/api/v1/indicators/{segment}/{ioc_value}/malware"
-            )
-            if malware_data and isinstance(malware_data, dict):
-                for entry in (malware_data.get("data", []) or [])[:10]:
-                    if isinstance(entry, dict):
-                        h = entry.get("hash", "")
-                        if h:
-                            associated_hashes.append(h)
-
-        # Analysis sub-endpoint: for IPs and file hashes
-        if ioc_type in ("ipv4", "ipv6", "md5", "sha1", "sha256"):
-            analysis_data = await self._sub_request(
-                f"https://otx.alienvault.com/api/v1/indicators/{segment}/{ioc_value}/analysis"
-            )
-            if analysis_data and isinstance(analysis_data, dict):
-                analysis = analysis_data.get("analysis", {})
-                if isinstance(analysis, dict):
-                    plugin_results = analysis.get("plugin_output", "") or analysis.get("plugins", "")
-                    if plugin_results:
-                        extra_data["analysis"] = plugin_results
-
-        if pulse_count > 0 and threat_score >= 5:
-            verdict = "malicious"
-            raw_score = min(threat_score / 10.0, 1.0)
-            confidence = "high"
+        tags: list[str] = []
+        if benign_validation or false_positive:
+            verdict, confidence, raw_score = "whitelisted", "medium", 0.0
+            tags.append("otx_whitelisted")
+        elif pulse_count >= 3 and (families or mitre):
+            verdict, confidence, raw_score = "malicious", "medium", 0.7
         elif pulse_count > 0:
-            verdict = "suspicious"
-            raw_score = 0.4
-            confidence = "medium"
+            verdict, confidence, raw_score = "suspicious", "low" if pulse_count == 1 else "medium", 0.4
         else:
-            verdict = "unknown"
-            raw_score = None
-            confidence = "low"
+            return NormalizedResult(
+                ioc=ioc_value, ioc_type=ioc_type, source=self.name,
+                verdict="unknown", provider_verdict="not_found",
+                execution_state="not_found", status="not_found",
+                related_iocs=related,
+                provider_summary="Indicator is not referenced by any OTX pulse",
+                raw_data={
+                    "pulse_count": 0,
+                    "validation": validation[:5],
+                    "malware_urls": malware_urls,
+                    "associated_hashes": associated_hashes,
+                },
+                source_link=f"https://otx.alienvault.com/indicator/{segment.lower()}/{ioc_value}",
+            )
+        if pulse_count:
+            tags.append("otx_pulses")
 
+        summary = f"Referenced by {pulse_count} OTX pulse{'s' if pulse_count != 1 else ''}"
+        if verdict == "whitelisted":
+            summary += "; OTX validation marks it as known-good/false positive"
         return NormalizedResult(
             ioc=ioc_value, ioc_type=ioc_type, source=self.name,
             verdict=verdict, confidence=confidence, raw_score=raw_score,
             tags=tags, reports_count=pulse_count,
-            malware_family=", ".join(sorted(all_families)) or None,
-            mitre_attck=sorted(all_mitre),
+            malware_family=", ".join(families[:5]) or None,
+            mitre_attck=sorted(mitre),
             related_iocs=related,
+            last_seen=last_seen,
+            provider_summary=summary,
+            source_link=f"https://otx.alienvault.com/indicator/{segment.lower()}/{ioc_value}",
             raw_data={
-                "api_response": data,
+                "pulse_count": pulse_count,
+                "pulse_names": pulse_names,
+                "validation": validation[:5],
+                "false_positive": false_positive[:5],
                 "malware_urls": malware_urls,
                 "associated_hashes": associated_hashes,
-                **extra_data,
             },
         )

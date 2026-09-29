@@ -1,13 +1,18 @@
-import httpx
-
-from app.backend.adapters.base import NormalizedResult, RateLimitConfig, SourceAdapter, is_valid_api_key, retry_after_seconds
+from app.backend.adapters._http import MalformedResponse, failure, http_failure, malformed, read_json
+from app.backend.adapters.base import NormalizedResult, RateLimitConfig, SourceAdapter, is_valid_api_key
 from app.backend.config import settings
 
 
 class IPinfoAdapter(SourceAdapter):
+    """IP geolocation/ASN context. It is not a reputation source: hosting or
+    bogon status describes the network, not whether the address is malicious."""
+
     name = "IPinfo"
     supported_types = ["ipv4", "ipv6"]
     public_without_key = True
+    produces_infrastructure_context = True
+    produces_metadata = True
+    # Free plan: 50k requests/month.
     rate_limit = RateLimitConfig(requests_per_minute=30)
 
     def __init__(self):
@@ -26,100 +31,71 @@ class IPinfoAdapter(SourceAdapter):
             f"https://ipinfo.io/{ioc_value}/json",
             timeout=10,
         )
-        if resp.status_code != 200:
-            return NormalizedResult(
-                ioc=ioc_value, ioc_type=ioc_type, source=self.name,
-                verdict="unknown", tags=["lite_api_unavailable"],
-            )
+        failed = http_failure(self.name, ioc_value, ioc_type, resp, key_sent=False)
+        if failed is not None:
+            # The key-free endpoint could not answer; say so instead of "no data".
+            if "lite_api_unavailable" not in failed.tags and failed.execution_state in {"error", "unavailable", "invalid_request"}:
+                failed.tags = [*failed.tags, "lite_api_unavailable"]
+            return failed
+        try:
+            data = read_json(resp)
+        except MalformedResponse as exc:
+            return malformed(self.name, ioc_value, ioc_type, exc.reason, resp.status_code)
+        if not isinstance(data, dict):
+            return malformed(self.name, ioc_value, ioc_type, http_status=resp.status_code)
 
-        data = resp.json()
-        tags = []
-        country = data.get("country_code", "") or data.get("country", "")
-        asn = data.get("asn", "")
-        asn_name = data.get("as_name", "") or data.get("asn_name", "")
-        if country:
-            tags.append(f"country:{country}")
-        if asn:
-            tags.append(f"asn:{asn}")
-        if asn_name:
-            tags.append(f"asn_name:{asn_name}")
-        tags.append("source:lite")
+        raw_data = {
+            "country": data.get("country_code", "") or data.get("country", ""),
+            "asn": data.get("asn", ""),
+            "as_name": data.get("as_name", "") or data.get("asn_name", ""),
+            "source": "lite",
+        }
         return NormalizedResult(
             ioc=ioc_value, ioc_type=ioc_type, source=self.name,
-            verdict="unknown", raw_score=None, tags=tags,
+            verdict="unknown", raw_score=None, tags=["geo_context"],
+            raw_data={k: v for k, v in raw_data.items() if v not in ("", None)},
+            status="found", http_status=resp.status_code,
         )
 
     async def _paid_lookup(self, client, ioc_value: str, ioc_type: str) -> NormalizedResult:
         resp = await client.get(
-                f"https://ipinfo.io/{ioc_value}/json",
-                headers={"Authorization": f"Bearer {self.api_key}"},
-                timeout=10,
-            )
+            f"https://ipinfo.io/{ioc_value}/json",
+            headers={"Authorization": f"Bearer {self.api_key}"},
+            timeout=10,
+        )
+        failed = http_failure(self.name, ioc_value, ioc_type, resp)
+        if failed is not None:
+            return failed
+        try:
+            data = read_json(resp)
+        except MalformedResponse as exc:
+            return malformed(self.name, ioc_value, ioc_type, exc.reason, resp.status_code)
+        if not isinstance(data, dict):
+            return malformed(self.name, ioc_value, ioc_type, http_status=resp.status_code)
 
-        if resp.status_code == 401:
-            return NormalizedResult(
-                ioc=ioc_value, ioc_type=ioc_type, source=self.name,
-                verdict="error", tags=["unauthorized"],
-            )
-        if resp.status_code == 429:
-            return NormalizedResult(
-                ioc=ioc_value, ioc_type=ioc_type, source=self.name,
-                verdict="unknown", tags=["rate_limited"], http_status=resp.status_code,
-                retry_after_seconds=retry_after_seconds(resp),
-            )
-        if resp.status_code != 200:
-            return NormalizedResult(
-                ioc=ioc_value, ioc_type=ioc_type, source=self.name,
-                verdict="error", tags=[f"http_{resp.status_code}"],
-            )
-
-        data = resp.json()
-        tags = []
-        categories = []
-
-        ip = data.get("ip", "")
-        city = data.get("city", "")
-        region = data.get("region", "")
-        country = data.get("country", "")
-        loc = data.get("loc", "")
-        postal = data.get("postal", "")
-        timezone = data.get("timezone", "")
-        org = data.get("org", "")
-        asn_info = data.get("asn", {}) or {}
-
-        if city: tags.append(f"city:{city}")
-        if region: tags.append(f"region:{region}")
-        if country: tags.append(f"country:{country}")
-        if timezone: tags.append(f"timezone:{timezone}")
-        if org: tags.append(f"org:{org}")
-        if isinstance(asn_info, dict):
-            asn_val = asn_info.get("asn", "")
-            asn_name = asn_info.get("name", "")
-            if asn_val: tags.append(f"asn:{asn_val}")
-            if asn_name: tags.append(f"asn_name:{asn_name}")
-
-        hosting = data.get("hosting", {})
-        is_hosting = False
-        is_bogon = False
-        if isinstance(hosting, dict):
-            is_hosting = bool(hosting.get("is_hosting", False))
-            is_bogon = bool(hosting.get("is_bogon", False))
-            if is_hosting:
-                tags.append("is_hosting")
-            if is_bogon:
-                tags.append("is_bogon")
-
-        raw_score = None
-        verdict = "unknown"
+        asn_info = data.get("asn") if isinstance(data.get("asn"), dict) else {}
+        hosting = data.get("hosting") if isinstance(data.get("hosting"), dict) else {}
+        is_hosting = bool(hosting.get("is_hosting", False))
+        is_bogon = bool(hosting.get("is_bogon", False))
+        tags = ["geo_context"]
+        if is_hosting:
+            tags.append("hosting_provider")
         if is_bogon:
-            raw_score = 0.3
-            verdict = "suspicious"
-        elif is_hosting:
-            raw_score = 0.2
-            verdict = "suspicious"
+            tags.append("bogon")
 
+        # Structured values live in raw_data; network type is context, never a verdict.
+        raw_data = {
+            key: data.get(key)
+            for key in ("ip", "city", "region", "country", "loc", "postal", "timezone", "org", "hostname")
+            if data.get(key)
+        }
+        if asn_info:
+            raw_data["asn"] = asn_info.get("asn")
+            raw_data["asn_name"] = asn_info.get("name")
+        raw_data["is_hosting"] = is_hosting
+        raw_data["is_bogon"] = is_bogon
         return NormalizedResult(
             ioc=ioc_value, ioc_type=ioc_type, source=self.name,
-            verdict=verdict, raw_score=raw_score, tags=tags,
-            categories=categories, raw_data=data,
+            verdict="unknown", raw_score=None, tags=tags,
+            raw_data=raw_data, status="found", http_status=resp.status_code,
         )

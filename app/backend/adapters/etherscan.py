@@ -125,7 +125,8 @@ class EtherscanAdapter(SourceAdapter):
             "balance_eth": balance_wei / 10**18,
             "transaction_count": len(valid_transactions),
         }
-        tags = [f"balance_eth:{balance_wei / 10**18:.6f}", f"transactions:{len(valid_transactions)}"]
+        # Balance and transaction count are typed values (raw_data, reports_count).
+        tags = ["active_address"] if valid_transactions or balance_wei else ["empty_address"]
         return NormalizedResult(
             ioc=ioc_value, ioc_type=ioc_type, source=self.name,
             verdict="unknown", status="found", tags=tags,

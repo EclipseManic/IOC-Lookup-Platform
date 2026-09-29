@@ -4,7 +4,7 @@ sys.path.insert(0, ".")
 
 import pytest
 
-from app.backend.config import Settings, resolve_credential
+from app.backend.config import Settings, resolve_credential, resolve_credential_with_origin
 
 VALID_KEYS = {
     "virustotal_api_key": "a" * 40,
@@ -163,7 +163,7 @@ def test_debug_accepts_common_environment_modes(value, expected):
     assert s.debug is expected
 
 # ------------------------------------------------------------
-# Credential resolution: system env > .env (literal or reference)
+# Credential resolution: .env (literal or reference) > system env
 # ------------------------------------------------------------
 
 def _write_env(tmp_path, name, text):
@@ -172,16 +172,29 @@ def _write_env(tmp_path, name, text):
     return str(path)
 
 
-def test_resolve_system_env_wins_over_env_file_literal(tmp_path):
+def test_resolve_env_file_wins_over_system_env_literal(tmp_path):
     env_file = _write_env(tmp_path, "a.env", "VT_API_KEY=file-key\n")
+    assert resolve_credential("VT_API_KEY", env_file=env_file, environ={"VT_API_KEY": "sys-key"}) == "file-key"
+
+
+def test_resolve_system_env_is_fallback_when_env_file_lacks_key(tmp_path):
+    env_file = _write_env(tmp_path, "a2.env", "SHODAN_API_KEY=x\n")
     assert resolve_credential("VT_API_KEY", env_file=env_file, environ={"VT_API_KEY": "sys-key"}) == "sys-key"
 
 
-def test_resolve_system_env_wins_over_env_file_reference(tmp_path):
+def test_resolve_env_file_reference_wins_over_system_env(tmp_path):
     env_file = _write_env(tmp_path, "b.env", "VT_API_KEY=${MY_VT_KEY}\n")
     assert resolve_credential(
         "VT_API_KEY", env_file=env_file, environ={"VT_API_KEY": "sys-key", "MY_VT_KEY": "other-key"}
-    ) == "sys-key"
+    ) == "other-key"
+
+
+def test_env_file_alias_beats_system_env_under_other_alias(tmp_path):
+    env_file = _write_env(tmp_path, "b2.env", "AbuseDB_API_KEY=file-key\n")
+    value, name, origin = resolve_credential_with_origin(
+        ["ABUSEIPDB_API_KEY", "AbuseDB_API_KEY"], env_file=env_file, environ={"ABUSEIPDB_API_KEY": "sys-key"},
+    )
+    assert (value, name, origin) == ("file-key", "AbuseDB_API_KEY", ".env")
 
 
 def test_resolve_env_file_literal_when_no_system_var(tmp_path):
@@ -248,7 +261,17 @@ def test_settings_resolves_env_file_reference(tmp_path, monkeypatch):
     assert s.malwarebazaar_api_key == "mb-key"
 
 
-def test_settings_system_env_wins_over_settings_kwarg(monkeypatch):
+def test_settings_kwarg_wins_over_system_env(monkeypatch):
     monkeypatch.setenv("VT_API_KEY", "system-key")
     s = _settings(VT_API_KEY="kwarg-key")
-    assert s.virustotal_api_key == "system-key"
+    assert s.virustotal_api_key == "kwarg-key"
+
+
+def test_settings_env_file_wins_over_system_env_and_reports_origin(tmp_path, monkeypatch):
+    env_file = _write_env(tmp_path, "o.env", "VT_API_KEY=file-key\nPORT=9123\n")
+    monkeypatch.setenv("VT_API_KEY", "system-key")
+    monkeypatch.setenv("PORT", "8111")
+    s = Settings(_env_file=env_file, database_url="sqlite+aiosqlite:///./test.db")
+    assert s.virustotal_api_key == "file-key"
+    assert s.credential_origin("virustotal_api_key") == ("VT_API_KEY", ".env")
+    assert s.port == 9123

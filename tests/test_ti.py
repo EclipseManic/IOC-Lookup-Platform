@@ -281,7 +281,9 @@ class TestVirusTotalAdapter:
         mock_class, _ = _mock_async_client(status_code=401)
         with patch("httpx.AsyncClient", mock_class):
             r = await a.lookup("8.8.8.8", "ipv4")
-        assert r.verdict == "error"
+        # A rejected key is a provider that could not answer, not a verdict.
+        assert r.verdict == "unknown"
+        assert r.execution_state == "unavailable"
         assert "invalid_api_key" in r.tags
 
     @pytest.mark.asyncio
@@ -292,7 +294,9 @@ class TestVirusTotalAdapter:
         with patch("httpx.AsyncClient", mock_class):
             r = await a.lookup("8.8.8.8", "ipv4")
         assert r.verdict == "unknown"
-        assert r.raw_score == 0.0
+        assert r.execution_state == "not_found"
+        # No record means no score, not a score of zero.
+        assert r.raw_score is None
 
     @pytest.mark.asyncio
     async def test_malicious_response(self):
@@ -416,7 +420,8 @@ class TestAbuseIPDBAdapter:
         mock_class, _ = _mock_async_client(status_code=401)
         with patch("httpx.AsyncClient", mock_class):
             r = await a.lookup("8.8.8.8", "ipv4")
-        assert r.verdict == "error"
+        assert r.verdict == "unknown"
+        assert r.execution_state == "unavailable"
         assert "invalid_api_key" in r.tags
 
     @pytest.mark.asyncio
@@ -452,13 +457,28 @@ class TestAbuseIPDBAdapter:
 
     @pytest.mark.asyncio
     async def test_clean_response(self):
-        data = {"data": {"abuseConfidenceScore": 0, "totalReports": 0, "isp": "Google LLC", "countryCode": "US"}}
+        data = {"data": {"abuseConfidenceScore": 0, "totalReports": 3, "isp": "Google LLC", "countryCode": "US"}}
         a = AbuseIPDBAdapter()
         a.api_key = "valid"
         mock_class, _ = _mock_async_client(json_data=data)
         with patch("httpx.AsyncClient", mock_class):
             r = await a.lookup("8.8.8.8", "ipv4")
         assert r.verdict == "clean"
+        assert r.raw_score == 0.0
+        assert r.raw_data["abuse_confidence_score"] == 0
+        assert r.raw_data["is_whitelisted"] is False
+        assert r.raw_data["is_tor"] is False
+
+    @pytest.mark.asyncio
+    async def test_no_reports_is_undetected_not_clean(self):
+        """Zero reports is absence of evidence; only reports that stayed low are 'clean'."""
+        data = {"data": {"abuseConfidenceScore": 0, "totalReports": 0, "isp": "Google LLC", "countryCode": "US"}}
+        a = AbuseIPDBAdapter()
+        a.api_key = "valid"
+        mock_class, _ = _mock_async_client(json_data=data)
+        with patch("httpx.AsyncClient", mock_class):
+            r = await a.lookup("8.8.8.8", "ipv4")
+        assert r.verdict == "undetected"
         assert r.raw_score == 0.0
 
     def test_supported_types(self):
@@ -479,7 +499,8 @@ class TestThreatFoxAdapter:
         with patch("httpx.AsyncClient", mock_class):
             r = await a.lookup("1.2.3.4", "ipv4")
         assert r.verdict == "unknown"
-        assert r.raw_score == 0.0
+        assert r.execution_state == "not_found"
+        assert r.raw_score is None
 
     @pytest.mark.asyncio
     async def test_no_result(self):
@@ -490,7 +511,8 @@ class TestThreatFoxAdapter:
         with patch("httpx.AsyncClient", mock_class):
             r = await a.lookup("1.2.3.4", "ipv4")
         assert r.verdict == "unknown"
-        assert r.raw_score == 0.0
+        assert r.execution_state == "not_found"
+        assert r.raw_score is None
 
     @pytest.mark.asyncio
     async def test_malicious_response(self):
@@ -512,9 +534,11 @@ class TestThreatFoxAdapter:
             r = await a.lookup("1.2.3.4", "ipv4")
         assert r.verdict == "malicious"
         assert r.raw_score == 1.0
-        assert r.malware_family == "Emotet"
+        # The family shown is ThreatFox's printable name.
+        assert r.malware_family == "Emotet Malware"
         assert "emotet" in r.tags
         assert "c2" in r.tags
+        assert r.raw_data["match_type"] == "exact"
         assert r.reports_count == 2
         assert r.first_seen is not None
         assert r.last_seen is not None
@@ -545,7 +569,9 @@ class TestThreatFoxAdapter:
         assert r.verdict == "unknown"
         assert r.status == "not_found"
         assert r.reports_count == 0
-        assert any("filtered_junk_entries" in t for t in r.tags)
+        # The filtered count is structured data, not a tag.
+        assert r.raw_data["filtered_low_quality_count"] == 2
+        assert r.raw_data["match_count"] == 0
 
     @pytest.mark.asyncio
     async def test_junk_entries_excluded_from_kept_count(self):
@@ -567,7 +593,7 @@ class TestThreatFoxAdapter:
         with patch("httpx.AsyncClient", mock_class):
             r = await a.lookup("1.2.3.4", "ipv4")
         assert r.verdict == "malicious"
-        assert r.malware_family == "Emotet"
+        assert r.malware_family == "Emotet Malware"
         assert "emotet" in r.tags
         assert r.reports_count == 1
         assert "test" not in r.tags
@@ -608,7 +634,8 @@ class TestMalwareBazaarAdapter:
         with patch("httpx.AsyncClient", mock_class):
             r = await a.lookup("d41d8cd98f00b204e9800998ecf8427e", "md5")
         assert r.verdict == "unknown"
-        assert r.raw_score == 0.0
+        assert r.execution_state == "not_found"
+        assert r.raw_score is None
 
     @pytest.mark.asyncio
     async def test_not_found(self):
@@ -619,7 +646,8 @@ class TestMalwareBazaarAdapter:
         with patch("httpx.AsyncClient", mock_class):
             r = await a.lookup("d41d8cd98f00b204e9800998ecf8427e", "md5")
         assert r.verdict == "unknown"
-        assert r.raw_score == 0.0
+        assert r.execution_state == "not_found"
+        assert r.raw_score is None
 
     @pytest.mark.asyncio
     async def test_malicious_response(self):
@@ -647,9 +675,24 @@ class TestMalwareBazaarAdapter:
         assert r.raw_score == 1.0
         assert r.confidence == "high"
         assert r.malware_family == "Emotet"
-        tags_str = " ".join(r.tags)
-        assert "exe" in tags_str
-        assert "Emotet" in tags_str
+        # File type is a category and the family is malware_family; tags
+        # carry only the sample's own short labels.
+        assert r.categories == ["exe"]
+        assert "emotet" in r.tags
+        assert "loader" in r.tags
+        assert r.raw_data["signature"] == "Emotet"
+        assert r.raw_data["file_name"] == "invoice.exe"
+
+    @pytest.mark.asyncio
+    async def test_record_for_a_different_hash_is_not_a_match(self):
+        data = {"query_status": "ok", "data": [{"sha256_hash": "def456", "signature": "Emotet"}]}
+        a = MalwareBazaarAdapter()
+        a.api_key = "valid"
+        mock_class, _ = _mock_async_client(json_data=data)
+        with patch("httpx.AsyncClient", mock_class):
+            r = await a.lookup("abc123", "sha256")
+        assert r.verdict == "unknown"
+        assert r.execution_state == "not_found"
 
     @pytest.mark.asyncio
     async def test_null_optional_metadata_is_filtered(self):
@@ -691,7 +734,8 @@ class TestUrlScanIOAdapter:
         mock_class, _ = _mock_async_client(status_code=401)
         with patch("httpx.AsyncClient", mock_class):
             r = await a.lookup("8.8.8.8", "ipv4")
-        assert r.verdict == "error"
+        assert r.verdict == "unknown"
+        assert r.execution_state == "unavailable"
         assert "invalid_api_key" in r.tags
 
     @pytest.mark.asyncio
@@ -703,13 +747,14 @@ class TestUrlScanIOAdapter:
         with patch("httpx.AsyncClient", mock_class):
             r = await a.lookup("evil.com", "domain")
         assert r.verdict == "unknown"
-        assert r.raw_score == 0.0
+        assert r.execution_state == "not_found"
+        assert r.raw_score is None
 
     @pytest.mark.asyncio
     async def test_malicious_response(self):
         data = {
             "results": [
-                {"page": {"tags": ["phishing", "malware"]}, "result": {"verdicts": {"overall": {"malicious": True, "score": 95}}},
+                {"page": {}, "result": {"verdicts": {"overall": {"malicious": True, "score": 95, "tags": ["phishing", "malware"]}}},
                  "task": {"url": "http://evil.com/login", "time": "2024-05-01T12:00:00Z", "reportURL": "https://urlscan.io/result/abc/"}, "categories": ["phishing"]},
                 {"page": {"tags": ["phishing"]}, "result": {"verdicts": {"overall": {"malicious": True, "score": 80}}},
                  "task": {"url": "http://evil.com/admin", "time": "2024-04-01T12:00:00Z", "reportURL": ""}, "categories": ["malware"]},

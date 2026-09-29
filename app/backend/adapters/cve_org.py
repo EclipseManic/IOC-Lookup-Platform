@@ -1,4 +1,12 @@
+from app.backend.adapters._http import MalformedResponse, http_failure, malformed, read_json
 from app.backend.adapters.base import NormalizedResult, RateLimitConfig, SourceAdapter
+
+def _as_vulnerability(result):
+    """Failures for CVE lookups stay in the vulnerability domain, where a
+    verdict is never used (the execution state carries the failure)."""
+    result.assessment_domain = "vulnerability"
+    result.verdict = "unknown"
+    return result
 
 
 class CveOrgAdapter(SourceAdapter):
@@ -29,18 +37,20 @@ class CveOrgAdapter(SourceAdapter):
             timeout=10,
         )
 
-        if resp.status_code == 404:
-            return NormalizedResult(
-                ioc=cve_id, ioc_type=ioc_type, source=self.name,
-                verdict="unknown", provider_verdict="record_not_found", raw_score=0.0, status="not_found", assessment_domain="vulnerability",
-            )
-        if resp.status_code != 200:
-            return NormalizedResult(
-                ioc=cve_id, ioc_type=ioc_type, source=self.name,
-                verdict="unknown", provider_verdict="provider_error", tags=[f"http_{resp.status_code}"], assessment_domain="vulnerability",
-            )
-
-        data = resp.json()
+        failed = http_failure(self.name, cve_id, ioc_type, resp, key_sent=False, not_found_summary="cve.org has no record of this CVE")
+        if failed is not None:
+            _as_vulnerability(failed)
+            return failed
+        try:
+            data = read_json(resp)
+        except MalformedResponse as exc:
+            failed = malformed(self.name, cve_id, ioc_type, exc.reason, resp.status_code)
+            _as_vulnerability(failed)
+            return failed
+        if not isinstance(data, dict):
+            failed = malformed(self.name, cve_id, ioc_type, http_status=resp.status_code)
+            _as_vulnerability(failed)
+            return failed
         meta = data.get("cveMetadata") or {}
         cna = (data.get("containers") or {}).get("cna") or {}
 
@@ -93,25 +103,13 @@ class CveOrgAdapter(SourceAdapter):
             if label:
                 affected.append(label)
 
+        # Labels only: CVSS, CWE, assigner and reference values are typed
+        # fields on the result and in raw_data.
         tags = []
         if description:
             tags.append("record_found")
-        if assigner:
-            tags.append(f"assigner:{assigner}")
-        if state:
-            tags.append(f"state:{state}")
-        if base_score is not None:
-            tags.append(f"cvss:{base_score}")
-            tags.append(f"severity:{severity}" if severity else f"severity:{_severity_label(base_score)}")
-        for cwe in cwes[:5]:
-            tags.append(f"cwe:{cwe}")
-        if references:
-            tags.append(f"references:{len(references)}")
-
         if state == "REJECTED":
             tags.append("rejected")
-
-        tags = list(dict.fromkeys(tags))
 
         # CVSS and CVE lifecycle state are vulnerability semantics.  They must
         # not be emitted as malicious/suspicious reputation verdicts.
@@ -152,9 +150,13 @@ class CveOrgAdapter(SourceAdapter):
                 "cve_id": cve_id,
                 "state": state,
                 "description": description[:500],
+                "assigner": assigner,
                 "cvss": cvss,
+                "cvss_score": base_score,
+                "severity": (severity or (_severity_label(base_score) if base_score is not None else "")).lower() or None,
                 "cwes": cwe_values,
                 "references": references[:20],
+                "reference_count": len(references),
                 "affected": affected[:50],
             },
         )

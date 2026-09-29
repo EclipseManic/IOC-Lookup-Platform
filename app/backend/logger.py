@@ -205,4 +205,26 @@ _ioc_logger.propagate = False
 def get_logger(name: str) -> logging.Logger:
     return logging.getLogger(f"ioc-platform.{name}")
 
-__all__ = ["get_logger", "_correlation_id", "configure_logging"]
+
+def describe_exception(exc: BaseException, limit: int = 300) -> str:
+    """Return a never-empty, redacted, bounded description of an exception.
+
+    Many network exceptions (``httpx.ConnectError()``, ``asyncio.TimeoutError()``,
+    ``ReadTimeout('')``) have an empty ``str()``, which previously produced log
+    lines such as ``"Provider failed: "``.  This always includes the exception
+    type, falls back to ``repr`` when the message is empty, and appends the
+    direct cause/context type (httpx wraps the underlying socket error).
+    """
+    message = str(exc).strip()
+    text = f"{type(exc).__name__}: {message}" if message else f"{type(exc).__name__} ({exc!r})"
+    cause = exc.__cause__ or exc.__context__
+    if cause is not None and cause is not exc:
+        cause_message = str(cause).strip()
+        text += f" <- {type(cause).__name__}" + (f": {cause_message}" if cause_message else "")
+    text = _redact_text(text)
+    if len(text) > limit:
+        text = text[: max(0, limit - 3)] + "..."
+    return text
+
+
+__all__ = ["get_logger", "_correlation_id", "configure_logging", "describe_exception"]

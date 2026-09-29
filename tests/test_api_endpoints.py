@@ -35,7 +35,14 @@ async def client(tmp_path):
     async with AsyncClient(transport=transport, base_url="http://localhost") as c:
         yield c
     app.dependency_overrides.clear()
-    from app.backend.batch import _batch_runners, shutdown_batch_tasks
+    from app.backend.batch import _batch_runners, _persist_tasks, shutdown_batch_tasks
+    # Let background batch work (fake analyses + SQLite persistence) finish
+    # inside this test's event loop.  Cancelling it mid-query leaves an
+    # aiosqlite worker thread that later calls back into the closed loop
+    # ("RuntimeError: Event loop is closed").
+    background = [t for t in (*_batch_runners.values(), *_persist_tasks) if not t.done()]
+    if background:
+        await asyncio.wait(background, timeout=5)
     await shutdown_batch_tasks()
     runners = list(_batch_runners.values())
     for runner in runners:
@@ -76,7 +83,7 @@ def _monkey_pipeline(monkeypatch):
     from app.backend import batch as batch_mod
     from app.backend import pipeline as pipeline_mod
 
-    async def fake_run_analysis(ioc_value, task_id=None, fp_override=False, ioc_type_override=None, bypass_cache=False, password_prehashed=False):
+    async def fake_run_analysis(ioc_value, task_id=None, fp_override=False, ioc_type_override=None, bypass_cache=False, password_prehashed=False, ioc_deadline=None):
         task = _make_task(ioc_value)
         task.task_id = task_id or task.task_id
         if ioc_type_override:

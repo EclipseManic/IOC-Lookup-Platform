@@ -11,15 +11,28 @@ Endpoints used:
 
 All responses are parsed for infostealer infection data, stealer families, compromised credentials,
 and related threat intelligence.
+
+Semantics: an infostealer log that *mentions* an IP or domain (a victim
+machine resolved it, a victim logged in to it) is exposure context about that
+infrastructure, never evidence that the indicator is malicious.  For an email
+or username it is credential exposure.  The adapter therefore never emits a
+malicious verdict; exposure is carried by ``provider_verdict``, the
+``infostealer_compromised`` tag and the typed counts in ``raw_data``.
+
+HUDSON_API_KEY is not sent: the Cavalier OSINT endpoints above are keyless,
+and the keyed ``api.hudsonrock.com/json/v3`` API uses a different request and
+response contract.
 """
+
+import asyncio
 
 import httpx
 
+from app.backend.adapters._http import describe_exception, exception_result, failure, http_failure
 from app.backend.adapters.base import (
     NormalizedResult,
     RateLimitConfig,
     SourceAdapter,
-    retry_after_seconds,
 )
 from app.backend.logger import get_logger
 
@@ -40,6 +53,11 @@ class HudsonRockAdapter(SourceAdapter):
     # Public API: 50 req / 10s = 300 req/min; we stay conservative at 120/min
     rate_limit = RateLimitConfig(requests_per_minute=120, requests_per_day=10_000)
     public_without_key = True  # No API key needed
+    evidence_roles = ("exposure",)
+    direct_threat_evidence = False
+    produces_reputation = False
+    produces_infrastructure_context = True
+    produces_metadata = True
 
     def __init__(self):
         super().__init__()
@@ -47,13 +65,9 @@ class HudsonRockAdapter(SourceAdapter):
 
     async def lookup(self, ioc_value: str, ioc_type: str) -> NormalizedResult:
         if ioc_type not in self.supported_types:
-            return NormalizedResult(
-                ioc=ioc_value,
-                ioc_type=ioc_type,
-                source=self.name,
-                verdict="unknown",
-                execution_state="not_applicable",
-                tags=["unsupported_provider_type"],
+            return failure(
+                self.name, ioc_value, ioc_type, "not_applicable", ["unsupported_provider_type"],
+                f"Hudson Rock does not support {ioc_type} lookups", request_made=False,
             )
 
         client = self._get_client()
@@ -76,101 +90,72 @@ class HudsonRockAdapter(SourceAdapter):
             url = f"{_BASE}/search-by-domain"
             params = {"domain": domain}
         else:
-            return NormalizedResult(
-                ioc=ioc_value, ioc_type=ioc_type, source=self.name,
-                verdict="unknown", execution_state="not_applicable",
-                tags=["unsupported_provider_type"],
+            return failure(
+                self.name, ioc_value, ioc_type, "not_applicable", ["unsupported_provider_type"],
+                f"Hudson Rock does not support {ioc_type} lookups", request_made=False,
             )
 
-        try:
-            resp = await client.get(url, params=params, headers=_HEADERS, timeout=15)
-        except httpx.TimeoutException:
-            return NormalizedResult(
-                ioc=ioc_value, ioc_type=ioc_type, source=self.name,
-                verdict="error", execution_state="timeout", tags=["timeout"],
-            )
-        except httpx.HTTPError as exc:
-            logger.warning("Hudson Rock request failed: %s", exc)
-            return NormalizedResult(
-                ioc=ioc_value, ioc_type=ioc_type, source=self.name,
-                verdict="error", execution_state="error", tags=["request_error"],
-            )
-
-        if resp.status_code == 429:
-            return NormalizedResult(
-                ioc=ioc_value, ioc_type=ioc_type, source=self.name,
-                verdict="unknown", execution_state="rate_limited",
-                tags=["rate_limited"], http_status=429,
-                retry_after_seconds=retry_after_seconds(resp),
-            )
-
-        if resp.status_code == 404:
-            return NormalizedResult(
-                ioc=ioc_value, ioc_type=ioc_type, source=self.name,
-                status="not_found", verdict="clean", execution_state="success",
-                raw_score=0.0, tags=["no_infostealer_compromise"],
-                source_link="https://www.hudsonrock.com/",
-                provider_summary="No infostealer infection found in Hudson Rock database",
-                http_status=404,
-            )
-
-        if resp.status_code == 400:
-            err_text = ""
-            try:
-                err_text = resp.text
-            except Exception:
-                pass
-            logger.info("Hudson Rock restricted domain query for %s: %s", ioc_value, err_text)
-            return NormalizedResult(
-                ioc=ioc_value, ioc_type=ioc_type, source=self.name,
-                status="not_found", verdict="unknown", execution_state="success",
-                raw_score=0.0, tags=["domain_search_restricted"],
-                source_link="https://www.hudsonrock.com/",
-                provider_summary="Hudson Rock limits infostealer search on broad public domains",
-                http_status=400,
-            )
-
-        if resp.status_code not in (200, 201):
-            logger.warning("Hudson Rock unexpected status %s for %s", resp.status_code, ioc_value)
-            return NormalizedResult(
-                ioc=ioc_value, ioc_type=ioc_type, source=self.name,
-                verdict="error", execution_state="error",
-                tags=[f"http_{resp.status_code}"], http_status=resp.status_code,
-            )
-
-        try:
-            data = resp.json()
-        except Exception:
-            return NormalizedResult(
-                ioc=ioc_value, ioc_type=ioc_type, source=self.name,
-                verdict="error", execution_state="error",
-                tags=["malformed_response"],
-            )
-        if not isinstance(data, dict):
-            return NormalizedResult(
-                ioc=ioc_value, ioc_type=ioc_type, source=self.name,
-                verdict="error", execution_state="error",
-                tags=["malformed_response"],
-            )
-
-        # For domain lookups, also query urls-by-domain for compromised URLs
-        if ioc_type in ("domain", "url"):
-            domain_val = ioc_value
-            if "://" in domain_val:
-                domain_val = domain_val.split("://", 1)[1].split("/")[0]
+        async def _urls_by_domain() -> dict | None:
             try:
                 urls_resp = await client.get(
                     f"{_BASE}/urls-by-domain",
-                    params={"domain": domain_val},
+                    params={"domain": params["domain"]},
                     headers=_HEADERS,
                     timeout=10,
                 )
                 if urls_resp.status_code == 200:
                     urls_data = urls_resp.json()
-                    if isinstance(urls_data, dict):
-                        data["_urls_by_domain"] = urls_data
+                    return urls_data if isinstance(urls_data, dict) else None
             except Exception as exc:
-                logger.debug("Hudson Rock urls-by-domain failed: %s", exc)
+                logger.debug("Hudson Rock urls-by-domain failed: %s", describe_exception(exc))
+            return None
+
+        # The optional urls-by-domain context request runs concurrently with
+        # the main search instead of after it.
+        urls_task = asyncio.ensure_future(_urls_by_domain()) if "domain" in params else None
+        try:
+            resp = await client.get(url, params=params, headers=_HEADERS, timeout=15)
+        except (httpx.HTTPError, OSError) as exc:
+            if urls_task is not None:
+                urls_task.cancel()
+            logger.warning("Hudson Rock request failed for %s: %s", ioc_value, describe_exception(exc))
+            return exception_result(self.name, ioc_value, ioc_type, exc)
+
+        if resp.status_code == 400:
+            if urls_task is not None:
+                urls_task.cancel()
+            err_text = resp.text if isinstance(getattr(resp, "text", None), str) else ""
+            logger.info("Hudson Rock rejected query for %s: %s", ioc_value, err_text[:200])
+            return failure(
+                self.name, ioc_value, ioc_type, "invalid_request", ["domain_search_restricted", "invalid_request"],
+                "Hudson Rock does not search broad public domains; no exposure data for this indicator",
+                http_status=400,
+            )
+        failed = http_failure(
+            self.name, ioc_value, ioc_type, resp, key_sent=False,
+            not_found_summary="No infostealer record for this indicator",
+        )
+        if failed is not None:
+            if urls_task is not None:
+                urls_task.cancel()
+            return failed
+
+        try:
+            data = resp.json()
+        except Exception:
+            data = None
+        if not isinstance(data, dict):
+            if urls_task is not None:
+                urls_task.cancel()
+            return failure(
+                self.name, ioc_value, ioc_type, "error", ["malformed_response"],
+                "Hudson Rock returned a malformed response", http_status=resp.status_code,
+            )
+
+        if urls_task is not None:
+            urls_data = await urls_task
+            if urls_data:
+                data["_urls_by_domain"] = urls_data
 
         return self._parse_response(ioc_value, ioc_type, data)
 
@@ -252,65 +237,49 @@ class HudsonRockAdapter(SourceAdapter):
             if isinstance(urls_list, list):
                 total_compromised_urls = len(urls_list)
 
-        # Build tags
+        exposed = infection_count > 0 or total_credentials > 0
+        credential_target = ioc_type in ("email", "username")
+        # Tags are labels only; counts live in raw_data.  The
+        # ``infostealer_compromised`` label is the stable exposure marker read
+        # by the evidence layer.
         tags: list[str] = []
-        if infection_count > 0:
+        if exposed:
             tags.append("infostealer_compromised")
-            tags.append(f"infections:{infection_count}")
-        if total_credentials > 0:
-            tags.append(f"credentials_at_risk:{total_credentials}")
-        if total_corporate > 0:
-            tags.append(f"corporate_services:{total_corporate}")
-        if infection_count > 0 or total_credentials > 0:
-            for f in families[:5]:
-                tags.append(f"stealer:{f}")
-            if top_services:
-                for svc in top_services[:3]:
-                    tags.append(f"exposed_service:{svc}")
+            tags.append("credential_exposure" if credential_target else "infrastructure_exposure")
 
-        # Build a concise human-readable summary
-        if infection_count == 0 and total_credentials == 0:
-            provider_summary = "No infostealer compromise observed"
+        if not exposed:
+            provider_summary = "No infostealer record for this indicator"
         else:
-            parts = [f"{infection_count} infostealer infection{'s' if infection_count != 1 else ''} detected"]
+            noun = "credential exposure" if credential_target else "exposure context"
+            parts = [f"{infection_count} infostealer infection{'s' if infection_count != 1 else ''} ({noun})"]
             if total_credentials:
                 parts.append(f"{total_credentials} credentials at risk")
             if families:
                 parts.append(f"families: {', '.join(families[:4])}")
-            if total_corporate:
-                parts.append(f"{total_corporate} corporate services exposed")
             provider_summary = "; ".join(parts)
-
-        # Risk determination
-        if infection_count > 0 or total_credentials > 0:
-            verdict = "malicious"
-            raw_score = min(0.50 + (infection_count * 0.05) + (total_corporate * 0.02), 1.0)
-            confidence = "high" if infection_count >= 3 or total_corporate >= 5 else "medium"
-            status = "found"
-            execution_state = "success"
-            reports_count = infection_count if infection_count else None
-        else:
-            verdict = "clean"
-            raw_score = 0.0
-            confidence = "low"
-            status = "not_found"
-            execution_state = "success"
-            reports_count = None
 
         return NormalizedResult(
             ioc=ioc_value,
             ioc_type=ioc_type,
             source=self.name,
-            status=status,
-            verdict=verdict,
-            execution_state=execution_state,
-            raw_score=raw_score,
-            confidence=confidence,
-            reports_count=reports_count,
+            # Exposure is never a maliciousness verdict for the indicator.
+            verdict="unknown",
+            provider_verdict=(
+                ("credential_exposure" if credential_target else "infostealer_exposure") if exposed else "not_found"
+            ),
+            normalized_verdict="unknown" if exposed else "not_found",
+            execution_state="success" if exposed else "not_found",
+            status="found" if exposed else "not_found",
+            raw_score=None,
+            confidence=("high" if infection_count >= 3 else "medium") if exposed else "low",
+            reports_count=infection_count if infection_count else None,
+            malware_family=", ".join(families[:4]) if exposed and families else None,
             tags=tags,
             source_link="https://www.hudsonrock.com/",
             provider_summary=provider_summary,
             raw_data={
+                "exposure_type": ("credential" if credential_target else "infrastructure") if exposed else None,
+                "credentials_at_risk": total_credentials,
                 "total_infections": infection_count,
                 "total_corporate_services": total_corporate,
                 "total_user_services": total_user,

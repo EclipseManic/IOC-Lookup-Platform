@@ -51,7 +51,8 @@ async def test_hibp_adapter_clean_hash():
     
     result = await adapter.lookup(sha1, "sha1")
     assert result.source == "HIBP Pwned Passwords"
-    assert result.verdict == "clean"
+    # Absence from the breach corpus is "not observed", never "clean".
+    assert result.verdict == "undetected"
     assert "not_in_pwned_passwords" in result.tags
 
 
@@ -98,9 +99,15 @@ async def test_hudson_rock_with_compromise():
     
     result = await adapter.lookup("victim@example.com", "email")
     assert result.source == "Hudson Rock"
-    assert result.verdict == "malicious"
+    # Infostealer exposure is context/credential exposure, never a
+    # maliciousness verdict for the indicator.
+    assert result.verdict == "unknown"
+    assert result.provider_verdict == "credential_exposure"
+    assert result.execution_state == "success"
     assert "infostealer_compromised" in result.tags
-    assert "stealer:RedLine" in result.tags
+    assert result.raw_data["total_infections"] == 1
+    assert result.raw_data["stealer_families"] == {"RedLine": 1}
+    assert result.raw_data["credentials_at_risk"] == 5
 
 
 @pytest.mark.asyncio
@@ -116,8 +123,10 @@ async def test_hudson_rock_clean():
     
     result = await adapter.lookup("clean@example.com", "email")
     assert result.source == "Hudson Rock"
-    assert result.verdict == "clean"
-    assert "no_infostealer_compromise" in result.tags
+    # No record is "not found", not a clean verdict.
+    assert result.verdict == "unknown"
+    assert result.execution_state == "not_found"
+    assert "infostealer_compromised" not in result.tags
 
 
 def test_adapters_registered_in_pipeline():

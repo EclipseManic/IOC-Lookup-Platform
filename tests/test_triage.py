@@ -49,7 +49,8 @@ class TestTriageAdapter:
         with patch("httpx.AsyncClient", mock):
             r = await a.lookup("d41d8cd98f00b204e9800998ecf8427e", "md5")
         assert r.verdict == "unknown"
-        assert r.raw_score == 0.0
+        assert r.execution_state == "not_found"
+        assert r.raw_score is None
 
     @pytest.mark.asyncio
     async def test_401_unauthorized(self):
@@ -58,8 +59,9 @@ class TestTriageAdapter:
         mock = _mock_client(status_code=401)
         with patch("httpx.AsyncClient", mock):
             r = await a.lookup("d41d8cd98f00b204e9800998ecf8427e", "md5")
-        assert r.verdict == "error"
-        assert "http_401" in r.tags
+        assert r.verdict == "unknown"
+        assert r.execution_state == "unavailable"
+        assert "invalid_api_key" in r.tags
 
     @pytest.mark.asyncio
     async def test_malicious_response(self):

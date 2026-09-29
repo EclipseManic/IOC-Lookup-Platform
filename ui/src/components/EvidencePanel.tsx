@@ -1,5 +1,7 @@
 import { useEffect, useMemo, useState } from "react";
 import { getSourceInventory, type LookupResponse, type SourceInventoryItem } from "../services/api";
+import { formatDateTime, formatDuration } from "../lib/format";
+import { problemReason } from "../lib/providerEvidence";
 
 function StatusPill({ value }: { value: string }) {
   const normalized = value.toLowerCase();
@@ -26,12 +28,13 @@ export default function EvidencePanel({ result }: { result: LookupResponse }) {
 
   const evidence = useMemo(() => {
     const state = (item: { execution_state?: string; status: string }) => item.execution_state || item.status;
-    const found = result.results.filter((item) => ["success", "found"].includes(state(item)) && item.verdict !== "error");
-    const notFound = result.results.filter((item) => state(item) === "not_found");
-    const notApplicable = result.results.filter((item) => state(item) === "not_applicable");
-    const unavailable = result.results.filter((item) => !["success", "found", "not_found", "not_applicable"].includes(state(item)));
+    const rows = Array.isArray(result.results) ? result.results : [];
+    const found = rows.filter((item) => ["success", "found"].includes(state(item)) && item.verdict !== "error");
+    const notFound = rows.filter((item) => state(item) === "not_found");
+    const notApplicable = rows.filter((item) => state(item) === "not_applicable");
+    const unavailable = rows.filter((item) => !["success", "found", "not_found", "not_applicable"].includes(state(item)));
     const sightings = found.reduce((total, item) => total + (item.reports_count ?? 0), 0);
-    const related = result.relationships.length + result.results.reduce((total, item) => total + (item.related_iocs?.length ?? 0), 0);
+    const related = (result.relationships?.length ?? 0) + rows.reduce((total, item) => total + (item.related_iocs?.length ?? 0), 0);
     const artifacts = found.reduce((total, item) => total + (item.samples?.length ?? 0) + (item.dropped_files?.length ?? 0) + (item.network_iocs?.length ?? 0), 0);
     return { found, notFound, notApplicable, unavailable, sightings, related, artifacts };
   }, [result]);
@@ -39,7 +42,7 @@ export default function EvidencePanel({ result }: { result: LookupResponse }) {
   const applicable = sources.filter((source) => source.supported_types.includes(result.ioc_type));
   const missing = applicable.filter((source) => !source.public_without_key && !source.configured);
   const health = result.provider_health ?? result.final_assessment?.provider_health ?? [];
-  const actionableResults = result.results.filter((item) => (item.execution_state || item.status) !== "not_applicable");
+  const actionableResults = (Array.isArray(result.results) ? result.results : []).filter((item) => (item.execution_state || item.status) !== "not_applicable");
   const plannedNotApplicable = (result.final_assessment?.provider_plan ?? []).filter((item) => item.applicable === false).map((item) => String(item.provider ?? "Unknown provider"));
   const notApplicableSources = evidence.notApplicable.length > 0 ? evidence.notApplicable.map((item) => item.source) : plannedNotApplicable;
 
@@ -68,12 +71,14 @@ export default function EvidencePanel({ result }: { result: LookupResponse }) {
             <div key={item.source} className="p-4 border-b border-border last:border-0 grid grid-cols-1 md:grid-cols-[minmax(0,1fr)_auto] gap-2">
               <div>
                 <div className="flex items-center gap-2"><span className="font-medium text-sm">{item.source}</span><StatusPill value={state} /></div>
-                <p className="text-xs text-text-secondary mt-1">Provider verdict: {item.provider_verdict ?? item.verdict} · normalized: {item.normalized_verdict ?? item.verdict} · confidence: {item.confidence}</p>
+                {["success", "found", "not_found"].includes(state)
+                  ? <p className="text-xs text-text-secondary mt-1">Provider verdict: {item.provider_verdict ?? item.verdict} · normalized: {item.normalized_verdict ?? item.verdict} · confidence: {item.confidence}</p>
+                  : <p className="text-xs text-amber-200/90 mt-1">{problemReason(item)}</p>}
                 <p className="text-[11px] text-text-secondary mt-1">
                   {item.cached ? `Cached${item.cache_age != null ? ` ${Math.round(item.cache_age / 60)}m old` : ""}` : "Fresh lookup"}
-                  {item.latency_ms != null ? ` · ${Math.round(item.latency_ms)}ms` : ""}
+                  {item.latency_ms != null ? ` · ${formatDuration(item.latency_ms)}` : ""}
                   {(item.retry_count ?? 0) > 0 ? ` · ${item.retry_count} retries` : ""}
-                  {item.source_timestamp ? ` · source time: ${new Date(item.source_timestamp).toLocaleString()}` : ""}
+                  {item.source_timestamp ? ` · source time: ${formatDateTime(item.source_timestamp)}` : ""}
                 </p>
                 <p className="text-[11px] text-text-secondary mt-1">Assessment domain: {item.assessment_domain ?? result.final_assessment?.assessment_domain ?? "ioc_reputation"}{item.provenance_family ? ` · provenance: ${item.provenance_family}` : ""}{item.evidence_items?.length ? ` · ${item.evidence_items.length} nested evidence item(s)` : ""}</p>
               </div>
@@ -86,11 +91,11 @@ export default function EvidencePanel({ result }: { result: LookupResponse }) {
 
       <div className="bg-bg-card border border-border rounded-lg p-4">
         <h3 className="text-sm font-semibold text-text-secondary uppercase tracking-wider mb-2">Coverage for {result.ioc_type}</h3>
-        {result.final_assessment && <p className="text-xs text-text-secondary mb-3">Evaluated coverage: <span className="text-text-primary">{Math.round(result.final_assessment.coverage * 100)}%</span> · cache status: <span className="text-text-primary">{result.final_assessment.cache_status}</span></p>}
+        {result.final_assessment && <p className="text-xs text-text-secondary mb-3">Evaluated coverage: <span className="text-text-primary">{Math.round((Number(result.final_assessment.coverage) || 0) * 100)}%</span> · cache status: <span className="text-text-primary">{result.final_assessment.cache_status}</span></p>}
         {applicable.length === 0 ? <p className="text-sm text-text-secondary">No reputation adapter is implemented for this IOC type; displayed data is contextual enrichment only.</p> : <div className="flex flex-wrap gap-2">{applicable.map((source) => <StatusPill key={source.name} value={`${source.name}: ${sourceState(source)}`} />)}</div>}
         {missing.length > 0 && <p className="text-xs text-amber-400 mt-3">Not queried because credentials are absent: {missing.map((source) => source.name).join(", ")}.</p>}
         {notApplicableSources.length > 0 && <p className="text-xs text-cyan-300 mt-3">Not applicable by provider capability: {notApplicableSources.join(", ")}.</p>}
-        {evidence.unavailable.length > 0 && <p className="text-xs text-verdict-malicious mt-2">Unavailable during this lookup: {evidence.unavailable.map((item) => `${item.source} (${item.execution_state || item.status})`).join(", ")}.</p>}
+        {evidence.unavailable.length > 0 && <p className="text-xs text-verdict-malicious mt-2">Unavailable during this lookup: {evidence.unavailable.map((item) => `${item.source} (${problemReason(item)})`).join(", ")}.</p>}
       </div>
 
       {health.length > 0 && <div className="bg-bg-card border border-border rounded-lg p-4"><h3 className="text-sm font-semibold text-text-secondary uppercase tracking-wider mb-2">Provider health</h3><div className="space-y-1">{health.map((item) => <div key={item.source} className="flex flex-wrap items-center justify-between gap-2 text-xs"><span>{item.source}</span><span className="text-text-secondary">{item.request_count} network attempts · {item.success_count} observations · {item.failure_count} failures{item.rate_limit_count ? ` · ${item.rate_limit_count} rate-limited` : ""}{item.cache_hit_count ? ` · ${item.cache_hit_count} cache hits` : ""}</span></div>)}</div></div>}

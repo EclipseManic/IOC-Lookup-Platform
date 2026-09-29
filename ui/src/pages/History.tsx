@@ -3,7 +3,19 @@ import { deleteRecentIOC, getRecentIOCs, getBatchesFromServer, deleteBatchFromSe
 import { showToast } from "../components/Toast";
 import type { NavigateEvent } from "../App";
 import { timeAgo } from "../lib/timeAgo";
-import { getVerdictColor } from "../lib/verdictColors";
+import { formatVerdictLabel, getVerdictBucket, getVerdictColor } from "../lib/verdictColors";
+import { formatDateTime } from "../lib/format";
+
+const SCORELESS = new Set(["context_only", "malicious_test_artifact", "unknown", "error"]);
+
+/** A stored score of 0 on a verdict that carries no score means "not scored", not "clean". */
+function displayScore(item: RecentIOC): string | null {
+  const verdict = item.final_verdict ?? item.verdict;
+  const score = item.final_score ?? item.score;
+  if (score === null || score === undefined || !Number.isFinite(score)) return null;
+  if (SCORELESS.has(getVerdictBucket(verdict)) && score === 0) return null;
+  return `${Math.round(score)}/100`;
+}
 import Modal from "../components/Modal";
 
 function VerdictBadge({ label, count }: { label: string; count: number }) {
@@ -214,7 +226,7 @@ export default function History() {
                       <VerdictBadge label="error" count={summary.error ?? 0} />
                     </div>
                     <div className="mt-1 text-[10px] text-text-secondary">
-                      {batch.created_at ? new Date(batch.created_at).toLocaleString() : "—"}
+                      {formatDateTime(batch.created_at)}
                     </div>
                   </div>
 
@@ -305,24 +317,16 @@ export default function History() {
                 <span className="text-[10px] font-mono px-1.5 py-0.5 bg-bg-elevated rounded text-text-secondary uppercase">
                   {item.ioc_type}
                 </span>
-                {item.score !== null && (
-                  <span className="text-xs text-text-secondary">Score: {item.score.toFixed(0)}/100</span>
+                {displayScore(item) && (
+                  <span className="text-xs text-text-secondary">Score: {displayScore(item)}</span>
                 )}
               </div>
             </div>
 
             <div className="flex items-center gap-3">
-              {item.verdict && (
-                <span className={
-                  "text-xs font-medium px-2 py-0.5 rounded " +
-                  (item.verdict === "malicious" || item.verdict === "compromised" ? "text-verdict-malicious bg-verdict-malicious/10" :
-                   item.verdict === "breached" ? "text-rose-400 bg-rose-500/10 border border-rose-500/30" :
-                   item.verdict === "not_breached" ? "text-emerald-400 bg-emerald-500/10 border border-emerald-500/30" :
-                   item.verdict === "suspicious" ? "text-verdict-suspicious bg-verdict-suspicious/10" :
-                   item.verdict === "clean" || item.verdict === "benign" ? "text-verdict-clean bg-verdict-clean/10" :
-                   "text-verdict-unknown bg-verdict-unknown/10")
-                }>
-                  {item.verdict.replace(/_/g, " ")}
+              {(item.final_verdict ?? item.verdict) && (
+                <span className={`text-xs font-medium px-2 py-0.5 rounded border ${getVerdictColor(item.final_verdict ?? item.verdict).badge}`}>
+                  {formatVerdictLabel(item.final_verdict ?? item.verdict)}
                 </span>
               )}
               <button
@@ -336,7 +340,7 @@ export default function History() {
                 </svg>
               </button>
               {item.created_at && (
-                <span className="text-xs text-text-secondary hidden sm:block whitespace-nowrap" title={new Date(item.created_at).toLocaleString()}>
+                <span className="text-xs text-text-secondary hidden sm:block whitespace-nowrap" title={formatDateTime(item.created_at)}>
                   {timeAgo(item.created_at)}
                 </span>
               )}

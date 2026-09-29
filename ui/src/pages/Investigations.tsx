@@ -3,9 +3,12 @@ import Modal from "../components/Modal";
 import Tag from "../components/Tag";
 import { showToast } from "../components/Toast";
 import { timeAgo } from "../lib/timeAgo";
+import { formatDateTime } from "../lib/format";
+import { formatVerdictLabel, getVerdictColor } from "../lib/verdictColors";
 import type { InvestigationDetail, InvestigationSummary } from "../services/api";
 import {
   addIOCToInvestigation,
+  errorMessage,
   createInvestigation,
   deleteInvestigation,
   getInvestigation,
@@ -81,8 +84,8 @@ export default function Investigations() {
     try {
       const data = await listInvestigations();
       setInvestigations(data);
-    } catch (e: any) {
-      showToast(e.message, "error");
+    } catch (e: unknown) {
+      showToast(errorMessage(e), "error");
     }
     setLoading(false);
   }, []);
@@ -98,8 +101,8 @@ export default function Investigations() {
       setCreateDesc("");
       await loadList();
       showToast("Investigation created", "success");
-    } catch (e: any) {
-      showToast(e.message, "error");
+    } catch (e: unknown) {
+      showToast(errorMessage(e), "error");
     }
   }
 
@@ -109,8 +112,8 @@ export default function Investigations() {
       const data = await getInvestigation(id);
       setDetail(data);
       setView("detail");
-    } catch (e: any) {
-      showToast(e.message, "error");
+    } catch (e: unknown) {
+      showToast(errorMessage(e), "error");
     }
     setDetailLoading(false);
   }
@@ -122,8 +125,8 @@ export default function Investigations() {
       setView("list");
       await loadList();
       showToast("Investigation deleted", "success");
-    } catch (e: any) {
-      showToast(e.message, "error");
+    } catch (e: unknown) {
+      showToast(errorMessage(e), "error");
     }
   }
 
@@ -135,8 +138,8 @@ export default function Investigations() {
       const updated = await getInvestigation(detail.id);
       setDetail(updated);
       showToast("IOC added", "success");
-    } catch (e: any) {
-      showToast(e.message, "error");
+    } catch (e: unknown) {
+      showToast(errorMessage(e), "error");
     }
   }
 
@@ -147,8 +150,8 @@ export default function Investigations() {
       const updated = await getInvestigation(detail.id);
       setDetail(updated);
       showToast("IOC removed", "success");
-    } catch (e: any) {
-      showToast(e.message, "error");
+    } catch (e: unknown) {
+      showToast(errorMessage(e), "error");
     }
   }
 
@@ -160,8 +163,8 @@ export default function Investigations() {
       const updated = await getInvestigation(detail.id);
       setDetail(updated);
       showToast("Notes saved", "success");
-    } catch (e: any) {
-      showToast(e.message, "error");
+    } catch (e: unknown) {
+      showToast(errorMessage(e), "error");
     }
   }
 
@@ -244,16 +247,15 @@ export default function Investigations() {
                     </div>
                     <div className="flex items-center gap-3 text-xs">
                       {entry.verdict && (
-                        <span className={
-                          entry.verdict === "malicious" ? "text-verdict-malicious" :
-                          entry.verdict === "suspicious" ? "text-verdict-suspicious" :
-                          entry.verdict === "clean" ? "text-verdict-clean" : "text-verdict-unknown"
-                        }>
-                          {entry.verdict} ({entry.score?.toFixed(0) || "N/A"})
+                        <span className={getVerdictColor(entry.verdict).text}>
+                          {formatVerdictLabel(entry.verdict)}
+                          {entry.score != null && Number.isFinite(entry.score) && !(entry.score === 0 && getVerdictColor(entry.verdict).band === "unknown")
+                            ? ` (${Math.round(entry.score)}/100)`
+                            : ""}
                         </span>
                       )}
                       {entry.looked_up_at && (
-                        <span className="text-text-secondary" title={new Date(entry.looked_up_at).toLocaleString()}>{timeAgo(entry.looked_up_at)}</span>
+                        <span className="text-text-secondary" title={formatDateTime(entry.looked_up_at)}>{timeAgo(entry.looked_up_at)}</span>
                       )}
                     </div>
                   </div>

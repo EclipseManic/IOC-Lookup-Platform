@@ -37,7 +37,7 @@ export default function HomePage({
   autoRescan?: boolean;
   createdAt?: string;
 }) {
-  const { state, submit, reset, loadResult, loadStored } = useLookup();
+  const { state, submit, reset, cancel, loadResult, loadStored } = useLookup();
   const submittedRef = useRef<string | null>(null);
   const [keyHealth, setKeyHealth] = useState<KeyHealthResponse | null>(null);
   const routeSubmissionKey = `${initialType}\u0000${initialValue}`;
@@ -55,12 +55,10 @@ export default function HomePage({
       return;
     }
     if (isHistorical || historyId) {
-       submittedRef.current = routeSubmissionKey;
-      loadStored(historyId, initialValue, { isHistorical: true, historyId, scannedAt: createdAt }).then((success) => {
-        if (!success && initialValue) {
-           submit(initialValue, initialType || undefined);
-        }
-      });
+      submittedRef.current = routeSubmissionKey;
+      // A missing stored copy is reported with a "Run live lookup" action rather
+      // than silently spending provider quota on a fresh analysis.
+      void loadStored(historyId, initialValue, { isHistorical: true, historyId, scannedAt: createdAt }, initialType || undefined);
       return;
     }
      if (initialValue && submittedRef.current !== routeSubmissionKey) {
@@ -96,7 +94,7 @@ export default function HomePage({
         </div>
         <div className="hidden items-center gap-3 md:flex">
           <div className="flex items-center gap-2 rounded-lg border border-border bg-bg-card px-3 py-2 text-xs font-medium text-text-secondary"><span className="status-dot" aria-hidden="true" /><span>Systems online</span></div>
-          {keyHealth && <div className="rounded-lg border border-sky-500/25 bg-sky-500/5 px-3 py-2 text-xs text-sky-200" title={keyHealth.missing_keys.length ? `Missing: ${keyHealth.missing_keys.join(", ")}` : "All configured providers are active"}><span className="font-semibold">API coverage</span><span className="ml-2 font-mono">{keyHealth.active_providers}/{keyHealth.total_providers}</span></div>}
+          {keyHealth && <div className="rounded-lg border border-sky-500/25 bg-sky-500/5 px-3 py-2 text-xs text-sky-200" title={keyHealth.missing_keys?.length ? `Missing: ${keyHealth.missing_keys.join(", ")}` : "All configured providers are active"}><span className="font-semibold">API coverage</span><span className="ml-2 font-mono">{keyHealth.active_providers}/{keyHealth.total_providers}</span></div>}
         </div>
       </div>
 
@@ -118,19 +116,48 @@ export default function HomePage({
 
         {state.status === "loading" && (
           <div className="space-y-6">
-            <PipelineProgress stages={state.stages} progress={state.progress} />
+            <div className="flex flex-wrap items-center justify-between gap-3 rounded-lg border border-border bg-bg-card px-4 py-3" role="status">
+              <p className="text-sm text-text-secondary">
+                {state.message ?? (state.stages.length ? "Analysis running…" : "Preparing provider plan…")}
+              </p>
+              {state.taskId && (
+                <button
+                  type="button"
+                  onClick={cancel}
+                  className="rounded-md border border-border bg-bg-elevated px-3 py-1.5 text-xs text-text-secondary transition-colors hover:border-red-400/40 hover:text-red-400"
+                >
+                  Cancel lookup
+                </button>
+              )}
+            </div>
+            {state.stages.length > 0 && <PipelineProgress stages={state.stages} progress={state.progress} />}
             <SkeletonHeader />
             <SkeletonSourceGrid />
           </div>
         )}
 
         {state.status === "error" && (
-          <div className="bg-verdict-malicious/10 border border-verdict-malicious/30 rounded-lg p-4 text-center">
-            <p className="text-verdict-malicious font-medium mb-2">Error</p>
+          <div role="alert" className="bg-verdict-malicious/10 border border-verdict-malicious/30 rounded-lg p-4 text-center">
+            <p className="text-verdict-malicious font-medium mb-2">{state.storedOnly ? "Stored analysis unavailable" : "Lookup failed"}</p>
             <p className="text-sm text-text-secondary">{state.error}</p>
-            <button onClick={reset} className="mt-3 px-4 py-1.5 text-sm bg-accent text-[#06070d] rounded-lg hover:bg-accent/90 transition-colors">
-              Try Again
-            </button>
+            <div className="mt-3 flex flex-wrap justify-center gap-2">
+              {state.request && (
+                <button
+                  type="button"
+                  onClick={() => { if (state.request) submit(state.request.value, state.request.iocType, state.request.refresh); }}
+                  className="px-4 py-1.5 text-sm bg-accent text-[#06070d] rounded-lg hover:bg-accent/90 transition-colors"
+                >
+                  {state.storedOnly ? "Run live lookup" : "Retry lookup"}
+                </button>
+              )}
+              <button
+                type="button"
+                onClick={reset}
+                className="px-4 py-1.5 text-sm border border-border bg-bg-elevated text-text-secondary rounded-lg hover:text-text-primary transition-colors"
+              >
+                Dismiss
+              </button>
+            </div>
           </div>
         )}
 

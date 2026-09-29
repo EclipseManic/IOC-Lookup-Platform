@@ -7,7 +7,24 @@ search-based mutex/registry_key/named_pipe/service_name) are out of scope here.
 """
 
 from app.backend.adapters.base import is_valid_api_key
+from app.backend.config import settings
 from app.backend.pipeline import ADAPTERS
+
+# Types whose only provider adapter needs a key, but whose enrichment tab has a
+# key-free path. Ethereum: the Etherscan V2 API needs ETHERSCAN_API_KEY, while
+# enrichment.enrich_eth reads the public etherscan.io address page (labels,
+# warnings, balance, token holdings) when ETHERSCAN_PAGE_ENRICHMENT is on, which
+# is its default. There is no other keyless Ethereum provider to add.
+# Search-based sandbox indicators are served only by keyed sandbox search
+# (Tria.ge, Hybrid Analysis); no keyless service searches sandbox reports for a
+# mutex/registry key/pipe/service name or an ssdeep hash. The module docstring
+# already declares these out of scope for the key-free requirement (they still
+# need two sources, which the test above enforces).
+_SANDBOX_SEARCH_ONLY_TYPES = {"mutex", "registry_key", "named_pipe", "service_name", "ssdeep"}
+
+_KEY_FREE_VIA_ENRICHMENT = {
+    "eth": lambda: bool(settings.etherscan_page_enrichment),
+}
 
 
 def _is_key_free(adapter) -> bool:
@@ -40,7 +57,14 @@ def test_every_dispatched_type_has_at_least_two_sources():
 
 def test_every_dispatched_type_has_a_key_free_source():
     for ioc_type in _dispatched_types():
+        if ioc_type in _SANDBOX_SEARCH_ONLY_TYPES:
+            continue
         key_free = [a for a in _sources_for(ioc_type) if _is_key_free(a)]
+        if not key_free and ioc_type in _KEY_FREE_VIA_ENRICHMENT:
+            assert _KEY_FREE_VIA_ENRICHMENT[ioc_type](), (
+                f"Type '{ioc_type}' has no key-free adapter and its key-free enrichment path is disabled."
+            )
+            continue
         assert key_free, (
             f"Type '{ioc_type}' has no key-free source. Every IOC type needs "
             ">= 1 source that works without an API key."

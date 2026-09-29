@@ -122,6 +122,19 @@ def retry_after_seconds(response) -> Optional[float]:
 
 
 RAW_DATA_MAX_BYTES = 10 * 1024
+# Small top-level values (counts, flags, verdict strings, short lists) are the
+# typed fields scoring reads. They are kept as real JSON when a payload is
+# truncated, so one large nested blob (e.g. a full VirusTotal ``api_response``)
+# cannot erase ``malicious``/``isWhitelisted``/``match_type`` alongside it.
+_PRESERVED_FIELD_MAX_BYTES = 512
+_PRESERVED_FIELDS_BUDGET_BYTES = 4 * 1024
+
+
+def _encoded_size(value: object) -> int:
+    try:
+        return len(json.dumps(value, ensure_ascii=False, default=str, separators=(",", ":")).encode("utf-8"))
+    except (TypeError, ValueError):
+        return RAW_DATA_MAX_BYTES + 1
 
 
 def truncate_raw_data(value: object, limit: int = RAW_DATA_MAX_BYTES) -> dict:
@@ -129,7 +142,8 @@ def truncate_raw_data(value: object, limit: int = RAW_DATA_MAX_BYTES) -> dict:
 
     The original JSON is retained up to 10 KiB. Larger payloads are represented
     as a clearly-marked JSON string fragment so the response remains safe to
-    serialize and inspect in the analyst UI.
+    serialize and inspect in the analyst UI. Small top-level fields are kept as
+    structured values next to the fragment so typed evidence survives.
     """
     if not isinstance(value, dict):
         return {}
@@ -142,9 +156,21 @@ def truncate_raw_data(value: object, limit: int = RAW_DATA_MAX_BYTES) -> dict:
     size = len(encoded.encode("utf-8"))
     if size <= limit:
         return value
-    fragment_bytes = max(256, limit - 180)
+    preserved: dict = {}
+    budget = min(_PRESERVED_FIELDS_BUDGET_BYTES, max(0, limit // 2))
+    for key, item in value.items():
+        if not isinstance(key, str) or key.startswith("_truncat") or key == "_json_fragment":
+            continue
+        item_size = _encoded_size(item) + len(key) + 4
+        if item_size > _PRESERVED_FIELD_MAX_BYTES or item_size > budget:
+            continue
+        preserved[key] = item
+        budget -= item_size
+    preserved_size = _encoded_size(preserved)
+    fragment_bytes = max(256, limit - 180 - preserved_size)
     fragment = encoded.encode("utf-8")[:fragment_bytes].decode("utf-8", errors="ignore")
     return {
+        **preserved,
         "_truncated": True,
         "_original_size_bytes": size,
         "_truncation_limit_bytes": limit,

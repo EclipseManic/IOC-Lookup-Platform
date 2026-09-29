@@ -22,8 +22,16 @@ from app.backend.adapters.base import (
 )
 from app.backend.config import settings
 from app.backend.domain_router import assessment_domain_for, route_assessment_domain
-from app.backend.evidence import evidence_freshness, normalize_provider_result
+from app.backend.evidence import (
+    CREDENTIAL_IOC_TYPES,
+    evidence_freshness,
+    evidence_semantics,
+    normalize_provider_result,
+    tag_value,
+)
 from app.backend.thresholds import (
+    DISPLAY_CLEAN,
+    DISPLAY_MALICIOUS,
     MALICIOUS_HIGH,
     MALICIOUS_MEDIUM,
     MIN_SOURCES_HIGH_CONFIDENCE,
@@ -178,13 +186,116 @@ def _role(result: NormalizedResult) -> str:
 
 
 def _number_from_tags(tags: set[str], prefix: str) -> int | None:
-    for tag in tags:
-        if tag.startswith(prefix):
-            try:
-                return int(float(tag.split(":", 1)[1].strip()))
-            except (ValueError, IndexError):
-                return None
-    return None
+    # Legacy transport: accepts both ``detections:5`` and ``detections: 5``.
+    value = tag_value(tags, prefix.rstrip(":"))
+    if value is None:
+        return None
+    try:
+        return int(float(value.replace(",", "")))
+    except ValueError:
+        return None
+
+
+# A record that matched only *related* indicators (a URL hosted on a domain,
+# a subdomain, another IP:port) is capped well below direct evidence.
+_RELATED_SIGNAL_CAP = 0.40
+# Tor-exit / anonymizer membership: a relevant risk, never proof by itself.
+_ANONYMIZATION_SIGNAL = 0.30
+_HIGH_RELIABILITY_SINGLE_SOURCE_SIGNAL = 0.90
+# Popularity rank / registration age that marks well-established
+# infrastructure. One uncorroborated record cannot flip such an indicator to
+# malicious; it can still be suspicious and corroborated evidence still wins.
+_ESTABLISHED_RANK_MAX = 10_000
+_ESTABLISHED_AGE_DAYS = 3650
+
+
+def _base_role(result: NormalizedResult, semantics: dict) -> str:
+    kind = semantics.get("kind")
+    if kind in {"anonymization", "exposure_context"}:
+        return "context"
+    if kind == "credential_exposure":
+        return "threat"
+    return _role(result)
+
+
+def _observation_brief(observation: EvidenceObservation) -> str:
+    """Short, evidence-bearing label such as ``VirusTotal (11/91 engines)``."""
+    details: list[str] = []
+    meta = observation.metadata or {}
+    semantics = meta.get("semantics") or {}
+    if observation.detection_count is not None and observation.total_engines:
+        details.append(f"{observation.detection_count}/{observation.total_engines} engines")
+    abuse_score = meta.get("abuse_confidence_score")
+    if abuse_score is not None:
+        details.append(f"abuse confidence {abuse_score}/100")
+    if observation.source == "AbuseIPDB" and observation.reports_count:
+        details.append(f"{observation.reports_count} reports")
+    if meta.get("whitelisted"):
+        details.append("whitelisted")
+    exposure = semantics.get("exposure") or {}
+    if exposure.get("infections"):
+        details.append(f"{exposure['infections']} infostealer infection{'s' if exposure['infections'] != 1 else ''}")
+    if exposure.get("credentials_at_risk"):
+        details.append(f"{exposure['credentials_at_risk']:,} credentials at risk")
+    if exposure.get("occurrences"):
+        details.append(f"seen {exposure['occurrences']:,} times in breach data")
+    if semantics.get("detail"):
+        details.append(str(semantics["detail"]))
+    if semantics.get("match_type") == "related":
+        details.append("related indicators only")
+    return f"{observation.source} ({', '.join(details)})" if details else observation.source
+
+
+def _join(items: list[str]) -> str:
+    items = list(dict.fromkeys(item for item in items if item))
+    if len(items) <= 1:
+        return "".join(items)
+    return ", ".join(items[:-1]) + f" and {items[-1]}"
+
+
+def _apex(host: str) -> str:
+    parts = [part for part in host.lower().strip(".").split(".") if part]
+    return ".".join(parts[-2:]) if len(parts) >= 2 else host.lower()
+
+
+def _established_infrastructure(ioc: str, ioc_type: str, results: list[NormalizedResult], enrichment: EnrichmentData | None) -> list[str]:
+    """Evidence that a registrable domain is long-established, popular infrastructure.
+
+    Only a registrable (apex) domain qualifies: a subdomain or URL can be
+    attacker-controlled content on an established platform.
+    """
+    if ioc_type != "domain":
+        return []
+    host = ioc.lower().strip(".")
+    apex = _apex(host)
+    if host != apex:
+        return []
+    notes: list[str] = []
+    best_rank: int | None = None
+    for result in results:
+        if result.execution_state != "success" or not isinstance(result.raw_data, dict):
+            continue
+        raw = result.raw_data
+        candidates = []
+        if isinstance(raw.get("umbrella_rank"), (int, float)) and not isinstance(raw.get("umbrella_rank"), bool):
+            candidates.append(int(raw["umbrella_rank"]))
+        for item in raw.get("results") or []:
+            page = item.get("page") if isinstance(item, dict) else None
+            if isinstance(page, dict) and str(page.get("apexDomain") or "").lower() == apex:
+                rank = page.get("umbrellaRank")
+                if isinstance(rank, (int, float)) and not isinstance(rank, bool) and rank > 0:
+                    candidates.append(int(rank))
+        for rank in candidates:
+            best_rank = rank if best_rank is None else min(best_rank, rank)
+    if best_rank is not None and best_rank <= _ESTABLISHED_RANK_MAX:
+        notes.append(f"Cisco Umbrella popularity rank {best_rank:,}")
+    whois = enrichment.whois if enrichment else None
+    age = whois.domain_age_days if whois else None
+    if age is None and enrichment and enrichment.web_preview:
+        age = enrichment.web_preview.domain_age_days
+    if age is not None and age >= _ESTABLISHED_AGE_DAYS:
+        notes.append(f"domain registered {age // 365} years ago")
+    return notes
 
 
 def _telemetry(result: NormalizedResult) -> tuple[int | None, int | None]:
@@ -349,12 +460,21 @@ def _provider_health(results: list[NormalizedResult]) -> list[ProviderHealth]:
     return sorted(grouped.values(), key=lambda item: item.source.lower())
 
 
+_LEGITIMATE_INFRASTRUCTURE = re.compile(
+    r"(?<![a-z0-9])(?:fastly|github|cloudflare|akamai|microsoft|google|amazon|aws|azure|cdn|content delivery)(?![a-z0-9])"
+)
+
+
+def _legitimate_infrastructure_match(values: list[str]) -> str | None:
+    # Whole-word match on ownership/ASN/hostname context. A substring scan
+    # made any hostname containing "cdn" or "aws" count as major infrastructure.
+    text = " ".join(str(value) for value in values).lower()
+    match = _LEGITIMATE_INFRASTRUCTURE.search(text)
+    return match.group(0) if match else None
+
+
 def _legitimate_infrastructure(values: list[str]) -> bool:
-    text = " ".join(values).lower()
-    return any(term in text for term in (
-        "fastly", "github", "cloudflare", "akamai", "microsoft", "google",
-        "amazon", "aws", "azure", "cdn", "content delivery",
-    ))
+    return _legitimate_infrastructure_match(values) is not None
 
 
 def _known_test_artifact(ioc: str, results: list[NormalizedResult]) -> str | None:
@@ -376,8 +496,15 @@ def aggregate_evidence(
     ioc_type: str,
     results: list[NormalizedResult],
     enrichment: EnrichmentData | None = None,
+    provider_plan: list[dict] | None = None,
 ) -> IOCAssessment:
-    """Build one authoritative, auditable assessment for one IOC."""
+    """Build one authoritative, auditable assessment for one IOC.
+
+    ``provider_plan`` (optional) is the pipeline's applicability plan. When
+    given, providers that were applicable but produced no result count as
+    expected-but-unevaluated coverage, and ``not_applicable`` rows are never
+    needed in ``results``.
+    """
     domain = assessment_domain_for(ioc_type, ioc)
     # This is the canonical normalization choke point.  Callers may pass
     # legacy adapter objects, but scoring always consumes normalized evidence.
@@ -400,27 +527,92 @@ def aggregate_evidence(
     observations: list[EvidenceObservation] = []
     for result in chosen.values():
         status, health_reason = _health_status(result)
-        role = "health" if status in {"rate_limited", "timeout", "error", "invalid_request", "unavailable"} else _role(result)
+        semantics = evidence_semantics(result, ioc, ioc_type, domain)
+        base_role = _base_role(result, semantics)
+        role = "health" if status in {"rate_limited", "timeout", "error", "invalid_request", "unavailable"} else base_role
         semantic_verdict = _semantic_verdict(result)
         detection_count, total_engines = _telemetry(result)
         signal, signal_reason = _signal(result, status, detection_count, total_engines)
+        if role == "context":
+            signal = 0.0
         weight = _EVIDENCE_WEIGHTS.get(result.source, 0.50) * _TYPE_WEIGHT.get(ioc_type, 0.80) * _time_decay(result)
+        raw = result.raw_data if isinstance(result.raw_data, dict) else {}
+        tags = _tag_set(result)
+        whitelisted = bool(raw.get("isWhitelisted") is True or raw.get("is_whitelisted") is True or raw.get("whitelisted") is True or "whitelisted" in tags or semantic_verdict == "whitelisted")
+        abuse_confidence = raw.get("abuseConfidenceScore", raw.get("abuse_confidence_score"))
+        votes = semantics.get("community_votes")
+        match_type = semantics.get("match_type")
+        kind = semantics.get("kind")
+
         contribution = "excluded" if status not in {"success"} else "neutral"
+        evidence_class_override: str | None = None
+        reason = health_reason or signal_reason
+        if signal > 0 and match_type == "related":
+            examples = semantics.get("related_examples") or []
+            signal = min(signal, _RELATED_SIGNAL_CAP)
+            evidence_class_override = "related_indicator"
+            reason = (
+                f"{result.source} matched related indicators"
+                + (f" (e.g. {', '.join(examples[:2])})" if examples else "")
+                + f", not {ioc} itself; this is weak, indirect evidence."
+            )
         if signal > 0:
             contribution = "positive"
-        elif status == "success" and semantic_verdict in {"clean", "benign", "whitelisted"} and result.source != "Hashlookup" and role in {"threat", "supporting"}:
+        elif (
+            status == "success"
+            and semantic_verdict in {"clean", "benign", "whitelisted"}
+            and result.source != "Hashlookup"
+            and role in {"threat", "supporting"}
+        ):
             contribution = "negative"
-        reason = health_reason or signal_reason
+            if votes and votes["malicious"] > votes["harmless"] and votes["malicious"] >= 3:
+                # Crowd votes are weak, but a malicious-leaning crowd means the
+                # clean engine result is not clean evidence on its own.
+                contribution = "neutral"
+                reason = (
+                    f"{result.source} returned a clean result, but community votes lean malicious "
+                    f"({votes['malicious']} malicious / {votes['harmless']} harmless); the clean result is not counted."
+                )
         if status == "not_found":
             reason = "Provider did not find this IOC; absence is not benign evidence."
-        elif status == "success" and semantic_verdict in {"unknown", "undetected", "unrated"}:
+        elif kind == "anonymization" and status == "success":
+            if semantics.get("anonymization"):
+                signal = _ANONYMIZATION_SIGNAL
+                contribution = "context_risk"
+                evidence_class_override = "anonymization"
+                reason = (
+                    "Tor exit relay: anonymization infrastructure is a relevant risk, but traffic from it can "
+                    "originate from any Tor user, so membership alone is not proof of malicious activity."
+                )
+            else:
+                reason = "Anonymization list checked; this IOC is not a listed exit relay."
+        elif kind == "exposure_context" and status == "success":
+            exposure = semantics.get("exposure")
+            if exposure:
+                evidence_class_override = "exposure_context"
+                count = exposure.get("infections") or exposure.get("occurrences") or 0
+                reason = (
+                    f"Infostealer exposure context: {result.source} links {count or 'one or more'} infected "
+                    f"machine{'' if count == 1 else 's'} to this {ioc_type}. This describes credential exposure of "
+                    "users/hosts behind it, not malicious activity by the indicator."
+                )
+            else:
+                reason = "Infostealer exposure source returned no exposure for this indicator."
+        elif status == "success" and semantic_verdict in {"unknown", "undetected", "unrated"} and contribution == "neutral":
             reason = "Provider returned insufficient evidence."
         elif role == "context":
             reason = "Infrastructure/context metadata is recorded but cannot increase maliciousness."
+        if votes and contribution in {"negative", "positive"} and "community votes" not in reason:
+            reason += (
+                f" Community votes ({votes['malicious']} malicious / {votes['harmless']} harmless) are a weak "
+                "crowd signal and are not scored."
+            )
         if status == "not_found":
             evidence_class = "non_observation"
         elif status not in {"success"}:
             evidence_class = "provider_status"
+        elif evidence_class_override:
+            evidence_class = evidence_class_override
         elif contribution == "negative":
             evidence_class = "negative"
         elif role == "context":
@@ -471,8 +663,29 @@ def aggregate_evidence(
                 "retry_after_seconds": result.retry_after_seconds,
                 "evidence_items": result.evidence_items,
                 "freshness_class": evidence_freshness(result),
+                "evidence_role": base_role,
+                "evidence_kind": kind,
+                "match_type": match_type,
+                "semantics": semantics,
+                "community_votes": votes,
+                "whitelisted": whitelisted or None,
+                "abuse_confidence_score": abuse_confidence if isinstance(abuse_confidence, (int, float)) and not isinstance(abuse_confidence, bool) else None,
             },
         ))
+
+    # Coverage is measured against the plan when one is supplied, so a
+    # provider that was applicable but returned nothing is not silently
+    # dropped from the denominator. Rows marked not_applicable never count.
+    observed_sources = {o.source for o in observations}
+    planned_applicable = [
+        str(item.get("provider")) for item in (provider_plan or [])
+        if isinstance(item, dict) and item.get("applicable", True) and item.get("provider")
+    ]
+    missing_planned = [name for name in dict.fromkeys(planned_applicable) if name not in observed_sources]
+    plan_not_applicable = len([
+        item for item in (provider_plan or [])
+        if isinstance(item, dict) and item.get("applicable") is False
+    ]) if provider_plan is not None else None
 
     # Domain-specific objects leave the reputation scorer here.  Provider
     # records remain visible, but their provider vocabulary cannot leak into
@@ -491,9 +704,8 @@ def aggregate_evidence(
             severity = "critical" if cvss >= 9 else "high" if cvss >= 7 else "medium" if cvss >= 4 else "low"
         severity = (severity or "informational").lower()
         evaluated = len([o for o in observations if o.status in {"success", "not_found"}])
-        applicable = len([o for o in observations if o.status != "not_applicable"])
+        applicable = len([o for o in observations if o.status != "not_applicable"]) + len(missing_planned)
         coverage = evaluated / applicable if applicable else 0.0
-        risk = max(min((cvss or 0.0) / 10.0, 1.0), min(max(epss or 0.0, 0.0), 1.0))
         records = []
         for item in typed:
             records.append({
@@ -505,16 +717,35 @@ def aggregate_evidence(
                 "exploit_status": item.exploit_status, "references": item.references,
                 "source_record_id": item.source_record_id,
             })
-        reason = f"Vulnerability assessment: {severity} severity"
+        cve_info = enrichment.cve if enrichment else None
+        if epss is None and cve_info is not None and cve_info.epss_score is not None:
+            epss = cve_info.epss_score
+        risk = max(min((cvss or 0.0) / 10.0, 1.0), min(max(epss or 0.0, 0.0), 1.0))
+        known_exploited = any(
+            item.exploit_status == "known_exploited" or "cisa_kev" in {str(tag).lower() for tag in item.tags}
+            for item in typed
+        ) or bool(cve_info and cve_info.is_in_kev)
+        cvss_source = next((item.source for item in typed if item.cvss_score is not None), None)
         if cvss is not None:
-            reason += f" (CVSS {cvss:g})"
+            reason = f"{severity.title()}-severity vulnerability (CVSS {cvss:g}{f', {cvss_source}' if cvss_source else ''})"
+        else:
+            reason = "CVSS severity is not available for this vulnerability"
+        if known_exploited:
+            reason += "; listed in the CISA Known Exploited Vulnerabilities catalog (exploited in the wild)"
         if epss is not None:
-            reason += f", EPSS {epss:.3f}"
-        if any(item.exploit_status == "known_exploited" or "cisa_kev" in item.tags for item in typed):
-            reason += "; known exploitation context is present"
+            reason += f"; EPSS {epss:.3f} ({epss * 100:.1f}% estimated probability of exploitation in the next 30 days)"
+        reason += "."
+        if typed:
+            basis = "CVSS/10" if cvss is not None and (epss is None or cvss / 10.0 >= epss) else "EPSS" if epss is not None else None
+            if basis:
+                reason += f" Vulnerability risk {round(risk * 100.0, 1):g}/100 is based on {basis}; this is not an IOC reputation verdict."
+            else:
+                reason += " No CVSS or EPSS score is available, so the vulnerability risk score is 0; this is not an IOC reputation verdict."
         if not typed:
             reason = "Vulnerability metadata is unavailable; no reputation verdict was generated."
         review_reasons = []
+        if known_exploited:
+            review_reasons.append("Known exploited vulnerability (CISA KEV): prioritize remediation")
         if severity in {"critical", "high"}:
             review_reasons.append(f"{severity.title()} vulnerability requires remediation review")
         if applicable and coverage < 0.5:
@@ -529,8 +760,10 @@ def aggregate_evidence(
             needs_review=bool(review_reasons), review_reasons=review_reasons, freshness="fresh" if typed else "unavailable",
             evidence_counts={"vulnerability": len(typed), "provider_status": len([o for o in observations if o.status not in {"success", "not_found", "not_applicable"}])},
             evidence_summary={"assessment_domain": domain, "severity": severity, "cvss_score": cvss, "epss_score": epss,
+                              "known_exploited": known_exploited,
                               "expected_providers": applicable, "evaluated_providers": evaluated,
-                              "coverage": round(coverage, 4), "threat_evidence_excluded": True},
+                              "coverage": round(coverage, 4), "threat_evidence_excluded": True,
+                              **({"not_applicable_providers": plan_not_applicable} if plan_not_applicable is not None else {})},
             provider_breakdown=observations, provider_health=_provider_health(list(chosen.values())),
             vulnerabilities=records, timestamps={"analyzed_at": datetime.now(timezone.utc).isoformat()},
             provider_summary=[{"source": o.source, "execution_state": o.execution_state} for o in observations],
@@ -563,59 +796,129 @@ def aggregate_evidence(
             reason=reason, analyzed_at=datetime.now(timezone.utc),
         )
 
-    if domain == "credential_exposure" or (domain == "identity_reputation" and ioc_type in {"email", "username", "password"}):
-        applicable = [o for o in observations if o.status not in {"not_applicable"}]
-        evaluated = [o for o in applicable if o.status in {"success", "not_found"}]
-        health_failures = [o for o in applicable if o.status not in {"success", "not_found"}]
+    if domain == "credential_exposure" or (domain == "identity_reputation" and ioc_type in CREDENTIAL_IOC_TYPES):
+        # Two different questions are answered here and kept apart:
+        #  * credential exposure: is this credential in breach dumps or
+        #    infostealer logs (Hudson Rock, HIBP, breach enrichment)?
+        #  * identity abuse reputation: is the address reported for spam or
+        #    is it a disposable/risky mailbox (StopForumSpam, Hunter.io, ...)?
+        # Exposure drives "breached"; abuse reputation alone is "suspicious".
+        applicable_count = len([o for o in observations if o.status != "not_applicable"]) + len(missing_planned)
+        evaluated = [o for o in observations if o.status in {"success", "not_found"}]
+        health_failures = [o for o in observations if o.status not in {"success", "not_found", "not_applicable"}]
 
-        breach_observations = []
-        for o in observations:
-            if o.status == "success":
-                tags_str = " ".join(o.tags).lower()
-                has_breach_tag = any(t in tags_str for t in ["compromised", "infostealer", "pwned", "breach"])
-                is_flagged = o.verdict in {"malicious", "compromised", "breached"} or bool(o.reports_count and o.reports_count > 0)
-                if has_breach_tag or is_flagged:
-                    breach_observations.append(o)
+        exposure_findings: list[EvidenceObservation] = []
+        abuse_findings: list[EvidenceObservation] = []
+        exposure_checked = False
+        for index, o in enumerate(observations):
+            semantics = (o.metadata or {}).get("semantics") or {}
+            kind = semantics.get("kind")
+            if kind == "credential_exposure" and o.status in {"success", "not_found"}:
+                exposure_checked = True
+            if o.status != "success":
+                continue
+            if semantics.get("exposure"):
+                updated = o.model_copy(update={
+                    "evidence_class": "credential_exposure",
+                    "contribution": "positive",
+                    "normalized_signal": max(o.normalized_signal, 0.7),
+                    "reason": f"Credential exposure: {_observation_brief(o)} records this {ioc_type} in breach or infostealer data.",
+                })
+                observations[index] = updated
+                exposure_findings.append(updated)
+            elif o.contribution == "positive":
+                abuse_findings.append(o)
+
+        breach_info = enrichment.breach if enrichment else None
+        breach_count = breach_info.breach_count if breach_info is not None else None
+        if breach_count is not None:
+            exposure_checked = True
+        breach_enrichment_positive = bool(breach_count and breach_count > 0)
 
         context = _context_values(list(chosen.values()), enrichment)
-        coverage = len(evaluated) / len(applicable) if applicable else 0.0
+        coverage = len(evaluated) / applicable_count if applicable_count else 0.0
+        exposed = bool(exposure_findings) or breach_enrichment_positive
 
-        if breach_observations:
-            classification = "breached"
-            final_verdict = "breached"
-            max_infections = max([o.reports_count or 0 for o in breach_observations] + [1])
-            risk = min(1.0, 0.70 + (math.log10(max(max_infections, 1)) / 10.0))
+        exposure_parts = [_observation_brief(o) for o in exposure_findings]
+        if breach_enrichment_positive:
+            names = ", ".join((breach_info.breach_names or [])[:3])
+            exposure_parts.append(
+                f"breach enrichment lists {breach_count} breach{'es' if breach_count != 1 else ''}"
+                + (f" ({names}{', ...' if breach_count > 3 else ''})" if names else "")
+            )
+        abuse_parts = [_observation_brief(o) for o in abuse_findings]
+        gap_sentence = (
+            f" Not evaluated: {_join([f'{o.source} ({o.status.replace(chr(95), chr(32))})' for o in health_failures])}."
+            if health_failures else ""
+        )
+
+        if exposed:
+            classification = final_verdict = "breached"
+            counts = [
+                max((o.metadata.get("semantics") or {}).get("exposure", {}).get("infections", 0),
+                    (o.metadata.get("semantics") or {}).get("exposure", {}).get("occurrences", 0))
+                for o in exposure_findings
+            ] + ([breach_count] if breach_enrichment_positive else [])
+            max_count = max(counts + [1])
+            risk = min(1.0, 0.70 + (math.log10(max(max_count, 1)) / 10.0))
             score = round(risk * 100.0, 1)
-            confidence = "high" if len(breach_observations) >= 2 or max_infections >= 3 else "medium"
-            reason = f"Credential compromise detected: indicator appeared in breach databases or infostealer malware logs ({len(breach_observations)} source{'s' if len(breach_observations) != 1 else ''} flagged exposure)."
+            confidence = "high" if len(exposure_parts) >= 2 or max_count >= 3 else "medium"
+            reason = f"Credential exposure found: {_join(exposure_parts)}."
+            if abuse_parts:
+                reason += f" Abuse reputation also flags it: {_join(abuse_parts)}."
+            reason += gap_sentence
             status_val = "complete" if coverage >= 1.0 else "partial"
-        elif evaluated and not health_failures:
-            classification = "not_breached"
-            final_verdict = "not_breached"
+        elif abuse_findings:
+            classification = final_verdict = "suspicious"
+            strength = sum(o.normalized_signal * o.weight for o in abuse_findings)
+            peak = max(o.normalized_signal for o in abuse_findings)
+            evidence_score = (0.55 * peak + 0.45 * min(strength / 1.20, 1.0)) * 100.0
+            score = round(min(max(evidence_score, DISPLAY_CLEAN), DISPLAY_MALICIOUS - 0.1), 1)
+            risk = score / 100.0
+            confidence = "medium" if len(abuse_findings) >= 2 else "low"
+            reason = (
+                f"No credential exposure was found{'' if exposure_checked else ' (no breach or infostealer source answered)'}, "
+                f"but identity abuse reputation flags this {ioc_type}: {_join(abuse_parts)}."
+            ) + gap_sentence
+            status_val = "complete" if coverage >= 1.0 else "partial"
+        elif exposure_checked and not health_failures:
+            classification = final_verdict = "not_breached"
             risk = 0.0
             score = 0.0
             confidence = "high" if len(evaluated) >= 2 else "medium"
             reason = "No breach or infostealer exposure observed across evaluated credential intelligence feeds."
             status_val = "complete" if coverage >= 1.0 else "partial"
-        elif evaluated:
-            classification = "unknown"
-            final_verdict = "unknown"
+        elif evaluated or breach_count is not None:
+            classification = final_verdict = "unknown"
             risk = 0.0
             score = 0.0
             confidence = "low"
-            reason = (
-                f"{len(health_failures)} credential intelligence source{'s were' if len(health_failures) != 1 else ' was'} "
-                "unavailable, so a clean result cannot be confirmed from the sources that did answer."
-            )
+            if not exposure_checked:
+                reason = "No breach or infostealer exposure source answered, so exposure cannot be assessed."
+            else:
+                reason = (
+                    f"{len(health_failures)} credential intelligence source{'s were' if len(health_failures) != 1 else ' was'} "
+                    "unavailable, so a clean result cannot be confirmed from the sources that did answer."
+                )
+            reason += gap_sentence
             status_val = "partial"
         else:
-            classification = "unknown"
-            final_verdict = "unknown"
+            classification = final_verdict = "unknown"
             risk = 0.0
             score = 0.0
             confidence = "low"
-            reason = "Credential intelligence is unavailable; no providers returned usable data."
+            reason = "Credential intelligence is unavailable; no providers returned usable data." + gap_sentence
             status_val = "partial" if health_failures else "unavailable"
+
+        review_reasons: list[str] = []
+        if exposed:
+            review_reasons.append("Credential was detected in public breach data or infostealer logs; credential reset recommended.")
+        if abuse_findings:
+            review_reasons.append("Identity abuse reputation (spam reports / disposable or risky mailbox) requires analyst confirmation.")
+        if health_failures and not exposed:
+            review_reasons.append("One or more credential intelligence sources were unavailable; absence of a finding is not confirmation of safety.")
+        if final_verdict == "unknown" and not exposure_checked and not health_failures:
+            review_reasons.append("No breach or infostealer source answered; exposure is unassessed.")
 
         freshness_values = [evidence_freshness(r) for r in chosen.values() if _health_status(r)[0] in {"success", "not_found"}]
         freshness = "historical" if freshness_values and all(item == "historical" for item in freshness_values) else "cached" if freshness_values and all(item == "cached" for item in freshness_values) else "fresh" if freshness_values else "unavailable"
@@ -623,34 +926,47 @@ def aggregate_evidence(
         return IOCAssessment(
             ioc=ioc, normalized_ioc=ioc, ioc_type=ioc_type, assessment_domain=domain,
             classification=classification, final_verdict=final_verdict, risk_score=round(risk, 4), normalized_score=score,
-            confidence_score=round(min(1.0, coverage + (0.2 if breach_observations else 0.0)), 4),
-            confidence=confidence, evidence_strength=1.0 if breach_observations or evaluated else 0.0, coverage=round(coverage, 4),
+            confidence_score=round(min(1.0, coverage + (0.2 if exposed else 0.0)), 4),
+            confidence=confidence, evidence_strength=1.0 if exposed or evaluated else 0.0, coverage=round(coverage, 4),
             assessment_status=status_val,
             freshness=freshness,
-            evidence_counts={"breach_findings": len(breach_observations), "providers": len(applicable), "contextual": len(context)},
+            evidence_counts={
+                "breach_findings": len(exposure_parts),
+                "abuse_reputation_findings": len(abuse_findings),
+                "providers": applicable_count,
+                "contextual": len(context),
+                "provider_status": len(health_failures),
+            },
             evidence_summary={
                 "assessment_domain": domain,
-                "breached": bool(breach_observations),
-                "expected_providers": len(applicable),
+                "breached": exposed,
+                "exposure_sources": [o.source for o in exposure_findings] + (["breach_enrichment"] if breach_enrichment_positive else []),
+                "abuse_reputation_sources": [o.source for o in abuse_findings],
+                "breach_enrichment_count": breach_count,
+                "expected_providers": applicable_count,
                 "evaluated_providers": len(evaluated),
                 "coverage": round(coverage, 4),
                 "unavailable_providers": len(health_failures),
+                **({"not_applicable_providers": plan_not_applicable} if plan_not_applicable is not None else {}),
             },
             provider_breakdown=observations, provider_health=_provider_health(list(chosen.values())), context=context,
+            malicious_sources=[o.source for o in abuse_findings if o.verdict == "malicious"],
+            suspicious_sources=[o.source for o in abuse_findings if o.verdict == "suspicious"],
+            strongest_evidence=sorted(exposure_findings + abuse_findings, key=lambda o: o.normalized_signal * o.weight, reverse=True)[:3],
+            not_found_sources=[o.source for o in observations if o.status == "not_found"],
+            rate_limited_sources=[o.source for o in observations if o.status == "rate_limited"],
+            unavailable_sources=[o.source for o in observations if o.status == "unavailable"],
+            error_sources=[o.source for o in observations if o.status in {"rate_limited", "timeout", "error", "invalid_request"}],
             reason=reason, analyzed_at=datetime.now(timezone.utc),
-            needs_review=bool(breach_observations) or bool(health_failures),
-            review_reasons=(
-                ["Credential was detected in public breach data or infostealer logs; credential reset recommended."]
-                if breach_observations
-                else ["One or more credential intelligence sources were unavailable; absence of a finding is not confirmation of safety."]
-                if health_failures
-                else []
-            ),
+            needs_review=bool(review_reasons),
+            analyst_review_recommended=bool(exposed or abuse_findings),
+            review_reasons=review_reasons,
         )
 
     if domain in {"infrastructure", "identity_reputation", "artifact_metadata"}:
         applicable = [o for o in observations if o.status not in {"not_applicable"}]
         evaluated = [o for o in applicable if o.status in {"success", "not_found"}]
+        expected_count = len(applicable) + len(missing_planned)
         context = _context_values(list(chosen.values()), enrichment)
         base_action = route_assessment_domain(ioc_type, ioc).recommended_action
 
@@ -708,11 +1024,11 @@ def aggregate_evidence(
             ioc=ioc, normalized_ioc=ioc, ioc_type=ioc_type, assessment_domain=domain,
             classification=classification, final_verdict=final_verdict,
             risk_score=round(normalized_score / 100.0, 4), normalized_score=normalized_score,
-            confidence_score=round(len(evaluated) / len(applicable), 4) if applicable else 0.0,
-            confidence=confidence, evidence_strength=round(evidence_strength, 4), coverage=round(len(evaluated) / len(applicable), 4) if applicable else 0.0,
-            assessment_status="complete" if applicable and len(evaluated) == len(applicable) else "partial" if applicable else "not_applicable",
-            freshness="fresh" if evaluated else "unavailable", evidence_counts={"contextual": len(context), "providers": len(applicable), "direct_positive": len(positive)},
-            evidence_summary={"assessment_domain": domain, "context_only": final_verdict == "context_only", "expected_providers": len(applicable), "evaluated_providers": len(evaluated), "independent_corroborating_groups": corroboration, "positive_strength": round(positive_strength, 4)},
+            confidence_score=round(len(evaluated) / expected_count, 4) if expected_count else 0.0,
+            confidence=confidence, evidence_strength=round(evidence_strength, 4), coverage=round(len(evaluated) / expected_count, 4) if expected_count else 0.0,
+            assessment_status="complete" if expected_count and len(evaluated) == expected_count else "partial" if expected_count else "not_applicable",
+            freshness="fresh" if evaluated else "unavailable", evidence_counts={"contextual": len(context), "providers": expected_count, "direct_positive": len(positive)},
+            evidence_summary={"assessment_domain": domain, "context_only": final_verdict == "context_only", "expected_providers": expected_count, "evaluated_providers": len(evaluated), "independent_corroborating_groups": corroboration, "positive_strength": round(positive_strength, 4), **({"not_applicable_providers": plan_not_applicable} if plan_not_applicable is not None else {})},
             provider_breakdown=observations, provider_health=_provider_health(list(chosen.values())), context=context,
             malicious_sources=[o.source for o in positive if o.verdict == "malicious"],
             suspicious_sources=[o.source for o in positive if o.verdict == "suspicious"],
@@ -736,6 +1052,7 @@ def aggregate_evidence(
                 artifact_observations.append(observation)
         applicable = [o for o in observations if o.status != "not_applicable"]
         evaluated = [o for o in applicable if o.status in {"success", "not_found"}]
+        expected_count = len(applicable) + len(missing_planned)
         artifact_success = [o for o in artifact_observations if o.status == "success"]
         freshness_values = [evidence_freshness(r) for r in chosen.values() if _health_status(r)[0] in {"success", "not_found"}]
         freshness = "historical" if freshness_values and all(item == "historical" for item in freshness_values) else "cached" if freshness_values and all(item == "cached" for item in freshness_values) else "fresh" if freshness_values else "unavailable"
@@ -745,8 +1062,8 @@ def aggregate_evidence(
             risk_score=0.0, normalized_score=0.0,
             confidence_score=1.0 if artifact else 0.0,
             confidence="high" if artifact else "low", evidence_strength=1.0 if artifact_success else 0.0,
-            coverage=round(len(evaluated) / len(applicable), 4) if applicable else 0.0,
-            assessment_status="complete" if applicable and len(evaluated) == len(applicable) else "partial" if applicable else "not_applicable",
+            coverage=round(len(evaluated) / expected_count, 4) if expected_count else 0.0,
+            assessment_status="complete" if expected_count and len(evaluated) == expected_count else "partial" if expected_count else "not_applicable",
             freshness=freshness,
             evidence_counts={
                 "test_artifact": len(artifact_success),
@@ -754,10 +1071,11 @@ def aggregate_evidence(
             },
             evidence_summary={
                 "assessment_domain": domain,
-                "expected_providers": len(applicable),
+                "expected_providers": expected_count,
                 "evaluated_providers": len(evaluated),
-                "coverage": round(len(evaluated) / len(applicable), 4) if applicable else 0.0,
+                "coverage": round(len(evaluated) / expected_count, 4) if expected_count else 0.0,
                 "threat_evidence_excluded": True,
+                **({"not_applicable_providers": plan_not_applicable} if plan_not_applicable is not None else {}),
             },
             provider_breakdown=artifact_observations,
             provider_health=_provider_health(list(chosen.values())),
@@ -771,37 +1089,65 @@ def aggregate_evidence(
             analyzed_at=datetime.now(timezone.utc),
         )
 
-    if ioc in WELL_KNOWN_PUBLIC_RESOLVERS and ioc_type in {"ipv4", "ipv6"}:
-        primary_threats = [o for o in observations if o.source in {"VirusTotal", "AbuseIPDB", "ThreatFox", "MalwareBazaar"} and o.contribution == "positive"]
-        if not primary_threats:
-            # Dampen infostealer client DNS noise for well-known public resolvers
-            for i, o in enumerate(observations):
-                if o.source in {"Hudson Rock", "LeakCheck.io"} and o.contribution == "positive":
-                    observations[i] = o.model_copy(update={
-                        "contribution": "neutral",
-                        "normalized_signal": 0.0,
-                        "role": "context",
-                        "reason": f"Well-known public DNS resolver ({ioc}); infostealer client log telemetry is dampened as expected ambient DNS traffic.",
-                    })
+    context = _context_values(list(chosen.values()), enrichment)
+    established_notes = _established_infrastructure(ioc, ioc_type, list(chosen.values()), enrichment)
+    major_provider = _legitimate_infrastructure_match(context)
+    major_provider_context = major_provider is not None
+    has_legitimate_context = major_provider_context or bool(established_notes)
+    legitimacy_notes = list(established_notes)
+    if major_provider_context:
+        legitimacy_notes.append(f"ownership/hosting context names major infrastructure ({major_provider})")
+
+    # A record that only matched *related* indicators (URLs hosted under this
+    # domain, subdomains) on established infrastructure is platform-abuse
+    # context: it says the platform hosts abused content, not that this
+    # indicator is malicious.
+    related_positive = [o for o in observations if o.contribution == "positive" and (o.metadata or {}).get("match_type") == "related"]
+    all_positive = [o for o in observations if o.role in {"threat", "supporting"} and o.contribution == "positive"]
+    platform_abuse: list[EvidenceObservation] = []
+    if established_notes and related_positive and len(related_positive) == len(all_positive):
+        related_ids = {id(o) for o in related_positive}
+        for index, o in enumerate(observations):
+            if id(o) in related_ids:
+                demoted = o.model_copy(update={
+                    "role": "context",
+                    "contribution": "neutral",
+                    "normalized_signal": 0.0,
+                    "evidence_class": "related_indicator",
+                    "reason": o.reason + f" On established infrastructure ({_join(established_notes)}) this is platform-abuse context and is not scored.",
+                })
+                observations[index] = demoted
+                platform_abuse.append(demoted)
 
     threat_obs = [o for o in observations if o.role in {"threat", "supporting"}]
     positive = [o for o in threat_obs if o.contribution == "positive"]
+    risk_context = [o for o in observations if o.contribution == "context_risk"]
     # ``harmless``, ``undetected``, and ``whitelisted`` are deliberately not
     # collapsed into clean evidence.  Only an explicit meaningful clean or
     # benign classification can support a benign final verdict.
-    clean = [o for o in threat_obs if o.status == "success" and o.verdict in {"clean", "benign", "whitelisted"} and o.source != "Hashlookup"]
-    context = _context_values(list(chosen.values()), enrichment)
-    has_legitimate_context = _legitimate_infrastructure(context)
+    clean = [o for o in threat_obs if o.contribution == "negative"]
     positive_strength = sum(o.normalized_signal * o.weight for o in positive)
+    risk_strength = sum(o.normalized_signal * o.weight for o in risk_context)
+    total_strength = positive_strength + risk_strength
     clean_strength = sum(o.weight for o in clean)
     max_signal = max((o.normalized_signal for o in positive), default=0.0)
+    max_any_signal = max([o.normalized_signal for o in positive + risk_context] or [0.0])
     independent_positive = {o.provenance or o.source for o in positive}
     strong_positive = [o for o in positive if o.normalized_signal >= 0.72]
+    strong_exact = [o for o in strong_positive if (o.metadata or {}).get("match_type") != "related"]
     artifact = _known_test_artifact(ioc, list(chosen.values()))
 
-    expected_providers = len([o for o in observations if o.status != "not_applicable"])
+    expected_providers = len([o for o in observations if o.status != "not_applicable"]) + len(missing_planned)
     evaluated_providers = len([o for o in observations if o.status in {"success", "not_found"}])
     coverage = evaluated_providers / expected_providers if expected_providers else 0.0
+    # Reputation coverage ignores pure context sources (GeoIP, Shodan, ...):
+    # ten answering context providers must not hide that every reputation
+    # provider was rate limited.
+    reputation_expected = [o for o in observations if (o.metadata or {}).get("evidence_role") in {"threat", "supporting"} and o.status != "not_applicable"]
+    reputation_evaluated = [o for o in reputation_expected if o.status in {"success", "not_found"}]
+    reputation_failed = [o for o in reputation_expected if o.status not in {"success", "not_found"}]
+    reputation_coverage = len(reputation_evaluated) / len(reputation_expected) if reputation_expected else coverage
+    decision_coverage = reputation_coverage if reputation_expected else coverage
     evidence_strength = min(1.0, max_signal * 0.65 + min(positive_strength / 1.2, 1.0) * 0.35)
     provenance_positive: dict[str, EvidenceObservation] = {}
     for observation in positive:
@@ -813,31 +1159,48 @@ def aggregate_evidence(
 
     # This is a new normalized evidence score, not a provider-score average.
     score = 0.0
-    if positive:
-        score = 0.55 * max_signal + 0.45 * min(positive_strength / 1.20, 1.0)
+    if positive or risk_context:
+        score = 0.55 * max_any_signal + 0.45 * min(total_strength / 1.20, 1.0)
         if has_legitimate_context and corroboration < 2 and max_signal < 0.85:
             score = max(0.0, score - 0.12)
-    normalized_score = round(min(1.0, score) * 100, 1)
+    evidence_score = round(min(1.0, score) * 100, 1)
 
+    single_source_blockers: list[str] = []
+    if clean:
+        single_source_blockers.append("an independent provider returned an explicit clean result")
+    if has_legitimate_context:
+        single_source_blockers.append("the indicator is established/major infrastructure")
     if artifact:
         final_verdict = "malicious_test_artifact"
         confidence = "high"
         reason = f"The hash is identified as the {artifact} anti-malware test artifact; this is a known test file, not ordinary live malware."
         analyst_review = False
-    elif corroboration >= 2 and len(strong_positive) >= 1 and positive_strength >= 1.10 and clean_strength < positive_strength * 0.85:
+    elif corroboration >= 2 and len(strong_positive) >= 1 and total_strength >= 1.10 and clean_strength < total_strength * 0.85:
         final_verdict = "malicious"
-        confidence = "high" if (len(strong_positive) >= 2 or positive_strength >= 1.60) and coverage >= 0.50 else "medium"
+        confidence = "high" if (len(strong_positive) >= 2 or total_strength >= 1.60) and decision_coverage >= 0.50 else "medium"
         reason = "Multiple independent high-quality threat sources corroborate malicious evidence."
         analyst_review = False
-    elif corroboration == 1 and len(strong_positive) == 1 and max_signal >= 0.90 and clean_strength < positive_strength * 0.75 and not (has_legitimate_context and ioc_type in {"ipv4", "ipv6"}):
+    elif corroboration == 1 and len(strong_exact) == 1 and max_signal >= _HIGH_RELIABILITY_SINGLE_SOURCE_SIGNAL and not single_source_blockers:
         final_verdict = "malicious"
-        confidence = "high" if coverage >= 0.50 and expected_providers >= 2 else "medium"
-        reason = "One exceptionally strong direct threat record supports malicious; independent corroboration is limited."
+        confidence = "high" if decision_coverage >= 0.50 and len(reputation_expected or observations) >= 2 else "medium"
+        reason = "One exceptionally strong, exact-match threat record supports malicious; independent corroboration is limited."
         analyst_review = False
-    elif positive:
+    elif positive or risk_context:
         final_verdict = "suspicious"
-        confidence = "medium" if positive_strength >= 0.45 and coverage >= 0.40 else "low"
-        if has_legitimate_context and ioc_type in {"ipv4", "ipv6"}:
+        confidence = "medium" if total_strength >= 0.45 and decision_coverage >= 0.40 and positive else "low"
+        if not positive:
+            reason = (
+                "Anonymization risk only: no reputation provider reported malicious activity, and anonymization "
+                "infrastructure membership is not proof of malicious activity by itself."
+            )
+        elif all((o.metadata or {}).get("match_type") == "related" for o in positive):
+            reason = "Only related indicators matched (not this indicator itself); this is indirect evidence and is not sufficient for malicious."
+        elif corroboration == 1 and strong_exact and single_source_blockers:
+            reason = (
+                "One strong threat record exists, but it is not sufficient for malicious because "
+                f"{_join(single_source_blockers)}."
+            )
+        elif has_legitimate_context:
             reason = "Reputation evidence is present, but it conflicts with legitimate infrastructure context; analyst review is recommended."
         elif len(independent_positive) == 1:
             reason = "A single provider supplied meaningful evidence, but there is not enough independent corroboration for malicious."
@@ -846,14 +1209,40 @@ def aggregate_evidence(
         analyst_review = True
     elif len(clean) >= 2:
         final_verdict = "benign"
-        confidence = "high" if len(clean) >= 3 else "medium"
-        reason = "Multiple reputation-oriented providers returned found/clean results and no reliable positive evidence was found."
+        if len(clean) >= 3 and decision_coverage >= 0.75:
+            confidence = "high"
+        elif decision_coverage >= 0.50:
+            confidence = "medium"
+        else:
+            confidence = "low"
+        reason = f"Benign: explicit clean results from {_join([_observation_brief(o) for o in clean])}, and no provider reported malicious activity."
         analyst_review = False
     else:
         final_verdict = "unknown"
         confidence = "low"
-        reason = "No reliable positive evidence was found; not-found, unknown, contextual, and provider-health results are not evidence of benignness."
+        if reputation_expected and not reputation_evaluated:
+            reason = (
+                "No reputation provider returned a usable answer "
+                f"({len(reputation_failed)} rate limited, timed out, or unavailable); the indicator cannot be assessed yet."
+            )
+        elif len(clean) == 1:
+            reason = (
+                f"Only one explicit clean result ({_observation_brief(clean[0])}); that is not enough to call the indicator benign, "
+                "and no reliable positive evidence was found."
+            )
+        else:
+            reason = "No reliable positive evidence was found; not-found, unknown, contextual, and provider-health results are not evidence of benignness."
         analyst_review = False
+
+    # The displayed score always sits inside the band of the verdict it
+    # accompanies (thresholds.py), so a gauge can never contradict the badge.
+    if final_verdict == "malicious":
+        normalized_score = max(evidence_score, DISPLAY_MALICIOUS)
+    elif final_verdict == "suspicious":
+        normalized_score = round(min(max(evidence_score, DISPLAY_CLEAN), DISPLAY_MALICIOUS - 0.1), 1)
+    else:
+        # benign / unknown / test artifact carry no scored positive evidence.
+        normalized_score = 0.0
 
     def by_source(verdict: str) -> list[str]:
         return [o.source for o in observations if o.verdict == verdict and o.status == "success" and o.role in {"threat", "supporting"}]
@@ -862,7 +1251,7 @@ def aggregate_evidence(
     supporting = [o for o in positive if o not in strongest][:10]
     conflicting = [o.model_copy(update={"evidence_class": "conflicting"}) for o in observations if (
         (o.contribution == "negative" and positive)
-        or (o.role == "context" and has_legitimate_context and positive)
+        or (o.role == "context" and major_provider_context and positive and o.evidence_class == "contextual")
     )][:20]
     families = sorted({r.malware_family.strip() for r in chosen.values() if r.malware_family and r.malware_family.strip()})
     mitre = sorted({tag.upper() for r in chosen.values() for tag in (r.mitre_attck or [])})
@@ -880,8 +1269,8 @@ def aggregate_evidence(
     provider_health = _provider_health(list(chosen.values()))
     health_failures = [o for o in observations if o.status not in {"success", "not_found", "not_applicable"}]
     deadline_aborts = [o for o in observations if o.status == "aborted_due_to_ioc_deadline"]
-    no_evidence = not positive and not clean and final_verdict in {"benign", "unknown", "harmless", "undetected", "context_only"}
-    insufficient_coverage = coverage < 0.50 or no_evidence
+    no_evidence = not positive and not risk_context and not clean and final_verdict in {"benign", "unknown", "harmless", "undetected", "context_only"}
+    insufficient_coverage = decision_coverage < 0.50 or no_evidence
     if insufficient_coverage and final_verdict in {"benign", "unknown"}:
         analyst_review = analyst_review or final_verdict == "benign"
     needs_review = analyst_review or insufficient_coverage or bool(conflicting)
@@ -890,10 +1279,16 @@ def aggregate_evidence(
         review_reasons.append("Positive, negative, or legitimate infrastructure evidence conflicts")
     if final_verdict in {"malicious", "suspicious"} and corroboration < 2:
         review_reasons.append("High-risk assessment relies on limited independent evidence")
+    if risk_context and final_verdict in {"malicious", "suspicious"}:
+        review_reasons.append("Anonymization infrastructure (Tor exit): activity may originate from many unrelated users")
     if insufficient_coverage:
         review_reasons.append(
-            "No provider returned usable threat evidence; not-found results are absence of data, not proof of safety"
+            f"No reputation provider answered ({len(reputation_failed)} rate limited, timed out, or unavailable); retry before relying on this result"
+            if reputation_expected and not reputation_evaluated
+            else "No provider returned usable threat evidence; not-found results are absence of data, not proof of safety"
             if no_evidence
+            else f"Reputation provider coverage is incomplete ({len(reputation_evaluated)}/{len(reputation_expected)} answered)"
+            if reputation_expected
             else "Applicable provider coverage is incomplete"
         )
     if deadline_aborts:
@@ -902,14 +1297,49 @@ def aggregate_evidence(
     freshness = "historical" if freshness_values and all(item == "historical" for item in freshness_values) else "cached" if freshness_values and all(item == "cached" for item in freshness_values) else "fresh" if freshness_values else "unavailable"
     if freshness == "historical" and final_verdict in {"malicious", "suspicious"}:
         review_reasons.append("High-risk intelligence is historical")
-    if conflicting:
-        conflict_sources = ", ".join(item.source for item in conflicting[:4])
-        reason += f" Conflicting/contextual evidence from {conflict_sources} is surfaced for analyst review."
+    # A listed review reason and the needs_review flag must never disagree.
+    needs_review = needs_review or bool(review_reasons)
+
+    # Reason: verdict basis first, then evidence that was deliberately not
+    # scored (so the analyst sees why it did not change the verdict), then gaps.
     if final_verdict in {"malicious", "suspicious"} and positive:
-        supporting_sources = ", ".join(dict.fromkeys(item.source for item in positive))
-        reason += f" Supporting threat sources: {supporting_sources}."
+        reason += f" Supporting threat sources: {_join([_observation_brief(o) for o in positive])}."
+    if conflicting and positive:
+        conflict_sources = _join([_observation_brief(item) for item in conflicting[:4]])
+        reason += f" Conflicting/contextual evidence from {conflict_sources} is surfaced for analyst review."
+    context_notes: list[str] = []
+    if risk_context:
+        context_notes.append(f"Tor exit relay per {_join([o.source for o in risk_context])} (anonymization risk context)")
+    elif any((o.metadata or {}).get("semantics", {}).get("anonymization") for o in observations):
+        context_notes.append("a provider marks this IP as a Tor exit (anonymization risk context)")
+    for o in observations:
+        semantics = (o.metadata or {}).get("semantics") or {}
+        if semantics.get("kind") == "exposure_context" and semantics.get("exposure"):
+            count = semantics["exposure"].get("infections") or 0
+            context_notes.append(
+                f"{o.source} links {count or 'one or more'} infostealer-infected machine{'' if count == 1 else 's'} to it "
+                "(credential-exposure context, not maliciousness)"
+            )
+        votes = semantics.get("community_votes")
+        if votes and votes.get("malicious"):
+            context_notes.append(
+                f"{o.source} community votes {votes['malicious']} malicious / {votes['harmless']} harmless (weak crowd signal, not scored)"
+            )
+    if platform_abuse:
+        examples = [example for o in platform_abuse for example in ((o.metadata or {}).get("semantics", {}).get("related_examples") or [])][:2]
+        context_notes.append(
+            f"{_join([o.source for o in platform_abuse])} lists related indicators hosted under this domain"
+            + (f" (e.g. {', '.join(examples)})" if examples else "")
+            + ", not the domain itself (platform-abuse context, not scored)"
+        )
+    if legitimacy_notes and (positive or platform_abuse or final_verdict in {"benign", "unknown"}):
+        context_notes.append(f"established infrastructure: {_join(legitimacy_notes)}")
+    if context_notes:
+        reason += " Context: " + "; ".join(dict.fromkeys(context_notes)) + "."
+    if health_failures:
+        reason += " Not evaluated: " + _join([f"{o.source} ({o.status.replace('_', ' ')})" for o in health_failures]) + "."
     if final_verdict == "benign":
-        reason += " This classification is based on explicit negative provider observations; not-found and undetected results were excluded."
+        reason += " Not-found and undetected results were not counted as clean."
 
     return IOCAssessment(
         ioc=ioc,
@@ -924,15 +1354,17 @@ def aggregate_evidence(
         confidence_score={"high": 0.9, "medium": 0.6, "low": 0.25}.get(confidence, 0.25),
         evidence_strength=round(evidence_strength, 4),
         coverage=round(coverage, 4),
-        assessment_status="aborted_due_to_ioc_deadline" if deadline_aborts else "partial" if health_failures or insufficient_coverage else "complete",
+        assessment_status="aborted_due_to_ioc_deadline" if deadline_aborts else "partial" if health_failures or insufficient_coverage or missing_planned else "complete",
         review_reasons=review_reasons,
         freshness=freshness,
         evidence_counts={
             "direct_positive": len([o for o in observations if o.evidence_class == "direct"]),
             "supporting_positive": len([o for o in observations if o.evidence_class == "supporting"]),
+            "related_positive": len([o for o in observations if o.evidence_class == "related_indicator" and o.contribution == "positive"]),
             "negative": len([o for o in observations if o.contribution == "negative"]),
             "conflicting": len(conflicting),
-            "contextual": len([o for o in observations if o.evidence_class == "contextual"]),
+            "contextual": len([o for o in observations if o.evidence_class in {"contextual", "anonymization", "exposure_context"} or (o.role == "context" and o.status == "success")]),
+            "anonymization": len(risk_context),
             "non_observation": len([o for o in observations if o.evidence_class == "non_observation"]),
             "provider_status": len([o for o in observations if o.evidence_class == "provider_status"]),
         },
@@ -943,21 +1375,29 @@ def aggregate_evidence(
             "providers_aggregated": len(observations),
             "duplicate_provider_results_ignored": duplicate_count,
             "positive_strength": round(positive_strength, 4),
+            "anonymization_risk_strength": round(risk_strength, 4),
             "clean_strength": round(clean_strength, 4),
             "reputation_evidence_count": len(positive) + len(clean),
             "evidence_strength": round(evidence_strength, 4),
+            "evidence_score": evidence_score,
             "independent_corroborating_groups": corroboration,
             "expected_providers": expected_providers,
             "evaluated_providers": evaluated_providers,
             "coverage": round(coverage, 4),
+            "reputation_providers_expected": len(reputation_expected),
+            "reputation_providers_evaluated": len(reputation_evaluated),
+            "reputation_coverage": round(reputation_coverage, 4),
+            "planned_providers_without_result": missing_planned,
             "provider_health_failures": len(health_failures),
             "context_only_count": len([o for o in observations if o.role == "context"]),
+            "legitimate_infrastructure": legitimacy_notes,
+            **({"not_applicable_providers": plan_not_applicable} if plan_not_applicable is not None else {}),
         },
         provider_breakdown=observations,
         provider_health=provider_health,
         malicious_sources=by_source("malicious"),
         suspicious_sources=by_source("suspicious"),
-        clean_sources=by_source("clean"),
+        clean_sources=[o.source for o in clean],
         unknown_sources=[o.source for o in observations if o.verdict in {"unknown", "undetected", "unrated"} and o.status in {"success", "not_found"}],
         not_found_sources=[o.source for o in observations if o.status == "not_found"],
         rate_limited_sources=[o.source for o in observations if o.status == "rate_limited"],
@@ -1019,15 +1459,25 @@ def compute_composite(
         confidence=o.confidence,
     ) for o in assessment.provider_breakdown if o.status != "error"]
     if assessment.assessment_domain != "ioc_reputation":
-        # CompositeScore is a legacy reputation-shaped field. Keep it neutral
-        # for typed domains so CVSS/EPSS, ATT&CK metadata, and artifact context
-        # can never be mistaken for an IOC reputation score.
+        # CompositeScore mirrors the domain assessment so every consumer
+        # (history, batch rows, exports, summaries) shows the same headline.
+        # It used to be forced to unknown/0 here, which made a critical KEV
+        # CVE or a breached credential read "unknown, 0" next to a reason
+        # describing the finding. The verdict keeps the domain vocabulary
+        # (critical/high/..., breached/not_breached, context_only,
+        # malicious_test_artifact), so it is never a reputation "malicious".
         return CompositeScore(
-            score=0.0,
-            verdict="unknown",
+            score=assessment.normalized_score,
+            verdict=assessment.final_verdict,
             confidence=assessment.confidence,
-            sources_contributing=0,
+            sources_contributing=len([
+                o for o in assessment.provider_breakdown
+                if o.status == "success" and o.contribution in {"positive", "negative"}
+            ]) or len([o for o in assessment.provider_breakdown if o.status == "success" and o.evidence_class == "vulnerability"]),
             source_breakdown=breakdown,
+            malicious_sources=len(assessment.malicious_sources),
+            suspicious_sources=len(assessment.suspicious_sources),
+            clean_sources=len(assessment.clean_sources),
         )
     # ``clean`` is retained in CompositeScore for old clients. The new
     # authoritative spelling (``benign``/``malicious_test_artifact``) lives in

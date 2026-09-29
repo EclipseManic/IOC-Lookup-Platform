@@ -5,7 +5,7 @@ Standalone script - run with:
     python tests/api_keys_deep_check.py
 
 For each of the 16 provider keys it resolves the credential through its full
-alias chain (system env first, then .env - same priority as the app),
+alias chain (.env first, then system env - same priority as the app),
 performs ONE live request against the provider's real endpoint (rate-limit
 friendly), and reports:
 
@@ -486,8 +486,8 @@ def mask_headers(service: dict, key: str) -> dict:
 
 
 def resolve_chain(service: dict) -> tuple[str, str]:
-    """Resolve a credential through its alias chain (system env first, then
-    .env). Returns ``(key, source_var)`` - source_var is the exact env-var
+    """Resolve a credential through its alias chain (.env first, then system
+    env). Returns ``(key, source_var)`` - source_var is the exact env-var
     name that supplied the key, or "" when nothing is configured."""
     for name in service["env_aliases"]:
         value = resolve_credential(name)
@@ -500,7 +500,7 @@ async def run_all() -> None:
     print("=" * 100)
     print("DEEP API KEY ANALYSIS - one live request per provider")
     print("=" * 100)
-    print("Resolver: system env first, then .env - 16 adapters (keyed + keyless)")
+    print("Resolver: .env first, then system env - 16 adapters (keyed + keyless)")
     print()
 
     summary = []

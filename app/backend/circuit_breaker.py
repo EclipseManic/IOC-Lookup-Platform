@@ -79,11 +79,32 @@ _breakers: dict[str, CircuitBreaker] = {}
 _breakers_lock = threading.Lock()
 
 
-def get_breaker(name: str, failure_threshold: int = 3, recovery_timeout: float = 30.0) -> CircuitBreaker:
+# Consecutive provider-side failures (transport errors, 5xx, provider
+# timeouts) before a provider's circuit opens.  The pipeline never reports
+# rate limits, local queueing or configuration errors here, but a burst of
+# concurrent lookups can still see several simultaneous transport failures
+# during one network blip; a threshold of 5 keeps such a blip from blocking
+# the provider for every other lookup.
+DEFAULT_FAILURE_THRESHOLD = 5
+DEFAULT_RECOVERY_TIMEOUT = 30.0
+
+
+def get_breaker(
+    name: str,
+    failure_threshold: int = DEFAULT_FAILURE_THRESHOLD,
+    recovery_timeout: float = DEFAULT_RECOVERY_TIMEOUT,
+) -> CircuitBreaker:
     with _breakers_lock:
         if name not in _breakers:
             _breakers[name] = CircuitBreaker(name, failure_threshold, recovery_timeout)
         return _breakers[name]
+
+
+def reset_all_breakers() -> None:
+    with _breakers_lock:
+        breakers = list(_breakers.values())
+    for breaker in breakers:
+        breaker.reset()
 
 
 def all_breaker_states() -> list[dict]:

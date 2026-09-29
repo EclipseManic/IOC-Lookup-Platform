@@ -1,15 +1,19 @@
 import base64
-from datetime import datetime
+from datetime import datetime, timezone
 
-import httpx
-
-from app.backend.adapters.base import NormalizedResult, RateLimitConfig, SourceAdapter, is_valid_api_key, retry_after_seconds
+from app.backend.adapters._http import MalformedResponse, failure, http_failure, malformed, not_configured, read_json
+from app.backend.adapters.base import NormalizedResult, RateLimitConfig, SourceAdapter, is_valid_api_key
 from app.backend.config import settings
+
+_MAX_TAGS = 12
 
 
 class VirusTotalAdapter(SourceAdapter):
     name = "VirusTotal"
     supported_types = ["md5", "sha1", "sha256", "ipv4", "ipv6", "domain", "url"]
+    direct_threat_evidence = True
+    produces_reputation = True
+    # Public (free) API: 4 lookups/minute, 500/day, 15.5K/month.
     rate_limit = RateLimitConfig(
         requests_per_minute=4,
         requests_per_day=500,
@@ -22,21 +26,20 @@ class VirusTotalAdapter(SourceAdapter):
     def __init__(self):
         self.api_key = settings.virustotal_api_key
         rpm = getattr(settings, "vt_rate_per_minute", None)
-        if rpm and rpm > 0:
-            self.rate_limit = RateLimitConfig(requests_per_minute=rpm, requests_per_day=500)
+        if isinstance(rpm, int) and rpm > 0 and rpm != self.rate_limit.requests_per_minute:
+            # Premium keys raise the per-minute quota; keep every other
+            # policy field (daily cap, retries, concurrency) intact.
+            self.rate_limit = self.rate_limit.model_copy(update={"requests_per_minute": rpm})
 
     async def lookup(self, ioc_value: str, ioc_type: str) -> NormalizedResult:
         if not is_valid_api_key(self.api_key):
-            return NormalizedResult(
-                ioc=ioc_value, ioc_type=ioc_type, source=self.name,
-                verdict="unknown", tags=["no_api_key_configured"],
-            )
+            return not_configured(self.name, ioc_value, ioc_type)
 
         endpoint = self._endpoint(ioc_value, ioc_type)
         if not endpoint:
-            return NormalizedResult(
-                ioc=ioc_value, ioc_type=ioc_type, source=self.name,
-                verdict="unknown", tags=["unsupported_type"],
+            return failure(
+                self.name, ioc_value, ioc_type, "not_applicable", ["unsupported_type"],
+                f"VirusTotal does not support {ioc_type} lookups", request_made=False,
             )
 
         client = self._get_client()
@@ -46,55 +49,54 @@ class VirusTotalAdapter(SourceAdapter):
                 timeout=15,
             )
 
-        if resp.status_code == 401:
-            return NormalizedResult(
-                ioc=ioc_value, ioc_type=ioc_type, source=self.name,
-                verdict="error", tags=["invalid_api_key"], http_status=resp.status_code,
-            )
-        if resp.status_code == 400:
-            return NormalizedResult(
-                ioc=ioc_value, ioc_type=ioc_type, source=self.name,
-                verdict="unknown", tags=["invalid_request"], status="error",
-                http_status=resp.status_code,
-            )
-        if resp.status_code == 404:
-            return NormalizedResult(
-                ioc=ioc_value, ioc_type=ioc_type, source=self.name,
-                verdict="unknown", raw_score=0.0, status="not_found", http_status=resp.status_code,
-            )
-        if resp.status_code == 429:
-            return NormalizedResult(
-                ioc=ioc_value, ioc_type=ioc_type, source=self.name,
-                verdict="unknown", tags=["rate_limited"], http_status=resp.status_code,
-                retry_after_seconds=retry_after_seconds(resp),
-            )
-        if resp.status_code != 200:
-            return NormalizedResult(
-                ioc=ioc_value, ioc_type=ioc_type, source=self.name,
-                verdict="error", raw_score=0.0, tags=[f"http_{resp.status_code}"], http_status=resp.status_code,
-            )
+        failed = http_failure(self.name, ioc_value, ioc_type, resp)
+        if failed is not None:
+            if resp.status_code == 429:
+                # VirusTotal answers 429 both for the per-minute limit and for
+                # an exhausted daily quota (QuotaExceededError).
+                failed.provider_summary = "VirusTotal quota reached (HTTP 429; public API allows 4/min, 500/day)"
+            return failed
+        try:
+            data = read_json(resp)
+        except MalformedResponse as exc:
+            return malformed(self.name, ioc_value, ioc_type, exc.reason, resp.status_code)
+        if not isinstance(data, dict) or not isinstance(data.get("data"), dict):
+            return malformed(self.name, ioc_value, ioc_type, http_status=resp.status_code)
+        attrs = data["data"].get("attributes") or {}
+        if not isinstance(attrs, dict):
+            attrs = {}
+        stats = attrs.get("last_analysis_stats") or {}
+        if not isinstance(stats, dict):
+            stats = {}
 
-        data = resp.json()
-        attrs = data.get("data", {}).get("attributes", {})
-        stats = attrs.get("last_analysis_stats", {}) or {}
-        malicious = stats.get("malicious", 0)
-        suspicious = stats.get("suspicious", 0)
-        harmless = stats.get("harmless", 0)
-        undetected = stats.get("undetected", 0)
+        def _count(key: str) -> int:
+            value = stats.get(key, 0)
+            return int(value) if isinstance(value, (int, float)) and not isinstance(value, bool) else 0
+
+        malicious = _count("malicious")
+        suspicious = _count("suspicious")
+        harmless = _count("harmless")
+        undetected = _count("undetected")
         total = malicious + suspicious + harmless + undetected
 
         ratio = malicious / total if total > 0 else 0.0
-        if ratio >= 0.1:
+        if total == 0:
+            # The object exists but has never been scanned by any engine.
+            verdict = "unrated"
+        elif ratio >= 0.1:
             verdict = "malicious"
         elif malicious > 0 or suspicious > 0:
             verdict = "suspicious"
-        else:
+        elif harmless > 0:
             verdict = "clean"
+        else:
+            # Every engine answered "undetected": no detection, but no engine
+            # asserted the object is harmless either.
+            verdict = "undetected"
 
         score = ratio
         confidence = "high" if malicious >= 5 else "medium" if malicious > 0 else "low"
         raw_data = {
-            "api_response": data,
             "detection_ratio": f"{malicious}/{total}",
             "malicious": malicious,
             "suspicious": suspicious,
@@ -111,11 +113,11 @@ class VirusTotalAdapter(SourceAdapter):
             parts = threat_label.split(".")
             family = parts[-1] if len(parts) > 1 else threat_label
 
-        tags = attrs.get("tags", [])
+        tags = [str(tag) for tag in (attrs.get("tags") or []) if isinstance(tag, str) and tag.strip()][:_MAX_TAGS]
         categories_data = attrs.get("categories")
         if not isinstance(categories_data, dict):
             categories_data = {}
-        categories = list(categories_data.values()) or []
+        categories = list(dict.fromkeys(str(value) for value in categories_data.values() if value))
 
         mitre = []
         sandbox_verdicts = attrs.get("sandbox_verdicts")
@@ -141,19 +143,28 @@ class VirusTotalAdapter(SourceAdapter):
                 if isinstance(res, dict) and res.get("host_name"):
                     related.append((res["host_name"], "resolves_to"))
 
-        type_description = attrs.get("type_description", "")
-        if type_description:
-            tags.append(f"file_type: {type_description}")
-
-        names = attrs.get("names", [])
+        file_details = {}
+        if attrs.get("type_description"):
+            file_details["type_description"] = attrs.get("type_description")
+        names = attrs.get("names") if isinstance(attrs.get("names"), list) else []
         if names:
-            tags.append(f"file_name: {names[0]}")
-
-        sig_info = attrs.get("signature_info", {})
-        if sig_info and isinstance(sig_info, dict):
-            for k, v in sig_info.items():
-                if v:
-                    tags.append(f"{k}: {v}")
+            file_details["names"] = [str(name)[:200] for name in names[:5]]
+        for key in ("meaningful_name", "size", "type_tag"):
+            if attrs.get(key) not in (None, ""):
+                file_details[key] = attrs.get(key)
+        sig_info = attrs.get("signature_info")
+        if isinstance(sig_info, dict) and sig_info:
+            file_details["signature_info"] = {
+                k: str(v)[:200] for k, v in sig_info.items()
+                if k in {"product", "description", "copyright", "signers", "verified", "original name"} and v
+            }
+        if file_details:
+            raw_data["file"] = file_details
+        for key in ("as_owner", "asn", "country", "network", "registrar", "reputation"):
+            if attrs.get(key) not in (None, ""):
+                raw_data[key] = attrs.get(key)
+        if threat_label:
+            raw_data["suggested_threat_label"] = threat_label
 
         first_sub = attrs.get("first_submission_date")
         first_seen = None
@@ -162,7 +173,7 @@ class VirusTotalAdapter(SourceAdapter):
                 ts = int(first_sub)
                 if ts > 1e10:
                     ts = ts / 1000
-                first_seen = datetime.fromtimestamp(ts)
+                first_seen = datetime.fromtimestamp(ts, tz=timezone.utc)
             except (TypeError, ValueError, OSError, OverflowError):
                 first_seen = None
 
@@ -173,18 +184,18 @@ class VirusTotalAdapter(SourceAdapter):
                 ts = int(last_sub)
                 if ts > 1e10:
                     ts = ts / 1000
-                last_seen = datetime.fromtimestamp(ts)
+                last_seen = datetime.fromtimestamp(ts, tz=timezone.utc)
             except (TypeError, ValueError, OSError, OverflowError):
                 last_seen = None
 
-        total_votes = attrs.get("total_votes", {})
-        if total_votes:
-            vm = total_votes.get("malicious", 0)
-            if vm:
-                tags.append(f"votes_malicious: {vm}")
-            vh = total_votes.get("harmless", 0)
-            if vh:
-                tags.append(f"votes_harmless: {vh}")
+        total_votes = attrs.get("total_votes")
+        if isinstance(total_votes, dict) and total_votes:
+            # Community votes are opinion, not engine detections; keep them
+            # as structured context rather than as tags.
+            raw_data["community_votes"] = {
+                "malicious": total_votes.get("malicious", 0),
+                "harmless": total_votes.get("harmless", 0),
+            }
 
         return NormalizedResult(
             ioc=ioc_value,
@@ -199,7 +210,7 @@ class VirusTotalAdapter(SourceAdapter):
             mitre_attck=mitre,
             related_iocs=related,
             source_link=f"https://www.virustotal.com/gui/{self._url_type(ioc_type)}/{ioc_value}",
-            reports_count=malicious,
+            reports_count=None,
             detection_count=malicious,
             total_engines=total,
             first_seen=first_seen,

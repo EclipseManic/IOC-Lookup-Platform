@@ -46,8 +46,64 @@ def _stix_id(prefix: str) -> str:
     return f"{prefix}--{uuid.uuid4()}"
 
 
+def _execution_state(result: dict) -> str:
+    state = result.get("execution_state")
+    if state:
+        return str(state)
+    status = str(result.get("status") or "found")
+    if status == "not_found":
+        return "not_found"
+    if status in {"error", "unavailable", "not_applicable"}:
+        return status
+    return "success"
+
+
+def provider_evidence_rows(response: dict) -> list[tuple[dict, str]]:
+    """Provider results that actually answered, with their assessed meaning.
+
+    Returns ``(result, effective_verdict)``. Not-found, rate-limited,
+    unavailable and other non-answers are dropped: they are absence of data,
+    not sightings. When the final assessment is present the provider's role
+    in it decides the verdict, so context (infostealer exposure of an IP,
+    related-indicator matches, test-artifact detections) is never exported as
+    maliciousness, and Tor membership is exported as anonymization.
+    """
+    assessment = response.get("final_assessment") or {}
+    observations = {
+        str(item.get("source")): item
+        for item in (assessment.get("provider_breakdown") or [])
+        if isinstance(item, dict)
+    }
+    rows: list[tuple[dict, str]] = []
+    for result in response.get("results") or []:
+        if not isinstance(result, dict) or _execution_state(result) != "success":
+            continue
+        observation = observations.get(str(result.get("source")))
+        if observation is None:
+            rows.append((result, str(result.get("verdict") or "unknown")))
+            continue
+        contribution = observation.get("contribution")
+        evidence_class = observation.get("evidence_class")
+        if evidence_class == "credential_exposure":
+            verdict = "compromised"
+        elif contribution == "positive":
+            verdict = observation.get("verdict") if observation.get("verdict") in {"malicious", "suspicious"} else "suspicious"
+        elif contribution == "context_risk":
+            verdict = "anonymization"
+        elif contribution == "negative":
+            verdict = "benign"
+        else:
+            verdict = "unknown"
+        rows.append((result, verdict))
+    return rows
+
+
 def _verdict_to_labels(verdict: str) -> list[str]:
-    if verdict in {"malicious", "breached", "compromised", "critical", "high"}:
+    if verdict in {"breached", "compromised"}:
+        return ["compromised"]
+    if verdict == "anonymization":
+        return ["anonymization"]
+    if verdict in {"malicious", "critical", "high"}:
         return ["malicious-activity"]
     if verdict in {"suspicious", "medium", "low"}:
         return ["suspicious-activity"]
@@ -138,7 +194,7 @@ def build_stix_bundle(response: dict) -> dict:
         }
 
     main_obs_id = _stix_id("observed-data")
-    window_first, window_last = _observed_window(results)
+    window_first, window_last = _observed_window([row for row, _ in provider_evidence_rows(response)])
     objects.append({
         "type": "observed-data",
         "id": main_obs_id,
@@ -151,11 +207,13 @@ def build_stix_bundle(response: dict) -> dict:
     })
 
     relationship_ids: list[str] = []
-    for r in results:
+    evidence_rows = provider_evidence_rows(response)
+    for r, effective_verdict in evidence_rows:
         source_name = r.get("source", "Unknown")
         r_indicator_id = _stix_id("indicator")
-        verdict_label = _verdict_to_labels(r.get("verdict", "unknown"))
-        indicator_types = (["malicious-activity"] + verdict_label) if r.get("confidence") in ("high", "medium") else verdict_label
+        # The label follows what the provider's record means in the final
+        # assessment; confidence never promotes a record to malicious-activity.
+        indicator_types = _verdict_to_labels(effective_verdict)
 
         objects.append({
             "type": "indicator",
@@ -163,7 +221,7 @@ def build_stix_bundle(response: dict) -> dict:
             "created": _ts(),
             "modified": _ts(),
             "name": f"{ioc_value} — {source_name}",
-            "description": f"{source_name}: {r.get('verdict', 'unknown')} (score: {r.get('raw_score', 'N/A')})",
+            "description": f"{source_name}: {effective_verdict} (provider verdict: {r.get('verdict', 'unknown')}, score: {r.get('raw_score', 'N/A')})",
             "indicator_types": indicator_types,
             "pattern": _build_pattern(ioc_value, ioc_type),
             "pattern_type": "stix",
@@ -195,11 +253,15 @@ def build_stix_bundle(response: dict) -> dict:
                 "relationship_type": rtype,
                 "source_ref": src_ref,
                 "target_ref": tgt_ref,
-                "description": f"{source_name}: {r.get('verdict', 'unknown')}",
+                "description": f"{source_name}: {effective_verdict}",
             })
             relationship_ids.append(rel_id)
 
-    if results:
+    # A sighting counts only providers that actually reported this indicator
+    # as malicious/suspicious; not-found and unavailable providers are not
+    # sightings.
+    sighting_count = len([1 for _, effective_verdict in evidence_rows if effective_verdict in {"malicious", "suspicious"}])
+    if sighting_count:
         objects.append({
             "type": "sighting",
             "id": _stix_id("sighting"),
@@ -207,7 +269,7 @@ def build_stix_bundle(response: dict) -> dict:
             "modified": _ts(),
             "sighting_of_ref": indicator_id,
             "where_sighted_refs": [],
-            "count": len(results),
+            "count": sighting_count,
             "summary": True,
         })
 

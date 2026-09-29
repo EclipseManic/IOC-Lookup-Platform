@@ -89,7 +89,7 @@ def test_run_batch_analysis_success(monkeypatch):
     batch_mod._batch_tasks.clear()
     batch_mod._batch_queues.clear()
 
-    async def fake_run_analysis(ioc, task_id=None, fp_override=False):
+    async def fake_run_analysis(ioc, task_id=None, fp_override=False, **kwargs):
         t = AnalysisTask(task_id=task_id or "x", ioc_value=ioc, status="done", progress=100.0)
         t.composite = CompositeScore(score=0.0, verdict="clean", confidence="high")
         return t
@@ -110,7 +110,7 @@ def test_run_batch_analysis_timeout(monkeypatch):
     batch_mod._batch_tasks.clear()
     batch_mod._batch_queues.clear()
 
-    async def slow_run(ioc, task_id=None, fp_override=False):
+    async def slow_run(ioc, task_id=None, fp_override=False, **kwargs):
         await asyncio.sleep(5)
 
     monkeypatch.setattr(batch_mod, "run_analysis", slow_run)
@@ -127,7 +127,7 @@ def test_run_batch_analysis_generic_error(monkeypatch):
     batch_mod._batch_tasks.clear()
     batch_mod._batch_queues.clear()
 
-    async def boom_run(ioc, task_id=None, fp_override=False):
+    async def boom_run(ioc, task_id=None, fp_override=False, **kwargs):
         raise ValueError("kaput")
 
     monkeypatch.setattr(batch_mod, "run_analysis", boom_run)
@@ -158,7 +158,7 @@ def test_run_batch_analysis_fp_override(monkeypatch):
     batch_mod._batch_queues.clear()
     captured = []
 
-    async def fake_run(ioc, task_id=None, fp_override=False):
+    async def fake_run(ioc, task_id=None, fp_override=False, **kwargs):
         captured.append((ioc, fp_override))
         t = AnalysisTask(task_id=task_id or "x", ioc_value=ioc, status="done")
         t.composite = CompositeScore(score=0.0, verdict="clean", confidence="high")

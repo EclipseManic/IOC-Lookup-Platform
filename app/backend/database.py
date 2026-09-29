@@ -6,9 +6,10 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 from sqlalchemy import event, inspect, select, delete, text
-from sqlalchemy.exc import OperationalError
+from sqlalchemy.exc import IntegrityError, OperationalError
 from sqlalchemy import create_engine
 from sqlalchemy.ext.asyncio import create_async_engine, async_sessionmaker, AsyncSession
+from sqlalchemy.pool import NullPool
 
 from app.backend.config import settings
 from app.backend.models import Base, IOC, InvestigationIOC, IOCFeedback, LookupResult
@@ -33,6 +34,13 @@ if _db_url.startswith("sqlite"):
     # WU-0.2: keep writes from failing under concurrency — wait on the lock
     # instead of raising "database is locked" immediately.
     _connect_args = {"timeout": 30}
+    # A local SQLite file has no connection set-up cost worth pooling, while a
+    # pooled aiosqlite connection is bound to the event loop that opened it:
+    # when that loop ends (app shutdown, a test's loop) the pooled connection's
+    # worker thread later calls back into the closed loop ("RuntimeError: Event
+    # loop is closed").  Opening one connection per session and closing it
+    # with the session keeps every connection inside its own loop.
+    _pool_kwargs = {"poolclass": NullPool}
 else:
     _pool_kwargs["pool_size"] = 5
     _pool_kwargs["max_overflow"] = 10
@@ -259,6 +267,55 @@ async def upsert_lookup_result(
                 if key != "task_id":
                     setattr(row, key, value)
     await retry_sqlite_commit(session)
+
+
+async def persist_lookup(
+    *,
+    value: str,
+    ioc_type: str,
+    task_id: str,
+    composite_score: float,
+    composite_verdict: str,
+    composite_confidence: str,
+    full_response: str,
+    source_count: int,
+    batch_id: str | None = None,
+) -> int:
+    """Get-or-create the IOC row and upsert its LookupResult in one session.
+
+    Two lookups of the same indicator can finish at the same moment (a single
+    lookup plus a batch, or a repeated submission); both then try to insert
+    the IOC row and one hits the ``uq_ioc_value`` constraint.  That loser used
+    to drop its LookupResult silently.  Retrying once re-reads the row the
+    winner created.  Returns the IOC id.
+    """
+    for attempt in range(2):
+        try:
+            async with async_session() as session:
+                ioc_obj = (
+                    await session.execute(select(IOC).where(IOC.value == value))
+                ).scalar_one_or_none()
+                if ioc_obj is None:
+                    ioc_obj = IOC(value=value, ioc_type=ioc_type or "unknown")
+                    session.add(ioc_obj)
+                    await session.flush()
+                ioc_id = ioc_obj.id
+                await upsert_lookup_result(
+                    session,
+                    ioc_id=ioc_id,
+                    task_id=task_id,
+                    composite_score=composite_score,
+                    composite_verdict=composite_verdict,
+                    composite_confidence=composite_confidence,
+                    full_response=full_response,
+                    source_count=source_count,
+                    batch_id=batch_id,
+                )
+                return ioc_id
+        except IntegrityError:
+            if attempt:
+                raise
+    raise RuntimeError("unreachable")
 
 
 async def cleanup_old_lookups(days: int | None = None) -> int:

@@ -93,7 +93,9 @@ async def resolve_public_url(
 
 def get_client() -> AsyncClient:
     global _SHARED_CLIENT
-    if _SHARED_CLIENT is None:
+    # A closed client (previous app lifespan, tests) cannot send requests;
+    # hand out a fresh one instead of failing every provider call.
+    if _SHARED_CLIENT is None or _SHARED_CLIENT.is_closed:
         _SHARED_CLIENT = AsyncClient(
             limits=Limits(max_connections=200, max_keepalive_connections=50),
             timeout=DEFAULT_TIMEOUT,

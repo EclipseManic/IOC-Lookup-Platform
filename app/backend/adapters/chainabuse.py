@@ -3,12 +3,12 @@ from datetime import datetime, timezone
 
 import httpx
 
+from app.backend.adapters._http import MalformedResponse, failure, http_failure, malformed, not_configured, read_json
 from app.backend.adapters.base import (
     NormalizedResult,
     RateLimitConfig,
     SourceAdapter,
     is_valid_api_key,
-    retry_after_seconds,
 )
 from app.backend.config import settings
 
@@ -55,14 +55,11 @@ class ChainAbuseAdapter(SourceAdapter):
 
     async def lookup(self, ioc_value: str, ioc_type: str) -> NormalizedResult:
         if not is_valid_api_key(self.api_key):
-            return NormalizedResult(
-                ioc=ioc_value, ioc_type=ioc_type, source=self.name,
-                verdict="unknown", tags=["no_api_key_configured"],
-            )
+            return not_configured(self.name, ioc_value, ioc_type)
         if not self._reserve_quota():
-            return NormalizedResult(
-                ioc=ioc_value, ioc_type=ioc_type, source=self.name,
-                verdict="unknown", tags=["monthly_quota_exhausted"],
+            return failure(
+                self.name, ioc_value, ioc_type, "unavailable", ["monthly_quota_exhausted"],
+                f"ChainAbuse monthly budget ({self.MONTHLY_LIMIT} requests) used up locally", request_made=False,
             )
         client = self._get_client()
         response = await client.get(
@@ -72,28 +69,15 @@ class ChainAbuseAdapter(SourceAdapter):
             headers={"accept": "application/json"},
             timeout=15,
         )
-        if response.status_code == 429:
-            return NormalizedResult(
-                ioc=ioc_value, ioc_type=ioc_type, source=self.name,
-                verdict="unknown", tags=["rate_limited"], http_status=429,
-                retry_after_seconds=retry_after_seconds(response),
-            )
-        if response.status_code in (401, 403):
-            return NormalizedResult(
-                ioc=ioc_value, ioc_type=ioc_type, source=self.name,
-                verdict="error", tags=["unauthorized"], http_status=response.status_code,
-            )
-        if response.status_code == 404:
-            return NormalizedResult(
-                ioc=ioc_value, ioc_type=ioc_type, source=self.name,
-                verdict="unknown", status="not_found", tags=["no_reports"], http_status=404,
-            )
-        if response.status_code != 200:
-            return NormalizedResult(
-                ioc=ioc_value, ioc_type=ioc_type, source=self.name,
-                verdict="error", tags=[f"http_{response.status_code}"], http_status=response.status_code,
-            )
-        data = response.json()
+        failed = http_failure(self.name, ioc_value, ioc_type, response, not_found_summary="No ChainAbuse reports for this address")
+        if failed is not None:
+            if failed.execution_state == "not_found":
+                failed.tags = ["no_reports"]
+            return failed
+        try:
+            data = read_json(response)
+        except MalformedResponse as exc:
+            return malformed(self.name, ioc_value, ioc_type, exc.reason, response.status_code)
         raw_data = data if isinstance(data, dict) else {"response": data}
         reports = self._reports(data)
         if not reports:
@@ -109,7 +93,10 @@ class ChainAbuseAdapter(SourceAdapter):
                 if value:
                     categories.append(str(value))
         categories = list(dict.fromkeys(categories))[:30]
-        tags = ["abuse_reports", f"reports:{len(reports)}"] + [f"category:{item}" for item in categories[:10]]
+        # Report count and category names are typed fields (reports_count,
+        # categories); the tag is only the label.
+        tags = ["abuse_reports"]
+        raw_data = {**raw_data, "report_count": len(reports)}
         return NormalizedResult(
             ioc=ioc_value, ioc_type=ioc_type, source=self.name,
             verdict="malicious", raw_score=min(1.0, 0.65 + len(reports) * 0.05), confidence="high",
