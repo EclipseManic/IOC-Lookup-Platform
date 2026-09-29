@@ -5,6 +5,7 @@ import VerdictBadge from "../components/VerdictBadge";
 import {
   buildLookupResponseFromBatch,
   cancelBatch,
+  getBatchIOCResult,
   getBatchResult,
   getBatchStatus,
   startBatch,
@@ -13,7 +14,7 @@ import {
   type BatchResultItem,
   type BatchStatus,
   type IOCAssessment,
-  saveBatchHistory,
+  type LookupResponse,
 } from "../services/api";
 import type { NavigateEvent } from "../App";
 
@@ -71,12 +72,30 @@ async function prepareBatchValues(values: string[]): Promise<string[]> {
   return prepared;
 }
 
+// Verdicts that carry NO reputation signal and must never reach the
+// malicious/benign buckets:
+//   - `malicious_test_artifact` is the EICAR-style TEST sentinel. It contains the
+//     substring "malicious", so it has to be matched BEFORE the
+//     `.includes("malicious")` check below or the donut reports fake detections.
+//   - `context_only` is emitted by context-only providers (scorer.py).
+//   - `vulnerability` / `attack_technique` are typed assessment domains (CVE and
+//     ATT&CK). They already fell through to "unknown"; listing them here makes
+//     that deliberate so a future `.includes()` style check cannot capture them.
+const NON_REPUTATION_VERDICTS = new Set([
+  "malicious_test_artifact",
+  "context_only",
+  "vulnerability",
+  "attack_technique",
+]);
+
 function verdictBucket(verdict: string): VerdictBucket {
-  if (verdict === "breached" || verdict === "pwned") return "breached";
-  if (verdict === "not_breached" || verdict === "not_pwned") return "not_breached";
-  if (verdict.includes("malicious") || verdict === "compromised") return "malicious";
-  if (verdict === "suspicious") return "suspicious";
-  if (verdict === "benign" || verdict === "clean") return "benign";
+  const value = verdict.trim().toLowerCase();
+  if (NON_REPUTATION_VERDICTS.has(value)) return "unknown";
+  if (value === "breached" || value === "pwned") return "breached";
+  if (value === "not_breached" || value === "not_pwned") return "not_breached";
+  if (value.includes("malicious") || value === "compromised") return "malicious";
+  if (value === "suspicious") return "suspicious";
+  if (value === "benign" || value === "clean") return "benign";
   return "unknown";
 }
 function verdictLabel(verdict: VerdictBucket): string {
@@ -206,6 +225,13 @@ function BatchSummary({ result, groups }: { result: BatchResult; groups: BatchGr
   }, [groups]);
   const health = result.provider_health ?? [];
   const cached = health.reduce((sum, item) => sum + item.cache_hit_count, 0);
+  // `failed_lookups` is a SUPERSET, verified against app/backend/batch.py
+  // (BatchTask.refresh_metrics): execution_state "rate_limited" increments both
+  // `rate_limited_lookups` and `failed_lookups`; "timeout" increments both
+  // `timeout_lookups` and `failed_lookups`; every other non-success, non-N/A,
+  // non-deadline state increments `failed_lookups` alone. Deadline aborts go to
+  // `batch_deadline_exceeded` only and are never in `failed_lookups`. So this
+  // subtraction correctly isolates genuine provider errors/unavailability.
   const errors = Math.max(0, result.failed_lookups - result.rate_limited_lookups - result.timeout_lookups);
   const notApplicable = result.not_applicable_lookups ?? result.execution_health?.not_applicable ?? 0;
   const deadline = result.batch_deadline_exceeded ?? result.execution_health?.batch_deadline_exceeded ?? 0;
@@ -261,6 +287,11 @@ export default function Batch({
   const [reviewOnly, setReviewOnly] = useState(false);
   const [sortBy, setSortBy] = useState("severity");
   const [expandAll, setExpandAll] = useState(false);
+  const [pollError, setPollError] = useState<string | null>(null);
+  // Non-null while a batch is being fetched/started but has produced no status,
+  // result or error yet. Without it that window renders the "paste IOCs" form.
+  const [loadingNotice, setLoadingNotice] = useState<string | null>(initialBatchId ? "Loading saved batch…" : null);
+  const [openingKey, setOpeningKey] = useState<string | null>(null);
   const pollingRef = useRef<number | null>(null);
   const pollingGenerationRef = useRef(0);
   const autoRescanTriggeredRef = useRef(false);
@@ -277,18 +308,24 @@ export default function Batch({
   useEffect(() => () => { stopPolling(); }, [stopPolling]);
 
   useEffect(() => {
-    if (!initialBatchId) return;
+    if (!initialBatchId) {
+      setLoadingNotice(null);
+      return;
+    }
     let cancelled = false;
     setLoading(true);
+    setLoadingNotice("Loading saved batch…");
     getBatchResult(initialBatchId).then((loaded) => {
       if (!cancelled) {
         setBatchId(loaded.batch_id);
         setResult(loaded);
         setLoading(false);
+        setLoadingNotice(null);
       }
     }).catch(() => {
       if (cancelled) return;
       setLoading(false);
+      setLoadingNotice(null);
       if (initialResult && Array.isArray(initialResult.results)) {
         setBatchId(initialResult.batch_id || initialBatchId);
         setResult({ ...initialResult, batch_id: initialResult.batch_id || initialBatchId });
@@ -302,6 +339,7 @@ export default function Batch({
 
   const pollBatch = useCallback(async (bid: string) => {
     stopPolling();
+    setPollError(null);
     const generation = pollingGenerationRef.current;
     const poll = async () => {
       if (generation !== pollingGenerationRef.current) return;
@@ -327,17 +365,33 @@ export default function Batch({
         }
         if (current.status === "done" || current.status === "completed") {
           const stoppedGeneration = stopPolling();
-          const finalResult = await getBatchResult(bid);
+          // `stopPolling()` already bumped the generation, so a throw here would
+          // fall into the outer catch and be discarded by its stale-generation
+          // guard — leaving `loading` true and the progress card spinning with no
+          // error. This branch therefore recovers on its own.
+          let finalResult: BatchResult;
+          try {
+            finalResult = await getBatchResult(bid);
+          } catch {
+            if (stoppedGeneration !== pollingGenerationRef.current) return;
+            setLoading(false);
+            setLoadingNotice(null);
+            // `status` is intentionally kept: setting `pollError` hides the
+            // progress card (it requires `!pollError`) and shows the retry card.
+            setPollError("Batch finished but results could not be loaded. Retry to fetch them.");
+            showToast("Batch finished but results could not be loaded — retry to fetch them", "error");
+            return;
+          }
           if (stoppedGeneration !== pollingGenerationRef.current) return;
           setResult(finalResult);
-          saveBatchHistory(finalResult);
           setLoading(false);
+          setLoadingNotice(null);
           showToast(`Batch complete: ${finalResult.completed}/${finalResult.total} IOCs`, "success");
           return;
         }
       } catch {
         if (generation !== pollingGenerationRef.current) return;
-        stopPolling(); setLoading(false); setBatchId(null); setStatus(null); showToast("Batch polling failed — please retry", "error");
+        stopPolling(); setLoading(false); setPollError("Batch polling failed. The batch may still be running on the server."); showToast("Batch polling failed — retry to resume", "error");
         return;
       }
       if (generation === pollingGenerationRef.current) {
@@ -384,6 +438,43 @@ export default function Batch({
     try { const started = await uploadBatchFile(file); setBatchId(started.batch_id); await pollBatch(started.batch_id); } catch (error) { showToast(error instanceof Error ? error.message : "Could not upload batch", "error"); setLoading(false); }
   }
 
+  function navigateToLookup(group: BatchGroup, lookupResponse: LookupResponse) {
+    window.dispatchEvent(new CustomEvent<NavigateEvent>("navigate", {
+      detail: {
+        page: "lookup",
+        ioc: group.value,
+        iocType: group.type === "password" ? "password_sha1" : group.type,
+        batchResultItem: lookupResponse,
+        fromBatch: true,
+        batchId: result?.batch_id,
+      },
+    }));
+  }
+
+  async function handleOpenGroup(group: BatchGroup) {
+    const fallback = () => buildLookupResponseFromBatch(
+      group.value,
+      group.type,
+      group.assessment,
+      group.results,
+      result?.relationships,
+      result?.provider_health,
+      group.assessment?.task_id ?? group.results.find((item) => item.task_id)?.task_id
+    );
+    const bid = result?.batch_id ?? batchId;
+    if (!bid) { navigateToLookup(group, fallback()); return; }
+    setOpeningKey(group.key);
+    try {
+      const full = await getBatchIOCResult(bid, group.value);
+      navigateToLookup(group, full);
+    } catch {
+      showToast("Could not load the full analysis; showing batch evidence only", "info");
+      navigateToLookup(group, fallback());
+    } finally {
+      setOpeningKey(null);
+    }
+  }
+
   const handleRescanBatch = useCallback(async (customList?: string[]) => {
     const list = customList && customList.length > 0
       ? customList
@@ -402,6 +493,12 @@ export default function Batch({
       setLoading(false);
     }
   }, [pollBatch, result]);
+
+  const handleRetryPoll = useCallback(async () => {
+    if (!batchId) return;
+    setLoading(true);
+    await pollBatch(batchId);
+  }, [batchId, pollBatch]);
 
   useEffect(() => {
     if (!autoRescan || !result || autoRescanTriggeredRef.current) return;
@@ -459,33 +556,15 @@ export default function Batch({
 
       {!batchId && <div className="space-y-4"><label role="button" tabIndex={0} aria-label="Upload CSV or JSON file" className={`flex h-32 flex-col items-center justify-center rounded-lg border-2 border-dashed transition-colors focus:outline-none focus:border-accent focus:ring-1 focus:ring-accent ${dragOver ? "border-accent bg-accent/5" : "border-border hover:border-accent/50"}`} onKeyDown={(event) => { if (event.key === "Enter" || event.key === " ") { event.preventDefault(); (event.currentTarget.querySelector("input[type=file]") as HTMLInputElement | null)?.click(); } }} onDragOver={(event) => { event.preventDefault(); setDragOver(true); }} onDragLeave={() => setDragOver(false)} onDrop={(event) => { event.preventDefault(); setDragOver(false); const file = event.dataTransfer.files?.[0]; if (file) { const dataTransfer = new DataTransfer(); dataTransfer.items.add(file); handleFileUpload({ target: { files: dataTransfer.files } } as React.ChangeEvent<HTMLInputElement>); } }}><svg className="mb-2 h-8 w-8 text-text-secondary" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={1.5} d="M7 16a4 4 0 01-.88-7.903A5 5 0 1115.9 6L16 6a5 5 0 011 9.9M15 13l-3-3m0 0l-3 3m3-3v12" /></svg><span className="text-xs text-text-secondary">Drop CSV/JSON/TXT file or click to browse</span><input type="file" accept=".csv,.json,.txt" onChange={handleFileUpload} className="hidden" /></label><div><textarea value={iocs} onChange={(event) => setIocs(event.target.value)} placeholder={"Paste IOCs here, one per line — auto-detected or typed:\n185.199.108.153\nexample.com\ndomain:eclipsemanic.me\nip:8.8.8.8\nsha256:d41d8cd98f00b204e9800998ecf8427e..."} className="h-40 w-full resize-y rounded-lg border border-border bg-bg-card px-4 py-3 font-mono text-sm text-text-primary outline-none transition-all placeholder-text-secondary focus:border-accent focus:ring-1 focus:ring-accent" disabled={loading} /><div className="mt-1.5 rounded-md border border-accent/20 bg-accent/5 px-3 py-1.5 text-[11px] text-text-secondary"><span className="font-semibold text-accent">💡 Typed prefixes:</span> Force IOC type with <code className="rounded bg-bg-elevated px-1 py-0.5 font-mono text-accent">type:value</code> syntax — e.g. <code className="rounded bg-bg-elevated px-1 py-0.5 font-mono">domain:eclipsemanic.me</code>, <code className="rounded bg-bg-elevated px-1 py-0.5 font-mono">ip:1.1.1.1</code>, <code className="rounded bg-bg-elevated px-1 py-0.5 font-mono">cve:CVE-2021-44228</code>, <code className="rounded bg-bg-elevated px-1 py-0.5 font-mono">sha256:abc123…</code></div><div className="mt-2 flex items-center justify-between"><span className={`text-xs font-mono ${overLimit ? "text-verdict-malicious" : "text-text-secondary"}`}>{inputList.length} IOC{inputList.length !== 1 ? "s" : ""}{overLimit ? " (max 100)" : ""}</span><button onClick={handleSubmit} disabled={loading || inputList.length === 0 || overLimit} className="rounded-lg bg-accent px-5 py-2 text-sm font-medium text-[#06070d] transition-colors hover:bg-accent/90 disabled:cursor-not-allowed disabled:opacity-40">{loading ? "Starting..." : "Analyze Batch"}</button></div></div></div>}
 
-      {status && !result && <div className="rounded-lg border border-border bg-bg-card p-6 text-center"><div role="progressbar" aria-label="Batch progress" aria-valuemin={0} aria-valuemax={100} aria-valuenow={Math.round(status.progress)} className="mb-4 h-2 w-full rounded-full bg-bg-elevated"><div className="h-2 rounded-full bg-gradient-to-r from-accent to-accent-secondary transition-all duration-500" style={{ width: `${status.progress}%` }} /></div><p className="text-sm text-text-secondary" aria-live="polite">Processing {status.completed}/{status.total} IOCs…</p><p className="mt-1 text-xs text-text-secondary">{status.progress > 0 && status.expected_lookups > 0 ? `${status.progress.toFixed(0)}% complete · ${status.completed_lookups}/${status.expected_lookups} provider lookups` : status.active_iocs?.length ? `Analyzing ${status.active_iocs.length} IOC${status.active_iocs.length === 1 ? "" : "s"} · provider plan in progress…` : "Preparing provider plans…"}</p><button onClick={async () => { if (!batchId) return; try { await cancelBatch(batchId); showToast("Batch cancellation requested", "info"); } catch (error) { showToast(error instanceof Error ? error.message : "Could not cancel batch", "error"); } }} className="mt-4 rounded-md border border-border bg-bg-elevated px-3 py-1.5 text-xs text-text-secondary transition-colors hover:border-red-400/40 hover:text-red-400">Cancel Batch</button></div>}
+      {status && !result && !pollError && <div className="rounded-lg border border-border bg-bg-card p-6 text-center"><div role="progressbar" aria-label="Batch progress" aria-valuemin={0} aria-valuemax={100} aria-valuenow={Math.round(status.progress)} className="mb-4 h-2 w-full rounded-full bg-bg-elevated"><div className="h-2 rounded-full bg-gradient-to-r from-accent to-accent-secondary transition-all duration-500" style={{ width: `${status.progress}%` }} /></div><p className="text-sm text-text-secondary" aria-live="polite">Processing {status.completed}/{status.total} IOCs…</p><p className="mt-1 text-xs text-text-secondary">{status.progress > 0 && status.expected_lookups > 0 ? `${status.progress.toFixed(0)}% complete · ${status.completed_lookups}/${status.expected_lookups} provider lookups` : status.active_iocs?.length ? `Analyzing ${status.active_iocs.length} IOC${status.active_iocs.length === 1 ? "" : "s"} · provider plan in progress…` : "Preparing provider plans…"}</p><button onClick={async () => { if (!batchId) return; try { await cancelBatch(batchId); showToast("Batch cancellation requested", "info"); } catch (error) { showToast(error instanceof Error ? error.message : "Could not cancel batch", "error"); } }} className="mt-4 rounded-md border border-border bg-bg-elevated px-3 py-1.5 text-xs text-text-secondary transition-colors hover:border-red-400/40 hover:text-red-400">Cancel Batch</button></div>}
+
+      {pollError && !result && <div className="rounded-lg border border-verdict-malicious/30 bg-verdict-malicious/10 p-6 text-center"><p className="mb-2 font-medium text-verdict-malicious">Batch polling interrupted</p><p className="mb-4 text-sm text-text-secondary">{pollError}</p><div className="flex justify-center gap-2"><button onClick={handleRetryPoll} disabled={loading || !batchId} className="rounded-lg bg-accent px-4 py-1.5 text-sm text-[#06070d] transition-colors hover:bg-accent/90 disabled:cursor-not-allowed disabled:opacity-40">{loading ? "Retrying…" : "Retry"}</button><button onClick={() => { setPollError(null); setIocs(""); setBatchId(null); setStatus(null); setResult(null); }} className="rounded-lg border border-border bg-bg-elevated px-4 py-1.5 text-sm text-text-secondary transition-colors hover:text-text-primary">New Batch</button></div></div>}
 
       {result && <div className="space-y-5"><BatchSummary result={result} groups={groups} /><div className="flex flex-wrap items-center justify-between gap-2"><div><h3 className="text-sm font-semibold uppercase tracking-wider text-text-secondary">IOC assessments</h3><p className="mt-1 text-xs text-text-secondary">Showing {visibleGroups.length} of {groups.length} unique IOCs · each card contains all provider evidence.</p></div><div className="flex gap-2"><button onClick={() => setExpandAll((value) => !value)} className="rounded-md border border-border bg-bg-elevated px-3 py-1.5 text-xs text-text-secondary hover:text-text-primary">{expandAll ? "Collapse all evidence" : "Expand all evidence"}</button><button onClick={() => handleRescanBatch()} disabled={loading} className="rounded-md border border-accent/40 bg-accent/10 px-3 py-1.5 text-xs font-semibold text-accent hover:bg-accent/20 transition-colors">Re-scan Batch</button><button onClick={() => { const blob = new Blob([JSON.stringify(result, null, 2)], { type: "application/json" }); const url = URL.createObjectURL(blob); const anchor = document.createElement("a"); anchor.href = url; anchor.download = "batch-results.json"; anchor.click(); URL.revokeObjectURL(url); }} className="rounded-md bg-accent px-3 py-1.5 text-xs text-[#06070d] hover:bg-accent/90">Download JSON</button><button onClick={() => { setIocs(""); setBatchId(null); setStatus(null); setResult(null); }} className="rounded-md border border-border bg-bg-elevated px-3 py-1.5 text-xs text-text-secondary hover:text-text-primary">New Batch</button></div></div>
 
         <section className="rounded-lg border border-border bg-bg-card p-3"><div className="grid grid-cols-1 gap-2 md:grid-cols-2 lg:grid-cols-4"><input value={query} onChange={(event) => setQuery(event.target.value)} placeholder="Search IOC, type, provider, family" className="rounded-md border border-border bg-bg-elevated px-3 py-2 text-xs text-text-primary outline-none focus:border-accent" /><select value={verdictFilter} onChange={(event) => setVerdictFilter(event.target.value)} className="rounded-md border border-border bg-bg-elevated px-3 py-2 text-xs text-text-primary"><option value="all">All verdicts</option><option value="malicious">Malicious</option><option value="breached">Breached</option><option value="suspicious">Suspicious</option><option value="benign">Benign</option><option value="not_breached">Not Breached</option><option value="unknown">Unknown</option></select><select value={domainFilter} onChange={(event) => setDomainFilter(event.target.value)} className="rounded-md border border-border bg-bg-elevated px-3 py-2 text-xs text-text-primary"><option value="all">All assessment domains</option>{domainOptions.map((domain) => <option key={domain} value={domain}>{domain.replace(/_/g, " ")}</option>)}</select><select value={typeFilter} onChange={(event) => setTypeFilter(event.target.value)} className="rounded-md border border-border bg-bg-elevated px-3 py-2 text-xs text-text-primary"><option value="all">All IOC types</option>{[...new Set(groups.map((group) => group.type))].sort().map((type) => <option key={type} value={type}>{type}</option>)}</select><select value={providerFilter} onChange={(event) => setProviderFilter(event.target.value)} className="rounded-md border border-border bg-bg-elevated px-3 py-2 text-xs text-text-primary"><option value="all">All providers</option>{providerOptions.map((provider) => <option key={provider} value={provider}>{provider}</option>)}</select><select value={statusFilter} onChange={(event) => setStatusFilter(event.target.value)} className="rounded-md border border-border bg-bg-elevated px-3 py-2 text-xs text-text-primary"><option value="all">All lookup status</option><option value="complete">Complete</option><option value="partial">Partial</option><option value="rate_limited">Rate limited</option><option value="not_applicable">Not applicable</option><option value="unavailable">Unavailable</option><option value="batch_deadline_exceeded">Deadline exceeded</option></select><select value={confidenceFilter} onChange={(event) => setConfidenceFilter(event.target.value)} className="rounded-md border border-border bg-bg-elevated px-3 py-2 text-xs text-text-primary"><option value="all">All confidence</option><option value="high">High confidence</option><option value="medium">Medium confidence</option><option value="low">Low confidence</option></select><select value={freshnessFilter} onChange={(event) => setFreshnessFilter(event.target.value)} className="rounded-md border border-border bg-bg-elevated px-3 py-2 text-xs text-text-primary"><option value="all">All freshness</option><option value="fresh">Fresh</option><option value="cached">Cached</option><option value="historical">Historical</option><option value="unavailable">Unavailable</option></select><select value={riskFilter} onChange={(event) => setRiskFilter(event.target.value)} className="rounded-md border border-border bg-bg-elevated px-3 py-2 text-xs text-text-primary"><option value="all">All risk scores</option><option value="high">High risk (70+)</option><option value="medium">Medium risk (30-69)</option><option value="low">Low risk (&lt;30)</option></select><select value={coverageFilter} onChange={(event) => setCoverageFilter(event.target.value)} className="rounded-md border border-border bg-bg-elevated px-3 py-2 text-xs text-text-primary"><option value="all">All coverage</option><option value="low">Low coverage (&lt;50%)</option><option value="adequate">Adequate coverage</option></select><input value={malwareFilter} onChange={(event) => setMalwareFilter(event.target.value)} placeholder="Malware family" className="rounded-md border border-border bg-bg-elevated px-3 py-2 text-xs text-text-primary outline-none focus:border-accent" /><select value={sortBy} onChange={(event) => setSortBy(event.target.value)} className="rounded-md border border-border bg-bg-elevated px-3 py-2 text-xs text-text-primary"><option value="severity">Sort: severity</option><option value="risk">Sort: highest risk</option><option value="evidence">Sort: evidence strength</option><option value="coverage">Sort: lowest coverage</option><option value="confidence">Sort: confidence</option><option value="newest">Sort: newest observation</option><option value="oldest">Sort: oldest observation</option><option value="duration">Sort: slowest provider</option><option value="ioc">Sort: IOC value</option></select><label className="flex items-center gap-2 rounded-md border border-border bg-bg-elevated px-3 py-2 text-xs text-text-secondary"><input type="checkbox" checked={reviewOnly} onChange={(event) => setReviewOnly(event.target.checked)} /> Needs analyst review</label></div></section>
 
-        <div className="space-y-3">{visibleGroups.length === 0 ? <div className="rounded-lg border border-border bg-bg-card p-8 text-center text-sm text-text-secondary">No IOCs match the current filters.</div> : visibleGroups.map((group) => group.assessment ? <IocAssessmentCard key={group.key} assessment={group.assessment} results={group.results} forceExpanded={expandAll} onOpen={() => {
-          const lookupResponse = buildLookupResponseFromBatch(
-            group.value,
-            group.type,
-            group.assessment,
-            group.results,
-            result?.relationships,
-            result?.provider_health,
-            group.assessment?.task_id ?? group.results.find((item) => item.task_id)?.task_id
-          );
-          window.dispatchEvent(new CustomEvent<NavigateEvent>("navigate", {
-            detail: {
-               page: "lookup",
-               ioc: group.value,
-               iocType: group.type === "password" ? "password_sha1" : group.type,
-               batchResultItem: lookupResponse,
-              fromBatch: true,
-              batchId: result?.batch_id,
-            },
-          }));
-        }} /> : <UnassessedGroup key={group.key} group={group} />)}</div>
+        <div className="space-y-3">{visibleGroups.length === 0 ? <div className="rounded-lg border border-border bg-bg-card p-8 text-center text-sm text-text-secondary">No IOCs match the current filters.</div> : visibleGroups.map((group) => group.assessment ? <div key={group.key} className="relative">{openingKey === group.key && <div className="absolute inset-0 z-10 flex items-center justify-center rounded-xl bg-bg-card/70 backdrop-blur-[1px]" aria-live="polite"><span className="rounded-md border border-accent/40 bg-accent/10 px-3 py-1.5 text-xs font-semibold text-accent">Loading full analysis…</span></div>}<IocAssessmentCard assessment={group.assessment} results={group.results} forceExpanded={expandAll} onOpen={() => { void handleOpenGroup(group); }} /></div> : <UnassessedGroup key={group.key} group={group} />)}</div>
       </div>}
     </div>
   );

@@ -4,10 +4,12 @@ import type { ResultSourceMeta } from "../hooks/useLookup";
 import type { NavigateEvent } from "../App";
 import AbuseReportsPanel from "../components/AbuseReportsPanel";
 import ConsensusBar from "../components/ConsensusBar";
+import ContextIntelCard, { hasContextIntel } from "../components/ContextIntelCard";
 import CoverageNotice from "../components/CoverageNotice";
 import EnrichmentPanel from "../components/EnrichmentPanel";
 import EvidencePanel from "../components/EvidencePanel";
 import ExportMenu, { ExportTab } from "../components/ExportMenu";
+import PanelBoundary from "../components/PanelBoundary";
 import FeedbackWidget from "../components/FeedbackWidget";
 import HostingPivotCard from "../components/HostingPivotCard";
 import HostVulnerabilityMatrix from "../components/HostVulnerabilityMatrix";
@@ -35,6 +37,18 @@ function defangValue(text: string): string {
   return text
     .replace(/https?:\/\//gi, (m) => (m.toLowerCase().startsWith("https") ? "hxxps://" : "hxxp://"))
     .replace(/\./g, "[.]");
+}
+
+/**
+ * Coerce an unknown enrichment value into a display string. Missing / non-numeric
+ * values render as an em dash rather than crashing or printing "NaN".
+ */
+function fmtMetric(value: unknown, suffix = ""): string {
+  if (value === null || value === undefined || value === "") return "—";
+  const numeric = Number(value);
+  if (!Number.isFinite(numeric)) return "—";
+  const formatted = numeric.toLocaleString(undefined, { maximumFractionDigits: 8 });
+  return suffix ? `${formatted} ${suffix}` : formatted;
 }
 
 function hasProviderData(result: NormalizedResult): boolean {
@@ -244,8 +258,21 @@ export default function ResultView({
   const enrichment = result.enrichment;
   const isDomainOrUrl = result.ioc_type === "domain" || result.ioc_type === "url";
   const isIp = result.ioc_type === "ipv4" || result.ioc_type === "ipv6";
-  const isCred = result.ioc_type === "email" || result.ioc_type === "username" || result.ioc_type === "password";
+  // password_sha1 is the type Batch.tsx navigates with for credential rows, so it
+  // must be treated as a credential here or its column collapses.
+  const isCred = result.ioc_type === "email" || result.ioc_type === "username"
+    || result.ioc_type === "password" || result.ioc_type === "password_sha1";
   const isCve = result.ioc_type === "cve";
+  const isCrypto = result.ioc_type === "btc" || result.ioc_type === "eth";
+  // "Context" indicator types: the backend produces structured enrichment.extra.*
+  // data for these (ASN routing, MITRE ATT&CK metadata, host artifacts, file
+  // hashes, filenames/paths, user-agents, MACs, fuzzy hashes). They previously
+  // had no dedicated card, so their data was only reachable in the Raw Data tab.
+  const isContextType = [
+    "asn", "mitre_attack", "mutex", "named_pipe", "registry_key", "service_name",
+    "filename", "windows_path", "linux_path", "user_agent", "mac",
+    "md5", "sha1", "sha256", "ssdeep",
+  ].includes(result.ioc_type);
 
   const spfValue = enrichment?.email_security?.spf;
   const spfConfigured = Boolean(spfValue && spfValue !== "missing");
@@ -264,8 +291,16 @@ export default function ResultView({
     enrichment?.cve ||
     enrichment?.geoip ||
     enrichment?.extra?.bitcoin ||
-    enrichment?.extra?.ethereum
+    enrichment?.extra?.ethereum ||
+    hasContextIntel(enrichment?.extra)
   );
+
+  // Indicator types that have a dedicated technical-intelligence module in the
+  // right column. For these, we keep the two-column layout and show a small
+  // placeholder when no enrichment came back, instead of silently collapsing to
+  // a single column (which reads as a broken/empty panel).
+  const expectsTechnicalIntel = isDomainOrUrl || isIp || isCred || isCve || isCrypto || isContextType;
+  const showRightColumn = hasTechnicalIntel || expectsTechnicalIntel;
 
   return (
     <div className="space-y-6">
@@ -507,7 +542,7 @@ export default function ResultView({
             {/* Unified 2-Column Responsive Workspace */}
             <div className="grid grid-cols-1 gap-6 lg:grid-cols-12 items-start">
               {/* LEFT COLUMN: Threat Feeds & Provider Consensus */}
-              <div className={`space-y-4 ${hasTechnicalIntel ? "lg:col-span-7" : "lg:col-span-12"}`}>
+              <div className={`space-y-4 ${showRightColumn ? "lg:col-span-7" : "lg:col-span-12"}`}>
                 {/* Providers Header & Filter Bar */}
                 <div className="rounded-xl border border-border bg-bg-card p-4 space-y-3">
                   <div className="flex flex-wrap items-center justify-between gap-3">
@@ -667,7 +702,8 @@ export default function ResultView({
               </div>
 
               {/* RIGHT COLUMN: Domain-Aware Contextual Technical Intelligence */}
-              {hasTechnicalIntel && (
+              {showRightColumn && (
+                <PanelBoundary label="Technical intelligence">
                 <div className="space-y-4 lg:col-span-5">
                   {/* Indicator Specific Modules */}
 
@@ -780,7 +816,8 @@ export default function ResultView({
                   )}
 
                   {/* CVE / VULNERABILITY INTELLIGENCE */}
-                  {Boolean(isCve && enrichment?.cve) && (
+                  {isCve && (
+                    enrichment?.cve ? (
                     <section className="rounded-xl border border-border bg-bg-card p-4 space-y-3">
                       <div className="flex items-center justify-between border-b border-border/60 pb-2">
                         <h4 className="text-xs font-bold uppercase tracking-wider text-text-primary">
@@ -814,6 +851,21 @@ export default function ResultView({
                         )}
                       </div>
                     </section>
+                    ) : (
+                    <section className="rounded-xl border border-border bg-bg-card p-4 space-y-3">
+                      <div className="flex items-center justify-between border-b border-border/60 pb-2">
+                        <h4 className="text-xs font-bold uppercase tracking-wider text-text-primary">
+                          CVE Exploitability Context
+                        </h4>
+                        <span className="text-[10px] text-text-secondary">NVD / NIST</span>
+                      </div>
+                      <p className="text-[11px] text-text-secondary">
+                        No CVE enrichment available for this indicator. The verdict above is
+                        derived from provider intelligence; CVSS, EPSS, and CISA KEV context
+                        could not be retrieved from the vulnerability feeds.
+                      </p>
+                    </section>
+                    )
                   )}
 
                   {/* CRYPTO WALLET METRICS */}
@@ -825,22 +877,124 @@ export default function ResultView({
                         </h4>
                         <span className="text-[10px] text-text-secondary">Blockchain Explorer</span>
                       </div>
-                      {Boolean(enrichment?.extra?.bitcoin) && (
-                        <div className="space-y-1.5 text-xs font-mono">
-                          <div className="flex justify-between">
-                            <span className="text-text-secondary">BTC Balance:</span>
-                            <span className="text-text-primary font-bold">
-                              {String(((enrichment?.extra?.bitcoin as unknown) as Record<string, unknown>)?.balance_btc ?? "0")} BTC
-                            </span>
+
+                      {/* BITCOIN */}
+                      {Boolean(enrichment?.extra?.bitcoin) && (() => {
+                        const btc = (enrichment?.extra?.bitcoin as Record<string, unknown>) ?? {};
+                        const recent = Array.isArray(btc.recent_transactions)
+                          ? (btc.recent_transactions as Record<string, unknown>[])
+                          : [];
+                        return (
+                          <div className="space-y-2 text-xs">
+                            <div className="flex items-center gap-1.5">
+                              <span className="rounded bg-amber-500/15 px-1.5 py-0.5 text-[10px] font-bold uppercase tracking-wider text-amber-400 border border-amber-500/30">
+                                BTC
+                              </span>
+                              <span className="text-[10px] text-text-secondary">Bitcoin</span>
+                            </div>
+                            <div className="space-y-1.5 font-mono">
+                              <div className="flex justify-between">
+                                <span className="text-text-secondary">Balance:</span>
+                                <span className="text-text-primary font-bold">
+                                  {fmtMetric(btc.final_balance_btc, "BTC")}
+                                </span>
+                              </div>
+                              <div className="flex justify-between">
+                                <span className="text-text-secondary">Transactions:</span>
+                                <span className="text-text-primary">{fmtMetric(btc.n_tx)}</span>
+                              </div>
+                              <div className="flex justify-between">
+                                <span className="text-text-secondary">Total Received:</span>
+                                <span className="text-emerald-400">{fmtMetric(btc.total_received_btc, "BTC")}</span>
+                              </div>
+                              <div className="flex justify-between">
+                                <span className="text-text-secondary">Total Sent:</span>
+                                <span className="text-rose-400">{fmtMetric(btc.total_sent_btc, "BTC")}</span>
+                              </div>
+                            </div>
+                            {recent.length > 0 && (
+                              <div className="space-y-1 pt-1">
+                                <span className="text-[10px] uppercase tracking-wider text-text-secondary block">
+                                  Recent Transactions ({recent.length})
+                                </span>
+                                <div className="max-h-32 overflow-y-auto space-y-1 font-mono text-[11px]">
+                                  {recent.map((tx, i) => {
+                                    const hash = tx.hash != null ? String(tx.hash) : "";
+                                    return (
+                                      <div
+                                        key={hash || i}
+                                        className="flex items-center justify-between gap-2 rounded bg-bg-elevated/60 px-2 py-1 border border-border/50"
+                                      >
+                                        <span className="truncate text-slate-300" title={hash}>
+                                          {hash ? `${hash.slice(0, 18)}…` : "—"}
+                                        </span>
+                                        <span className="shrink-0 text-text-secondary">
+                                          {fmtMetric(tx.result_btc, "BTC")}
+                                        </span>
+                                      </div>
+                                    );
+                                  })}
+                                </div>
+                              </div>
+                            )}
                           </div>
-                          <div className="flex justify-between">
-                            <span className="text-text-secondary">Transactions:</span>
-                            <span className="text-text-primary">
-                              {String(((enrichment?.extra?.bitcoin as unknown) as Record<string, unknown>)?.transaction_count ?? "0")}
-                            </span>
+                        );
+                      })()}
+
+                      {/* ETHEREUM */}
+                      {Boolean(enrichment?.extra?.ethereum) && (() => {
+                        const eth = (enrichment?.extra?.ethereum as Record<string, unknown>) ?? {};
+                        const recent = Array.isArray(eth.recent_transactions)
+                          ? (eth.recent_transactions as Record<string, unknown>[])
+                          : [];
+                        return (
+                          <div className={`space-y-2 text-xs ${enrichment?.extra?.bitcoin ? "border-t border-border/40 pt-3" : ""}`}>
+                            <div className="flex items-center gap-1.5">
+                              <span className="rounded bg-indigo-500/15 px-1.5 py-0.5 text-[10px] font-bold uppercase tracking-wider text-indigo-300 border border-indigo-500/30">
+                                ETH
+                              </span>
+                              <span className="text-[10px] text-text-secondary">Ethereum</span>
+                            </div>
+                            <div className="space-y-1.5 font-mono">
+                              <div className="flex justify-between">
+                                <span className="text-text-secondary">Balance:</span>
+                                <span className="text-text-primary font-bold">
+                                  {fmtMetric(eth.balance_eth, "ETH")}
+                                </span>
+                              </div>
+                              <div className="flex justify-between">
+                                <span className="text-text-secondary">Transactions:</span>
+                                <span className="text-text-primary">{fmtMetric(eth.transaction_count)}</span>
+                              </div>
+                            </div>
+                            {recent.length > 0 && (
+                              <div className="space-y-1 pt-1">
+                                <span className="text-[10px] uppercase tracking-wider text-text-secondary block">
+                                  Recent Transactions ({recent.length})
+                                </span>
+                                <div className="max-h-32 overflow-y-auto space-y-1 font-mono text-[11px]">
+                                  {recent.map((tx, i) => {
+                                    const hash = tx.hash != null ? String(tx.hash) : "";
+                                    return (
+                                      <div
+                                        key={hash || i}
+                                        className="flex items-center justify-between gap-2 rounded bg-bg-elevated/60 px-2 py-1 border border-border/50"
+                                      >
+                                        <span className="truncate text-slate-300" title={hash}>
+                                          {hash ? `${hash.slice(0, 18)}…` : "—"}
+                                        </span>
+                                        <span className="shrink-0 text-text-secondary">
+                                          {fmtMetric(tx.value_eth, "ETH")}
+                                        </span>
+                                      </div>
+                                    );
+                                  })}
+                                </div>
+                              </div>
+                            )}
                           </div>
-                        </div>
-                      )}
+                        );
+                      })()}
                     </section>
                   )}
 
@@ -848,7 +1002,29 @@ export default function ResultView({
                   {!isDomainOrUrl && enrichment?.whois && (
                     <WhoisCard whois={enrichment.whois} />
                   )}
+
+                  {/* CONTEXT INDICATOR INTELLIGENCE: ASN, MITRE ATT&CK, host
+                      artifacts, file hashes, filenames/paths, user-agents, MACs
+                      and fuzzy hashes. These render inline so structured data is
+                      never buried in the Raw Data tab. */}
+                  <ContextIntelCard extra={enrichment?.extra} />
+
+                  {/* No-data placeholder: column is shown because this indicator
+                      type has technical modules, but no enrichment was returned. */}
+                  {!hasTechnicalIntel && (
+                    <section className="rounded-xl border border-dashed border-border bg-bg-card/50 p-6 text-center">
+                      <h4 className="text-xs font-bold uppercase tracking-wider text-text-secondary">
+                        Technical Intelligence
+                      </h4>
+                      <p className="mt-2 text-[11px] leading-relaxed text-text-secondary">
+                        No technical intelligence available for this indicator. Enrichment
+                        providers returned no infrastructure, on-chain, or contextual data —
+                        the assessment above is based on provider reputation signals.
+                      </p>
+                    </section>
+                  )}
                 </div>
+                </PanelBoundary>
               )}
             </div>
           </div>
@@ -856,24 +1032,32 @@ export default function ResultView({
 
         {/* Dedicated Deep-Dive Tabs */}
         {tab === "Enrichment" && (
-          <EnrichmentPanel enrichment={result.enrichment} iocType={result.ioc_type} />
+          <PanelBoundary label="Enrichment">
+            <EnrichmentPanel enrichment={result.enrichment} iocType={result.ioc_type} />
+          </PanelBoundary>
         )}
 
         {tab === "Evidence" && (
-          <EvidencePanel result={result} />
+          <PanelBoundary label="Evidence">
+            <EvidencePanel result={result} />
+          </PanelBoundary>
         )}
 
         {tab === "Raw Data" && (
-          <RawDataView results={result.results} />
+          <PanelBoundary label="Raw data">
+            <RawDataView results={result.results} />
+          </PanelBoundary>
         )}
 
         {tab === "Relationships" && (
           result.relationships && result.relationships.length > 0 ? (
-            <RelationshipGraph
-              mainIoc={result.normalized}
-              relationships={result.relationships}
-              onNodeClick={handleNodeClick}
-            />
+            <PanelBoundary label="Relationship graph">
+              <RelationshipGraph
+                mainIoc={result.normalized}
+                relationships={result.relationships}
+                onNodeClick={handleNodeClick}
+              />
+            </PanelBoundary>
           ) : (
             <div className="rounded-xl border border-border bg-bg-card p-12 text-center text-xs text-text-secondary">
               No graph relationships discovered for this indicator.
@@ -882,7 +1066,9 @@ export default function ResultView({
         )}
 
         {tab === "Export" && (
-          <ExportTab result={result} />
+          <PanelBoundary label="Export">
+            <ExportTab result={result} />
+          </PanelBoundary>
         )}
       </div>
 

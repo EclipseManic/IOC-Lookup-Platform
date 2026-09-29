@@ -19,6 +19,32 @@ BATCH_SEMAPHORE_LIMIT = settings.batch_semaphore_limit
 IOC_TIMEOUT = settings.ioc_timeout
 logger = get_logger("batch")
 
+# Progress-persistence debounce.  ``_persist_batch`` re-runs a full
+# consolidate + json.dumps of the whole growing payload and upserts the
+# BatchRecord, so calling it on EVERY completed IOC is O(n) heavy work on the
+# drive loop's hot path (a top cause of the batch "persistence storm").  During
+# a run we throttle it: persist progress at most once every
+# ``BATCH_PROGRESS_PERSIST_EVERY`` completions or ``BATCH_PROGRESS_PERSIST_INTERVAL``
+# seconds, whichever comes first.  Terminal states (done/cancelled/error) ALWAYS
+# force one final full persist so the stored payload is complete and identical
+# to the historical final state.
+BATCH_PROGRESS_PERSIST_EVERY = max(1, int(getattr(settings, "batch_progress_persist_every", 5)))
+BATCH_PROGRESS_PERSIST_INTERVAL = max(0.0, float(getattr(settings, "batch_progress_persist_interval", 2.0)))
+
+# Shared provider fan-out budget.  Each in-flight IOC calls ``run_analysis``
+# which fans out to ~18 adapters (bounded only per-provider inside pipeline.py,
+# which this module may not edit).  With BATCH_SEMAPHORE_LIMIT IOCs running at
+# once that is a large simultaneous provider burst that burns API quota and
+# triggers rate-limit cascades.  ``_resolve_batch_concurrency`` clamps the batch
+# semaphore so the worst-case simultaneous provider fan-out stays under
+# ``BATCH_PROVIDER_FANOUT_BUDGET``.  Default 90 / 18-per-IOC => effective batch
+# concurrency 5 (half of the 10 default), a real 2x cut to the worst-case burst
+# while keeping throughput.  Set the budget to 0 to disable the clamp.  See the
+# module note above ``_resolve_batch_concurrency`` for the pipeline.py hook that
+# would let us bound providers directly instead of via the IOC-level cap.
+BATCH_PROVIDER_FANOUT_BUDGET = max(0, int(getattr(settings, "batch_provider_fanout_budget", 90)))
+BATCH_PROVIDER_FANOUT_PER_IOC = max(1, int(getattr(settings, "batch_provider_fanout_per_ioc", 18)))
+
 _MARKDOWN_LINK_RE = re.compile(r"\[[^\]]*\]\(([^)]+)\)")
 _CREDENTIAL_MARKERS = ("password", "passwd", "secret", "admin", "root", "qwerty", "letmein", "welcome", "login", "auth", "user")
 _batch_db_lock: Optional[asyncio.Lock] = None
@@ -45,6 +71,33 @@ def _get_batch_db_lock() -> asyncio.Lock:
     if _batch_db_lock is None or (getattr(_batch_db_lock, "_loop", None) is not None and getattr(_batch_db_lock, "_loop", None) is not loop):
         _batch_db_lock = asyncio.Lock()
     return _batch_db_lock
+
+
+def _resolve_batch_concurrency(requested: Optional[int]) -> int:
+    """Resolve the effective per-batch IOC concurrency.
+
+    Starts from the caller's request (clamped to ``BATCH_SEMAPHORE_LIMIT``) and
+    then applies a *shared provider fan-out budget*: because every concurrent
+    IOC fans out to ~``BATCH_PROVIDER_FANOUT_PER_IOC`` adapters at once, running
+    the full ``BATCH_SEMAPHORE_LIMIT`` IOCs in parallel produces a large
+    simultaneous provider burst that wastes API keys and trips rate limits.  We
+    cap concurrency so ``limit * per_ioc <= BATCH_PROVIDER_FANOUT_BUDGET`` while
+    always allowing at least one IOC at a time.
+
+    NOTE (pipeline.py hook we would want but did NOT add): a true global cap on
+    *simultaneous provider calls* (rather than IOCs) would require
+    ``run_analysis`` to accept a shared ``asyncio.Semaphore`` and acquire it
+    around each adapter call.  ``run_analysis`` lives in pipeline.py, which this
+    module must not edit, so we approximate the budget at the IOC level here.
+    """
+    requested_limit = requested if requested is not None else BATCH_SEMAPHORE_LIMIT
+    limit = min(requested_limit, BATCH_SEMAPHORE_LIMIT)
+    if limit < 1:
+        raise ValueError("concurrency must be >= 1")
+    if BATCH_PROVIDER_FANOUT_BUDGET > 0:
+        budgeted = max(1, BATCH_PROVIDER_FANOUT_BUDGET // BATCH_PROVIDER_FANOUT_PER_IOC)
+        limit = min(limit, budgeted)
+    return limit
 
 
 def normalize_batch_iocs(values: list[str]) -> list[str]:
@@ -160,6 +213,14 @@ class BatchTask:
         self.created_at = time.time()
         self.cancel_event = asyncio.Event()
         self.run_task: Optional[asyncio.Task] = None
+        # Perf: which subtask task_ids have already been written to the
+        # LookupResult table.  Progressive persistence only writes NEW subtasks
+        # so the whole batch costs O(n) upserts instead of the historical
+        # O(n^2) storm (every persist re-wrote every already-done subtask).
+        self._persisted_task_ids: set[str] = set()
+        # Debounce state for progress persistence (see _maybe_persist_progress).
+        self._last_progress_persist_ts: float = 0.0
+        self._last_progress_persist_completed: int = 0
 
     def refresh_metrics(self) -> None:
         health: dict[str, ProviderHealth] = {}
@@ -285,6 +346,33 @@ def _schedule_batch_persist(batch: BatchTask) -> None:
     task.add_done_callback(done)
 
 
+async def _maybe_persist_progress(bt: BatchTask) -> None:
+    """Debounced progress persistence for the drive loop.
+
+    A full ``_persist_batch`` re-consolidates every subtask, ``json.dumps`` the
+    whole growing payload and rewrites the BatchRecord, so awaiting it on EVERY
+    completed IOC is the hot-path cost behind the batch "persistence storm"
+    (≈ N consolidations + previously N²/2 subtask upserts).  We throttle it here:
+    persist only when at least ``BATCH_PROGRESS_PERSIST_EVERY`` new IOCs have
+    completed, OR ``BATCH_PROGRESS_PERSIST_INTERVAL`` seconds have elapsed since
+    the last progress persist (with at least one new completion to record).
+
+    Terminal states (done/cancelled/error) call ``_persist_batch`` directly and
+    are never throttled, so the final stored payload is always complete and
+    identical to the un-debounced result.
+    """
+    completed_delta = bt.completed - bt._last_progress_persist_completed
+    if completed_delta <= 0:
+        return
+    elapsed = time.monotonic() - bt._last_progress_persist_ts
+    due_by_count = completed_delta >= BATCH_PROGRESS_PERSIST_EVERY
+    due_by_time = BATCH_PROGRESS_PERSIST_INTERVAL > 0 and elapsed >= BATCH_PROGRESS_PERSIST_INTERVAL
+    if due_by_count or due_by_time:
+        bt._last_progress_persist_completed = bt.completed
+        bt._last_progress_persist_ts = time.monotonic()
+        await _persist_batch(bt)
+
+
 async def shutdown_batch_tasks() -> None:
     runners = list(_batch_runners.values())
     for runner in runners:
@@ -312,10 +400,10 @@ def start_batch_analysis(
     typed_pairs = normalize_batch_iocs_typed(iocs)
     clean_iocs = [value for value, _t in typed_pairs]
     type_overrides = {value: t for value, t in typed_pairs if t is not None}
-    requested_limit = concurrency if concurrency is not None else BATCH_SEMAPHORE_LIMIT
-    limit = min(requested_limit, BATCH_SEMAPHORE_LIMIT)
-    if limit < 1:
-        raise ValueError("concurrency must be >= 1")
+    # Validate concurrency early (raises on < 1) so the POST endpoint returns a
+    # 400 before scheduling the background runner.  The shared provider fan-out
+    # budget is applied here too, mirroring run_batch_analysis.
+    _resolve_batch_concurrency(concurrency)
     if not clean_iocs:
         raise ValueError("No valid IOCs supplied")
     if len(clean_iocs) > settings.max_batch_iocs:
@@ -334,13 +422,14 @@ def start_batch_analysis(
     async def _run_queued_batch() -> None:
         try:
             await run_batch_analysis(
-                iocs,
+                clean_iocs,
                 batch_id=bid,
                 fp_overrides=fp_overrides,
                 timeout=timeout,
                 concurrency=concurrency,
                 batch_timeout=batch_timeout,
                 type_overrides=type_overrides,
+                prenormalized=True,
             )
         except Exception as exc:
             batch.status = "error"
@@ -361,10 +450,20 @@ async def run_batch_analysis(iocs: list[str], batch_id: Optional[str] = None,
                              timeout: Optional[float] = None,
                              concurrency: Optional[int] = None,
                              batch_timeout: Optional[float] = None,
-                             type_overrides: Optional[dict[str, str]] = None) -> BatchTask:
-    typed_pairs = normalize_batch_iocs_typed(iocs)
-    clean_iocs = [value for value, _t in typed_pairs]
-    resolved_overrides = type_overrides or {value: t for value, t in typed_pairs if t is not None}
+                             type_overrides: Optional[dict[str, str]] = None,
+                             prenormalized: bool = False) -> BatchTask:
+    # ``start_batch_analysis`` already ran ``normalize_batch_iocs_typed`` (dedup,
+    # credential/hash validation, type-prefix extraction).  Passing
+    # ``prenormalized=True`` with the resulting clean values + ``type_overrides``
+    # avoids normalizing the same input a second time here.  Direct callers
+    # (endpoints/tests) still get normalization for free.
+    if prenormalized:
+        clean_iocs = list(iocs)
+        resolved_overrides = dict(type_overrides or {})
+    else:
+        typed_pairs = normalize_batch_iocs_typed(iocs)
+        clean_iocs = [value for value, _t in typed_pairs]
+        resolved_overrides = type_overrides or {value: t for value, t in typed_pairs if t is not None}
     for raw in clean_iocs:
         if len(refang(str(raw).strip())) > 2048:
             raise ValueError(f"IOC value too long: {refang(str(raw).strip())[:64]}…")
@@ -378,10 +477,7 @@ async def run_batch_analysis(iocs: list[str], batch_id: Optional[str] = None,
 
     ioc_timeout = timeout if timeout is not None else IOC_TIMEOUT
     batch_deadline = time.monotonic() + max(0.1, float(batch_timeout if batch_timeout is not None else getattr(settings, "batch_deadline_seconds", 300)))
-    requested_limit = concurrency if concurrency is not None else BATCH_SEMAPHORE_LIMIT
-    limit = min(requested_limit, BATCH_SEMAPHORE_LIMIT)
-    if limit < 1:
-        raise ValueError("concurrency must be >= 1")
+    limit = _resolve_batch_concurrency(concurrency)
     sem = asyncio.Semaphore(limit)
 
     async def run_one(ioc: str):
@@ -419,27 +515,37 @@ async def run_batch_analysis(iocs: list[str], batch_id: Optional[str] = None,
                 return task
             except asyncio.TimeoutError:
                 tid = f"{bid}-{uuid.uuid4().hex[:12]}"
+                # Set normalized/ioc_type so GET /api/batch/{id}/ioc/{ioc} can
+                # resolve a timed-out IOC (the endpoint matches on
+                # task.normalized / task.ioc_value).  Use the parsed clean_val +
+                # resolved type, not the raw prefixed input.
+                value = refang(clean_val)
+                ioc_type = ioc_type_override or classify_ioc(value)
                 task = AnalysisTask(
                     task_id=tid,
-                    ioc_value=ioc.strip(),
+                    ioc_value=clean_val,
+                    normalized=value,
+                    ioc_type=ioc_type,
                     status="error",
                     error="IOC analysis timed out",
                 )
-                task.final_assessment = aggregate_evidence(refang(ioc.strip()), classify_ioc(refang(ioc.strip())), [])
+                task.final_assessment = aggregate_evidence(value, ioc_type, [])
                 task.final_assessment.assessment_status = "unavailable"
                 task.final_assessment.review_reasons = ["IOC analysis did not finish before its deadline"]
                 task.final_assessment.reason = "IOC analysis did not finish before its deadline; no provider verdict was generated."
                 return task
             except Exception as exc:
                 tid = f"{bid}-{uuid.uuid4().hex[:12]}"
+                value = refang(clean_val)
+                ioc_type = ioc_type_override or classify_ioc(value)
                 task = AnalysisTask(
                     task_id=tid,
                     ioc_value=clean_val,
+                    normalized=value,
+                    ioc_type=ioc_type,
                     status="error",
                     error=str(exc)[:200],
                 )
-                value = refang(clean_val)
-                ioc_type = ioc_type_override or classify_ioc(value)
                 task.final_assessment = aggregate_evidence(value, ioc_type, [])
                 task.final_assessment.assessment_status = "error"
                 task.final_assessment.review_reasons = ["Batch worker failed before provider assessment"]
@@ -451,6 +557,8 @@ async def run_batch_analysis(iocs: list[str], batch_id: Optional[str] = None,
     runners = {asyncio.create_task(run_one(ioc)): ioc for ioc in clean_iocs}
     pending = set(runners)
     cancelled = False
+    bt._last_progress_persist_ts = time.monotonic()
+    bt._last_progress_persist_completed = bt.completed
     try:
         while pending:
             if bt.cancel_event.is_set():
@@ -477,7 +585,10 @@ async def run_batch_analysis(iocs: list[str], batch_id: Optional[str] = None,
                     "successful_lookups": bt.successful_lookups, "rate_limited_lookups": bt.rate_limited_lookups,
                     "timeout_lookups": bt.timeout_lookups, "failed_lookups": bt.failed_lookups,
                 })
-                await _persist_batch(bt)
+                # Debounced: a full consolidate+dump on every IOC is the
+                # persistence storm.  Terminal states below always force a final
+                # complete persist.
+                await _maybe_persist_progress(bt)
             if bt.cancel_event.is_set():
                 cancelled = True
                 break
@@ -672,35 +783,47 @@ async def _persist_batch(bt: BatchTask, *, required: bool = False) -> None:
                 await retry_sqlite_commit(session)
 
             try:
-                from app.backend.database import upsert_lookup_result
+                from app.backend.database import persisted_verdict_fields, upsert_lookup_result
                 from app.backend.pipeline import task_response_payload
-                async with async_session() as session:
-                    for subtask in bt.subtasks:
-                        if subtask.status != "done":
-                            continue
-                        val = subtask.normalized or subtask.ioc_value
-                        if not val:
-                            continue
-                        ioc_type = subtask.ioc_type or "unknown"
-                        score = getattr(subtask.composite, "score", 0.0) if subtask.composite else 0.0
-                        verdict = getattr(subtask.composite, "verdict", "unknown") if subtask.composite else "unknown"
-                        confidence = getattr(subtask.composite, "confidence", "low") if subtask.composite else "low"
-                        ioc_obj = (await session.execute(select(IOC).where(IOC.value == val))).scalar_one_or_none()
-                        if not ioc_obj:
-                            ioc_obj = IOC(value=val, ioc_type=ioc_type)
-                            session.add(ioc_obj)
-                            await session.flush()
-                        await upsert_lookup_result(
-                            session,
-                            ioc_id=ioc_obj.id,
-                            task_id=subtask.task_id,
-                            composite_score=score,
-                            composite_verdict=verdict,
-                            composite_confidence=confidence,
-                            full_response=json.dumps(task_response_payload(subtask), default=str),
-                            source_count=len(subtask.results),
-                            batch_id=bt.batch_id,
-                        )
+                # Perf: only write subtasks that finished AND have not already
+                # been persisted.  A subtask's task_id is unique and its verdict
+                # is fixed once ``status == "done"``, so ``upsert_lookup_result``
+                # is idempotent — writing each exactly once yields a final DB
+                # state identical to the old "rewrite every done subtask every
+                # time" loop, but costs O(n) upserts across the batch instead of
+                # O(n^2).
+                newly_done = [
+                    subtask for subtask in bt.subtasks
+                    if subtask.status == "done"
+                    and subtask.task_id not in bt._persisted_task_ids
+                    and (subtask.normalized or subtask.ioc_value)
+                ]
+                if newly_done:
+                    async with async_session() as session:
+                        for subtask in newly_done:
+                            val = subtask.normalized or subtask.ioc_value
+                            ioc_type = subtask.ioc_type or "unknown"
+                            # DV-1: persist the authoritative final_assessment verdict/score.
+                            score, verdict, confidence = persisted_verdict_fields(subtask)
+                            ioc_obj = (await session.execute(select(IOC).where(IOC.value == val))).scalar_one_or_none()
+                            if not ioc_obj:
+                                ioc_obj = IOC(value=val, ioc_type=ioc_type)
+                                session.add(ioc_obj)
+                                await session.flush()
+                            await upsert_lookup_result(
+                                session,
+                                ioc_id=ioc_obj.id,
+                                task_id=subtask.task_id,
+                                composite_score=score,
+                                composite_verdict=verdict,
+                                composite_confidence=confidence,
+                                full_response=json.dumps(task_response_payload(subtask), default=str),
+                                source_count=len(subtask.results),
+                                batch_id=bt.batch_id,
+                            )
+                            # Mark only after a committed write so a mid-loop
+                            # failure leaves the rest to retry next persist.
+                            bt._persisted_task_ids.add(subtask.task_id)
             except Exception as sub_exc:
                 logger.warning("Subtask IOC persistence skipped for batch %s: %s", getattr(bt, "batch_id", "unknown"), type(sub_exc).__name__)
         except Exception as exc:

@@ -3,19 +3,12 @@ import { deleteRecentIOC, getRecentIOCs, getBatchesFromServer, deleteBatchFromSe
 import { showToast } from "../components/Toast";
 import type { NavigateEvent } from "../App";
 import { timeAgo } from "../lib/timeAgo";
+import { getVerdictColor } from "../lib/verdictColors";
 import Modal from "../components/Modal";
-
-const VERDICT_COLORS: Record<string, string> = {
-  malicious: "text-red-400 bg-red-500/15 border-red-500/30",
-  suspicious: "text-amber-400 bg-amber-500/15 border-amber-500/30",
-  clean: "text-emerald-400 bg-emerald-500/15 border-emerald-500/30",
-  unknown: "text-slate-400 bg-slate-500/15 border-slate-500/30",
-  error: "text-rose-300 bg-rose-500/10 border-rose-500/20",
-};
 
 function VerdictBadge({ label, count }: { label: string; count: number }) {
   if (count === 0) return null;
-  const color = VERDICT_COLORS[label] ?? VERDICT_COLORS.unknown;
+  const color = getVerdictColor(label).badge;
   return (
     <span className={`inline-flex items-center gap-1 text-[10px] font-semibold px-1.5 py-0.5 rounded border ${color}`}>
       {count} {label}

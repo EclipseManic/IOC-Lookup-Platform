@@ -7,7 +7,61 @@ import asyncio
 import pytest
 from sqlalchemy.exc import OperationalError
 
-from app.backend.database import _is_sqlite_lock_error, init_db, retry_sqlite_commit
+from app.backend.database import (
+    _is_sqlite_lock_error,
+    init_db,
+    persisted_verdict_fields,
+    retry_sqlite_commit,
+)
+
+
+class _FakeAssessment:
+    def __init__(self, final_verdict, normalized_score, confidence):
+        self.final_verdict = final_verdict
+        self.normalized_score = normalized_score
+        self.confidence = confidence
+
+
+class _FakeComposite:
+    def __init__(self, verdict, score, confidence):
+        self.verdict = verdict
+        self.score = score
+        self.confidence = confidence
+
+
+class _FakeTask:
+    def __init__(self, final_assessment=None, composite=None):
+        self.final_assessment = final_assessment
+        self.composite = composite
+
+
+def test_persisted_verdict_prefers_assessment_over_composite():
+    # DV-1 regression: a breached email has a correct final_assessment but the
+    # reputation-only composite is neutralized to unknown/0. We must persist the
+    # assessment, not the composite.
+    task = _FakeTask(
+        final_assessment=_FakeAssessment("breached", 82.0, "high"),
+        composite=_FakeComposite("unknown", 0.0, "low"),
+    )
+    score, verdict, confidence = persisted_verdict_fields(task)
+    assert verdict == "breached"
+    assert score == 82.0
+    assert confidence == "high"
+
+
+def test_persisted_verdict_falls_back_to_composite_when_no_assessment():
+    task = _FakeTask(
+        final_assessment=None,
+        composite=_FakeComposite("malicious", 91.0, "high"),
+    )
+    score, verdict, confidence = persisted_verdict_fields(task)
+    assert verdict == "malicious"
+    assert score == 91.0
+    assert confidence == "high"
+
+
+def test_persisted_verdict_defaults_when_nothing_present():
+    assert persisted_verdict_fields(_FakeTask()) == (0.0, "unknown", "low")
 
 
 def test_is_sqlite_lock_error_operational():

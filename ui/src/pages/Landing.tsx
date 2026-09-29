@@ -1,10 +1,11 @@
 import type { NavigateEvent, Page, Tool } from "../App";
+import { DISPLAY_CLEAN, DISPLAY_SUSPICIOUS, DISPLAY_MALICIOUS } from "../lib/thresholds";
 
 const STATS = [
   { value: "20+", label: "Threat Intel Sources" },
   { value: "10", label: "IOC Types" },
   { value: "812+", label: "YARA Rules" },
-  { value: "4", label: "Verdict Tiers" },
+  { value: "3", label: "Verdict Tiers" },
   { value: "100", label: "Batch IOCs" },
 ];
 
@@ -85,10 +86,9 @@ const FEATURES = [
 ];
 
 const TIERS = [
-  { name: "Clean", range: "0-24", desc: "No evidence of malicious activity across the evaluated sources.", color: "var(--color-verdict-clean)" },
-  { name: "Suspicious", range: "25-49", desc: "Some signals present — verify context or retry with additional sources.", color: "var(--color-verdict-suspicious)" },
-  { name: "Malicious", range: "50-74", desc: "Strong consensus from multiple independent engines.", color: "var(--color-verdict-malicious)" },
-  { name: "Critical", range: "75-100", desc: "Severe, widely reported threat — block without hesitation.", color: "#b91c1c" },
+  { name: "Clean", range: `0-${DISPLAY_CLEAN - 1}`, desc: "No meaningful malicious signal across the evaluated sources.", color: "var(--color-verdict-clean)" },
+  { name: "Suspicious", range: `${DISPLAY_CLEAN}-${DISPLAY_SUSPICIOUS - 1}`, desc: "Some signals present — verify context or corroborate with additional sources.", color: "var(--color-verdict-suspicious)" },
+  { name: "Malicious", range: `${DISPLAY_SUSPICIOUS}-100`, desc: `Weighted consensus of independent engines flags this indicator; scores of ${DISPLAY_MALICIOUS}+ carry high confidence.`, color: "var(--color-verdict-malicious)" },
 ];
 
 const WORKFLOW = [
@@ -235,7 +235,7 @@ export default function Landing() {
           <h2 className="mt-3 text-3xl md:text-4xl font-extrabold text-text-primary">Verdicts that mean something</h2>
           <p className="mt-2 text-text-secondary">A weighted 0-100 scale backed by independent engine votes.</p>
         </div>
-        <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4">
+        <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-4">
           {TIERS.map((tier) => (
             <article
               key={tier.name}

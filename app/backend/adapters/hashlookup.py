@@ -63,8 +63,16 @@ class HashlookupAdapter(SourceAdapter):
                 tags.append(f"{hk}:{hv[:16]}...")
         source_link = f"https://hashlookup.circl.lu/lookup/{hash_type}/{ioc_value}"
         self._record_success()
+        # CIRCL Hashlookup is a known-FILE reference corpus (NSRL + known
+        # software + some malware). A hit means "this file is known", NOT
+        # "this file is safe" -- known-malware samples are present here too.
+        # Emit a neutral/informational signal so the per-source badge is honest
+        # and never contributes a false "clean" verdict. The reputation scorer
+        # already excludes Hashlookup from clean/negative evidence.
+        tags = ["known_file", "present_in_reference_corpus", *tags]
         return NormalizedResult(
             ioc=ioc_value, ioc_type=ioc_type, source=self.name,
-            verdict="clean", raw_score=0.0, confidence="high",
+            verdict="unknown", provider_verdict="known_file",
+            raw_score=0.0, confidence="low",
             tags=tags, source_link=source_link, status="found",
         )

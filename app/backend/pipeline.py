@@ -263,6 +263,130 @@ def get_rate_limiter() -> RateLimiter | None:
     return rate_limiter
 
 
+# Enrichment cache TTLs by ioc_type (seconds).  Enrichment hits public
+# infrastructure / OSINT endpoints (blockchain.info, RIPEstat, attack.mitre.org,
+# hashlookup.circl.lu, ...) that are NOT wrapped by the per-provider rate
+# limiter or circuit breaker the way reputation adapters are.  blockchain.info
+# in particular issues a 24-hour ban (HTTP 429, retry-after: 86400) after only a
+# few keyless calls; because enrich() was previously always called live, that
+# ban zeroed out BTC context on every later lookup.  Caching the structured
+# result — and, on a live failure, serving the last good snapshot even when
+# expired — keeps context data visible instead of blanking it.
+_ENRICHMENT_TTL_BY_TYPE = {
+    "btc": 3600,
+    "eth": 3600,
+    "asn": 21600,
+    "mitre_attack": 86400,
+    "mutex": 86400,
+    "named_pipe": 86400,
+    "registry_key": 86400,
+    "service_name": 86400,
+    "cve": 21600,
+    "md5": 3600,
+    "sha1": 3600,
+    "sha256": 3600,
+    "ssdeep": 3600,
+}
+_ENRICHMENT_TTL_DEFAULT = 1800
+
+
+def _enrichment_has_payload(enr: "EnrichmentData | None") -> bool:
+    """True when enrichment carries usable data (structured payload or a typed
+    section), False when it is only skipped/error/not-found completeness flags.
+
+    An empty result is never cached (so a transient rate-limit / error does not
+    poison the cache) and never overwrites a prior good snapshot.  ``extra`` may
+    hold an empty container (e.g. ``{"hash_results": []}`` for a clean hash), which
+    is a valid *not-found* answer worth caching, so a present ``extra`` key with
+    any value counts as payload."""
+    if enr is None:
+        return False
+    if getattr(enr, "extra", None):
+        return True
+    for attr in (
+        "geoip", "whois", "dns", "ssl", "reverse_dns", "subdomains", "cve",
+        "breach", "favicon", "email_security", "passive_dns", "host_intel",
+        "web_preview", "infostealer", "hosting_ip_intel",
+    ):
+        if getattr(enr, attr, None):
+            return True
+    if (
+        getattr(enr, "open_ports", None)
+        or getattr(enr, "abuse_reports", None)
+        or getattr(enr, "malware_urls", None)
+        or getattr(enr, "associated_hashes", None)
+        or getattr(enr, "relationships", None)
+    ):
+        return True
+    return False
+
+
+async def _run_enrichment_cached(
+    normalized: str,
+    ioc_type: str,
+    timeout: float,
+    bypass_cache: bool,
+) -> tuple["EnrichmentData", str | None]:
+    """Run type-specific enrichment through the cache with a stale-snapshot
+    fallback.  Returns ``(enrichment, error_message)`` where ``error_message`` is
+    non-None only when the live call failed AND no cached snapshot could be
+    served — the caller emits that as the Enrichment stage error event."""
+    enrich_key = f"enrich:{ioc_type}:{normalized.lower().strip()}"
+    ttl = _ENRICHMENT_TTL_BY_TYPE.get(ioc_type, _ENRICHMENT_TTL_DEFAULT)
+
+    # 1. Fresh cache hit — skip the network entirely (a live re-scan bypasses).
+    if cache is not None and not bypass_cache:
+        try:
+            cached = await cache.get(enrich_key)
+            if cached is not None:
+                return EnrichmentData.model_validate(cached), None
+        except Exception as exc:
+            logger.debug("Enrichment cache read failed for %s: %s", enrich_key, exc)
+
+    # 2. Live enrichment (bounded by the remaining pipeline deadline).
+    error_message: str | None = None
+    enrichment = EnrichmentData()
+    try:
+        enrichment = await asyncio.wait_for(enrich(normalized, ioc_type), timeout=timeout)
+    except asyncio.TimeoutError:
+        logger.warning("Enrichment timed out for %s (%s)", normalized, ioc_type)
+        error_message = "Enrichment timed out"
+    except Exception as ex:
+        logger.warning("Enrichment failed for %s (%s): %s", normalized, ioc_type, ex)
+        error_message = f"Enrichment failed: {ex}"
+
+    if cache is None:
+        return enrichment, error_message
+
+    # 3. Cache a good answer; on an empty/failed answer, serve the last good
+    #    snapshot (even if expired) so a rate-limit ban does not blank the UI.
+    if _enrichment_has_payload(enrichment):
+        try:
+            await cache.set(enrich_key, enrichment.model_dump(mode="json"), ttl)
+        except Exception as exc:
+            logger.debug("Enrichment cache write failed for %s: %s", enrich_key, exc)
+        return enrichment, error_message
+
+    try:
+        entry = await cache.get_entry(enrich_key)  # audit-preserving: returns expired too
+    except Exception:
+        entry = None
+    if entry is not None:
+        value, stale = entry
+        try:
+            salvaged = EnrichmentData.model_validate(value)
+            salvaged.analysis_notes.append(
+                "Live enrichment was unavailable (provider rate-limited or errored); "
+                "showing the most recent cached snapshot"
+                + (" (expired)." if stale else ".")
+            )
+            return salvaged, None
+        except Exception as exc:
+            logger.debug("Enrichment stale-snapshot restore failed for %s: %s", enrich_key, exc)
+
+    return enrichment, error_message
+
+
 async def _update_stage(task: AnalysisTask, stage_name: str, status: str, message: str = "", progress: float = 0.0):
     for s in task.stages:
         if s.name == stage_name:
@@ -272,6 +396,112 @@ async def _update_stage(task: AnalysisTask, stage_name: str, status: str, messag
             if progress:
                 s.progress = progress
             break
+
+
+def _rebuild_stages_from_plan(task: AnalysisTask, plan: list, ioc_type: str) -> None:
+    """Replace the provider stage rows with exactly the applicable providers.
+
+    Runtime stage updates key off ``adapter.name`` (see run_adapter:
+    ``stage_name = adapter.name``), and the plan's ``provider`` field is that same
+    adapter name, so a stage built here lines up with its live updates by
+    construction. Only *applicable* providers get a row — non-applicable ones no
+    longer appear as noise. ``Classify & Normalize`` keeps whatever state it has
+    already reached; ``Enrichment``/``Scoring & Relations`` bookend the list, with
+    ``CVE Intelligence`` inserted only for CVE indicators.
+    """
+    classify = next((s for s in task.stages if s.name == "Classify & Normalize"), None)
+    provider_names: list[str] = []
+    seen: set[str] = set()
+    for item in plan:
+        provider = getattr(item, "provider", None)
+        applicable = getattr(item, "applicable", False)
+        if applicable and provider and provider not in seen:
+            seen.add(provider)
+            provider_names.append(provider)
+    provider_names.sort(key=str.lower)
+
+    rebuilt: list[StageInfo] = [classify or StageInfo("Classify & Normalize")]
+    rebuilt.extend(StageInfo(name) for name in provider_names)
+    if ioc_type == "cve":
+        rebuilt.append(StageInfo("CVE Intelligence"))
+    rebuilt.append(StageInfo("Enrichment"))
+    rebuilt.append(StageInfo("Scoring & Relations"))
+    task.stages = rebuilt
+
+
+def _merge_provider_intel_into_enrichment(task: AnalysisTask) -> None:
+    """Fold structured intelligence from adapter ``raw_data`` into enrichment.
+
+    Several adapters carry richer structured payloads than the generic
+    reputation shape (urlscan web previews, Hudson Rock infostealer stats,
+    AbuseIPDB reports, OTX malware URLs/hashes). This copies the first such
+    payload of each kind into ``task.enrichment`` so the UI enrichment tab can
+    render it. It only reads ``task.results`` and mutates ``task.enrichment``;
+    each merge is guarded so one malformed payload never aborts the rest.
+    """
+    if task.enrichment is None:
+        return
+    for r in task.results:
+        # 1. urlscan.io -> WebPreviewInfo
+        if r.source == "urlscan.io" and isinstance(r.raw_data, dict):
+            wp_raw = r.raw_data.get("web_preview")
+            if wp_raw and isinstance(wp_raw, dict) and not task.enrichment.web_preview:
+                try:
+                    scan_uuid = wp_raw.get("scan_uuid")
+                    proxied_url = f"/api/screenshot?scan_id={scan_uuid}" if scan_uuid else None
+                    task.enrichment.web_preview = WebPreviewInfo(
+                        screenshot_url=proxied_url,
+                        page_title=wp_raw.get("page_title"),
+                        server=wp_raw.get("server"),
+                        language=wp_raw.get("language"),
+                        domain_age_days=wp_raw.get("domain_age_days"),
+                        tls_issuer=wp_raw.get("tls_issuer"),
+                        tls_valid_days=wp_raw.get("tls_valid_days"),
+                        asn_name=wp_raw.get("asn_name"),
+                        detected_brands=wp_raw.get("detected_brands", []) or [],
+                        detected_technologies=wp_raw.get("detected_technologies", []) or [],
+                        mime_type=wp_raw.get("mime_type"),
+                        scan_uuid=scan_uuid,
+                    )
+                except Exception as exc:
+                    logger.debug("Failed to construct WebPreviewInfo: %s", exc)
+
+        # 2. Hudson Rock -> InfostealerIntel
+        if r.source == "Hudson Rock" and isinstance(r.raw_data, dict):
+            if not task.enrichment.infostealer:
+                try:
+                    families_raw = r.raw_data.get("stealer_families", {})
+                    families_dict = families_raw if isinstance(families_raw, dict) else {}
+                    dates_list = r.raw_data.get("dates_compromised", [])
+                    date_range = f"{dates_list[0]} to {dates_list[-1]}" if dates_list else None
+                    task.enrichment.infostealer = InfostealerIntel(
+                        total_employee_compromises=r.raw_data.get("total_infections", 0) or 0,
+                        total_client_compromises=r.raw_data.get("total_user_services", 0) or 0,
+                        top_corporate_services=r.raw_data.get("top_corporate_services", []) or [],
+                        top_external_services=r.raw_data.get("top_external_services", []) or [],
+                        stealer_families=families_dict,
+                        password_strength_weak_pct=r.raw_data.get("password_strength_weak_pct"),
+                        password_strength_strong_pct=r.raw_data.get("password_strength_strong_pct"),
+                        total_compromised_urls=r.raw_data.get("total_compromised_urls"),
+                        date_range=date_range,
+                    )
+                except Exception as exc:
+                    logger.debug("Failed to construct InfostealerIntel: %s", exc)
+
+        # 3. AbuseIPDB -> abuse_reports
+        if r.source == "AbuseIPDB" and isinstance(r.raw_data, dict):
+            reports = r.raw_data.get("reports", []) or []
+            if reports and not task.enrichment.abuse_reports:
+                task.enrichment.abuse_reports = reports[:20]
+
+        # 4. AlienVault OTX -> malware_urls & associated_hashes
+        if r.source == "AlienVault OTX" and isinstance(r.raw_data, dict):
+            mal_urls = r.raw_data.get("malware_urls", []) or []
+            if mal_urls and not task.enrichment.malware_urls:
+                task.enrichment.malware_urls = mal_urls[:25]
+            assoc_hashes = r.raw_data.get("associated_hashes", []) or []
+            if assoc_hashes and not task.enrichment.associated_hashes:
+                task.enrichment.associated_hashes = assoc_hashes[:15]
 
 
 def _result_metadata(result: NormalizedResult, *, started: float, retry_count: int = 0, request_made: bool = True) -> NormalizedResult:
@@ -375,29 +605,15 @@ async def run_analysis(
     tid = task_id or uuid.uuid4().hex[:12]
     configured_deadline = ioc_deadline if ioc_deadline is not None else getattr(settings, "ioc_deadline_seconds", PIPELINE_TIMEOUT)
     deadline = time.monotonic() + max(0.1, float(configured_deadline))
+    # Stages start minimal; the provider stages are derived dynamically from the
+    # actual provider plan once the IOC is classified (see _rebuild_stages_from_plan
+    # below). This replaces the old fixed 24-entry list, which both (a) omitted
+    # newer adapters (Etherscan, ChainAbuse, Blockchain.info, FileScan, Hudson
+    # Rock, HIBP, cve.org) so their work was invisible, and (b) rendered a wall of
+    # irrelevant "skipped" rows for every provider that does not apply to the
+    # indicator type (e.g. all the malware feeds on a crypto-wallet lookup).
     stages = [
         StageInfo("Classify & Normalize"),
-        StageInfo("MalwareBazaar"),
-        StageInfo("ThreatFox"),
-        StageInfo("VirusTotal"),
-        StageInfo("AbuseIPDB"),
-        StageInfo("urlscan.io"),
-        StageInfo("Tria.ge"),
-        StageInfo("Hybrid Analysis"),
-        StageInfo("GreyNoise"),
-        StageInfo("AlienVault OTX"),
-        StageInfo("Shodan"),
-        StageInfo("OpenPhish"),
-        StageInfo("URLhaus"),
-        StageInfo("Tor Exit"),
-        StageInfo("Censys"),
-        StageInfo("IPinfo"),
-        StageInfo("StopForumSpam"),
-        StageInfo("AbstractAPI"),
-        StageInfo("Hunter.io"),
-        StageInfo("Team Cymru"),
-        StageInfo("Hashlookup"),
-        StageInfo("CVE Intelligence"),
         StageInfo("Enrichment"),
         StageInfo("Scoring & Relations"),
     ]
@@ -446,7 +662,14 @@ async def run_analysis(
         task.ioc_type = ioc_type
         task.normalized = normalized
         task.assessment_domain = route_assessment_domain(ioc_type, normalized).domain
-        task.provider_plan = [item.as_dict() for item in build_provider_plan(ADAPTERS, ioc_type, normalized)]
+        # Build the provider plan once and reuse it for the serialized plan, the
+        # dynamic stage list, and the execution filter below.
+        plan = build_provider_plan(ADAPTERS, ioc_type, normalized)
+        task.provider_plan = [item.as_dict() for item in plan]
+        # Derive stage rows from the applicable providers so the UI shows exactly
+        # the work that will run (crypto/HIBP/cve.org included) with no wall of
+        # irrelevant "skipped" rows.
+        _rebuild_stages_from_plan(task, plan, ioc_type)
 
         await _update_stage(task, "Classify & Normalize", "done", f"Classified as {ioc_type}", 1.0)
         await _emit_stage_event(task, "Classify & Normalize", "done", f"Classified as {ioc_type}", 1.0)
@@ -488,7 +711,8 @@ async def run_analysis(
 
         from app.backend.adapters.base import is_valid_api_key
 
-        plan = build_provider_plan(ADAPTERS, ioc_type, normalized)
+        # ``plan`` was already built above and drives task.provider_plan and the
+        # dynamic stage list; reuse it here for the execution filter.
         applicable_names = {item.provider for item in plan if item.applicable}
         matching = [a for a in ADAPTERS if a.name in applicable_names]
 
@@ -948,15 +1172,12 @@ async def run_analysis(
             await _update_stage(task, "Enrichment", "running", f"Running type-specific enrichment for {ioc_type}")
 
             enrichment = EnrichmentData()
-            try:
-                remaining = max(1.0, deadline - time.monotonic())
-                enrichment = await asyncio.wait_for(enrich(normalized, ioc_type), timeout=remaining)
-            except asyncio.TimeoutError:
-                logger.warning("Enrichment timed out for %s (%s)", normalized, ioc_type)
-                await _emit_error_event(task, "Enrichment", "Enrichment timed out")
-            except Exception as ex:
-                logger.warning("Enrichment failed for %s (%s): %s", normalized, ioc_type, ex)
-                await _emit_error_event(task, "Enrichment", f"Enrichment failed: {ex}")
+            remaining = max(1.0, deadline - time.monotonic())
+            enrichment, enrichment_error = await _run_enrichment_cached(
+                normalized, ioc_type, remaining, bypass_cache
+            )
+            if enrichment_error:
+                await _emit_error_event(task, "Enrichment", enrichment_error)
             task.enrichment = enrichment
             if not matching:
                 enrichment.analysis_notes.append(
@@ -968,68 +1189,7 @@ async def run_analysis(
                 )
 
             # --- Propagate Structured Intelligence from Adapter Results ---
-            if task.enrichment is not None:
-                for r in task.results:
-                    # 1. urlscan.io -> WebPreviewInfo
-                    if r.source == "urlscan.io" and isinstance(r.raw_data, dict):
-                        wp_raw = r.raw_data.get("web_preview")
-                        if wp_raw and isinstance(wp_raw, dict) and not task.enrichment.web_preview:
-                            try:
-                                scan_uuid = wp_raw.get("scan_uuid")
-                                proxied_url = f"/api/screenshot?scan_id={scan_uuid}" if scan_uuid else None
-                                task.enrichment.web_preview = WebPreviewInfo(
-                                    screenshot_url=proxied_url,
-                                    page_title=wp_raw.get("page_title"),
-                                    server=wp_raw.get("server"),
-                                    language=wp_raw.get("language"),
-                                    domain_age_days=wp_raw.get("domain_age_days"),
-                                    tls_issuer=wp_raw.get("tls_issuer"),
-                                    tls_valid_days=wp_raw.get("tls_valid_days"),
-                                    asn_name=wp_raw.get("asn_name"),
-                                    detected_brands=wp_raw.get("detected_brands", []) or [],
-                                    detected_technologies=wp_raw.get("detected_technologies", []) or [],
-                                    mime_type=wp_raw.get("mime_type"),
-                                    scan_uuid=scan_uuid,
-                                )
-                            except Exception as exc:
-                                logger.debug("Failed to construct WebPreviewInfo: %s", exc)
-
-                    # 2. Hudson Rock -> InfostealerIntel
-                    if r.source == "Hudson Rock" and isinstance(r.raw_data, dict):
-                        if not task.enrichment.infostealer:
-                            try:
-                                families_raw = r.raw_data.get("stealer_families", {})
-                                families_dict = families_raw if isinstance(families_raw, dict) else {}
-                                dates_list = r.raw_data.get("dates_compromised", [])
-                                date_range = f"{dates_list[0]} to {dates_list[-1]}" if dates_list else None
-                                task.enrichment.infostealer = InfostealerIntel(
-                                    total_employee_compromises=r.raw_data.get("total_infections", 0) or 0,
-                                    total_client_compromises=r.raw_data.get("total_user_services", 0) or 0,
-                                    top_corporate_services=r.raw_data.get("top_corporate_services", []) or [],
-                                    top_external_services=r.raw_data.get("top_external_services", []) or [],
-                                    stealer_families=families_dict,
-                                    password_strength_weak_pct=r.raw_data.get("password_strength_weak_pct"),
-                                    password_strength_strong_pct=r.raw_data.get("password_strength_strong_pct"),
-                                    total_compromised_urls=r.raw_data.get("total_compromised_urls"),
-                                    date_range=date_range,
-                                )
-                            except Exception as exc:
-                                logger.debug("Failed to construct InfostealerIntel: %s", exc)
-
-                    # 3. AbuseIPDB -> abuse_reports
-                    if r.source == "AbuseIPDB" and isinstance(r.raw_data, dict):
-                        reports = r.raw_data.get("reports", []) or []
-                        if reports and not task.enrichment.abuse_reports:
-                            task.enrichment.abuse_reports = reports[:20]
-
-                    # 4. AlienVault OTX -> malware_urls & associated_hashes
-                    if r.source == "AlienVault OTX" and isinstance(r.raw_data, dict):
-                        mal_urls = r.raw_data.get("malware_urls", []) or []
-                        if mal_urls and not task.enrichment.malware_urls:
-                            task.enrichment.malware_urls = mal_urls[:25]
-                        assoc_hashes = r.raw_data.get("associated_hashes", []) or []
-                        if assoc_hashes and not task.enrichment.associated_hashes:
-                            task.enrichment.associated_hashes = assoc_hashes[:15]
+            _merge_provider_intel_into_enrichment(task)
 
             await _update_stage(task, "Enrichment", "done", "Enrichment complete", 1.0)
             await _emit_stage_event(task, "Enrichment", "done", "Enrichment complete", 1.0)
@@ -1177,7 +1337,7 @@ async def run_analysis(
 
     if task.status == "done" and task.normalized:
         try:
-            from app.backend.database import async_session, upsert_lookup_result
+            from app.backend.database import async_session, persisted_verdict_fields, upsert_lookup_result
             from app.backend.models import IOC
             from sqlalchemy import select
             async with async_session() as session:
@@ -1189,9 +1349,10 @@ async def run_analysis(
                     ioc_obj = IOC(value=val, ioc_type=ioc_type)
                     session.add(ioc_obj)
                     await session.flush()
-                score = getattr(task.composite, "score", 0.0) if task.composite else 0.0
-                verdict = getattr(task.composite, "verdict", "unknown") if task.composite else "unknown"
-                confidence = getattr(task.composite, "confidence", "low") if task.composite else "low"
+                # DV-1: persist the authoritative final_assessment verdict/score,
+                # not the reputation-only composite (which is unknown/0 for
+                # breach/CVE/ASN/artifact domains).
+                score, verdict, confidence = persisted_verdict_fields(task)
                 await upsert_lookup_result(
                     session,
                     ioc_id=ioc_obj.id,

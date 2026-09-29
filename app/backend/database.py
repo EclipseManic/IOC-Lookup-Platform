@@ -175,6 +175,42 @@ async def retry_sqlite_commit(session: AsyncSession, *, attempts: int = 3, delay
             await asyncio.sleep(delay * attempt)
 
 
+def persisted_verdict_fields(task: object) -> tuple[float, str, str]:
+    """Derive the (score, verdict, confidence) to persist for a completed task.
+
+    DV-1 fix: ``compute_composite`` deliberately returns ``unknown / 0`` for
+    every non-reputation domain (breached emails, CVEs, ASNs, artifacts), so
+    persisting ``task.composite`` wrote the wrong answer to SQLite even though
+    the live ``final_assessment`` was correct. History, /recent and SIEM export
+    all read these columns back, so they showed "unknown / 0" for anything that
+    was not plain IP/domain/hash reputation.
+
+    The authoritative source is ``final_assessment`` (``normalized_score`` is the
+    0-100 scale, matching ``composite.score``); fall back to ``composite`` only
+    when no assessment exists. Mirrors the webhook dispatch logic in pipeline.py.
+    """
+    assessment = getattr(task, "final_assessment", None)
+    composite = getattr(task, "composite", None)
+    if assessment is not None:
+        score = getattr(assessment, "normalized_score", None)
+        if score is None:
+            score = getattr(composite, "score", 0.0) if composite else 0.0
+        verdict = getattr(assessment, "final_verdict", None) or (
+            getattr(composite, "verdict", "unknown") if composite else "unknown"
+        )
+        confidence = getattr(assessment, "confidence", None) or (
+            getattr(composite, "confidence", "low") if composite else "low"
+        )
+        return float(score or 0.0), verdict, confidence
+    if composite is not None:
+        return (
+            float(getattr(composite, "score", 0.0) or 0.0),
+            getattr(composite, "verdict", "unknown"),
+            getattr(composite, "confidence", "low"),
+        )
+    return 0.0, "unknown", "low"
+
+
 async def upsert_lookup_result(
     session: AsyncSession,
     *,

@@ -237,6 +237,7 @@ from app.backend.adapters.malware_bazaar import MalwareBazaarAdapter
 from app.backend.adapters.urlscan_io import UrlScanIOAdapter
 from app.backend.adapters.triage import TriageAdapter
 from app.backend.adapters.hybrid_analysis import HybridAnalysisAdapter
+from app.backend.adapters.hashlookup import HashlookupAdapter
 
 
 def _mock_async_client(status_code=200, json_data=None, raise_on=None):
@@ -733,6 +734,53 @@ class TestUrlScanIOAdapter:
 
 # Ã¢â€â‚¬Ã¢â€â‚¬ Cross-Adapter Ã¢â€â‚¬Ã¢â€â‚¬
 
+class TestHashlookupAdapter:
+    """CIRCL Hashlookup is a known-FILE reference corpus (NSRL + known software
+    + some malware). A hit means 'known file', never 'safe' -- the adapter must
+    not badge a found hash as clean (regression for the false-clean bug)."""
+
+    @pytest.mark.asyncio
+    async def test_found_known_malware_hash_is_not_clean(self):
+        # A real known-malware sample can be present in the corpus; 'found' must
+        # not be reported as a clean/benign verdict.
+        data = {
+            "FileName": "trojan_dropper.exe",
+            "mimetype": "application/x-dosexec",
+            "SHA-256": "a" * 64,
+            "KnownMalicious": "known malware sample",
+        }
+        a = HashlookupAdapter()
+        mock_class, _ = _mock_async_client(status_code=200, json_data=data)
+        with patch("httpx.AsyncClient", mock_class):
+            r = await a.lookup("a" * 64, "sha256")
+        assert r.status == "found"
+        assert r.verdict != "clean"
+        assert r.verdict != "benign"
+        assert r.verdict == "unknown"
+        assert r.raw_score == 0.0
+        assert "known_file" in r.tags
+
+    @pytest.mark.asyncio
+    async def test_found_benign_known_file_is_also_not_clean(self):
+        data = {"FileName": "kernel32.dll", "trust": 100}
+        a = HashlookupAdapter()
+        mock_class, _ = _mock_async_client(status_code=200, json_data=data)
+        with patch("httpx.AsyncClient", mock_class):
+            r = await a.lookup("d41d8cd98f00b204e9800998ecf8427e", "md5")
+        assert r.status == "found"
+        assert r.verdict == "unknown"
+        assert "present_in_reference_corpus" in r.tags
+
+    @pytest.mark.asyncio
+    async def test_not_found_stays_unknown_not_found(self):
+        a = HashlookupAdapter()
+        mock_class, _ = _mock_async_client(status_code=404)
+        with patch("httpx.AsyncClient", mock_class):
+            r = await a.lookup("d41d8cd98f00b204e9800998ecf8427e", "md5")
+        assert r.verdict == "unknown"
+        assert r.status == "not_found"
+
+
 class TestAdapterConsistency:
     """All adapters must follow the same contract."""
 
@@ -988,7 +1036,13 @@ class TestPipeline:
         assert task.progress == 100.0
         assert task.ioc_type == "ipv4"
         assert task.normalized == "8.8.8.8"
-        assert len(task.stages) == 24
+        # Stages are derived dynamically from the applicable provider plan
+        # (Classify + one row per applicable provider + Enrichment + Scoring),
+        # so the count varies by IOC type rather than being a fixed 24.
+        names = [s.name for s in task.stages]
+        assert names[0] == "Classify & Normalize"
+        assert names[-2:] == ["Enrichment", "Scoring & Relations"]
+        assert len(task.stages) >= 4
 
     @pytest.mark.asyncio
     async def test_run_analysis_domain(self):
@@ -1028,7 +1082,8 @@ class TestPipeline:
     @pytest.mark.asyncio
     async def test_task_has_stages(self):
         task = await run_analysis("8.8.8.8")
-        assert len(task.stages) == 24
+        # Dynamic stages: at least Classify + one provider + Enrichment + Scoring.
+        assert len(task.stages) >= 4
         for stage in task.stages:
             assert stage.status in ("done", "skipped", "pending", "error")
 
@@ -1068,7 +1123,8 @@ class TestPipeline:
         assert d["task_id"] == task.task_id
         assert d["status"] == "done"
         assert d["ioc_value"] == "8.8.8.8"
-        assert len(d["stages"]) == 24
+        assert len(d["stages"]) >= 4
+        assert d["stages"][0]["name"] == "Classify & Normalize"
 
 
 # Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬

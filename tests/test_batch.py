@@ -233,3 +233,99 @@ def test_run_batch_analysis_rejects_invalid_concurrency():
     err = asyncio.run(main())
     assert err is not None
     assert "concurrency" in err
+
+
+def test_resolve_batch_concurrency_applies_provider_budget(monkeypatch):
+    """Fix 3: the shared provider fan-out budget clamps batch concurrency so the
+    worst-case simultaneous provider burst stays bounded, without editing
+    pipeline.py."""
+    from app.backend import batch as batch_mod
+
+    monkeypatch.setattr(batch_mod, "BATCH_SEMAPHORE_LIMIT", 10)
+    monkeypatch.setattr(batch_mod, "BATCH_PROVIDER_FANOUT_PER_IOC", 18)
+    monkeypatch.setattr(batch_mod, "BATCH_PROVIDER_FANOUT_BUDGET", 90)
+
+    # 90 // 18 = 5, so a request for the full 10 is clamped down to 5 IOCs.
+    assert batch_mod._resolve_batch_concurrency(10) == 5
+    assert batch_mod._resolve_batch_concurrency(None) == 5
+    # A request already under the budget is left alone.
+    assert batch_mod._resolve_batch_concurrency(3) == 3
+
+    # Budget of 0 disables the clamp; only the semaphore limit applies.
+    monkeypatch.setattr(batch_mod, "BATCH_PROVIDER_FANOUT_BUDGET", 0)
+    assert batch_mod._resolve_batch_concurrency(10) == 10
+    assert batch_mod._resolve_batch_concurrency(50) == 10  # clamped to the limit
+
+    # Invalid concurrency is still rejected before any budget math.
+    with pytest.raises(ValueError):
+        batch_mod._resolve_batch_concurrency(0)
+
+
+def test_run_batch_analysis_normalizes_once(monkeypatch):
+    """Fix 2: run_batch_analysis normalizes exactly once on the direct path and
+    NOT at all when the caller already normalized (prenormalized=True), so the
+    start_batch_analysis -> run_batch_analysis handoff no longer double-normalizes."""
+    import asyncio
+    from app.backend import batch as batch_mod
+
+    batch_mod._batch_tasks.clear()
+    batch_mod._batch_queues.clear()
+
+    calls = {"n": 0}
+    original = batch_mod.normalize_batch_iocs_typed
+
+    def counting(values):
+        calls["n"] += 1
+        return original(values)
+
+    monkeypatch.setattr(batch_mod, "normalize_batch_iocs_typed", counting)
+
+    async def fake_run(ioc, task_id=None, fp_override=False, **kwargs):
+        t = AnalysisTask(task_id=task_id or "x", ioc_value=ioc, normalized=ioc,
+                         ioc_type="ipv4", status="done", progress=100.0)
+        t.composite = CompositeScore(score=0.0, verdict="clean", confidence="high")
+        return t
+
+    monkeypatch.setattr(batch_mod, "run_analysis", fake_run)
+
+    async def main():
+        # Direct path normalizes once.
+        await batch_mod.run_batch_analysis(["8.8.8.8", "1.1.1.1"])
+        after_direct = calls["n"]
+        # Prenormalized handoff (what start_batch_analysis does) skips it entirely.
+        await batch_mod.run_batch_analysis(
+            ["8.8.8.8", "1.1.1.1"], type_overrides={}, prenormalized=True
+        )
+        after_prenormalized = calls["n"]
+        return after_direct, after_prenormalized
+
+    after_direct, after_prenormalized = asyncio.run(main())
+    assert after_direct == 1
+    assert after_prenormalized == 1  # unchanged: the second run added zero calls
+
+
+def test_batch_timeout_synthetic_task_is_resolvable(monkeypatch):
+    """Fix 4: a timed-out IOC's synthetic task carries normalized + ioc_type so
+    GET /api/batch/{id}/ioc/{ioc} can resolve it."""
+    import asyncio
+    from app.backend import batch as batch_mod
+
+    batch_mod._batch_tasks.clear()
+    batch_mod._batch_queues.clear()
+
+    async def slow_run(ioc, task_id=None, fp_override=False, **kwargs):
+        await asyncio.sleep(5)
+
+    monkeypatch.setattr(batch_mod, "run_analysis", slow_run)
+
+    async def main():
+        return await batch_mod.run_batch_analysis(["8.8.8.8"], timeout=0.05)
+
+    bt = asyncio.run(main())
+    task = bt.subtasks[0]
+    assert task.status == "error"
+    assert "timed out" in (task.error or "")
+    # The endpoint matches on task.normalized / task.ioc_value; both must be set.
+    assert task.normalized == "8.8.8.8"
+    assert task.ioc_type  # non-empty (classified as ipv4)
+

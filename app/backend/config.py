@@ -154,6 +154,17 @@ class Settings(BaseSettings):
     queue_wait_timeout_seconds: float = Field(10.0, alias="QUEUE_WAIT_TIMEOUT_SECONDS")
     network_timeout_seconds: float = Field(15.0, alias="NETWORK_TIMEOUT_SECONDS")
     batch_semaphore_limit: int = Field(10, alias="BATCH_SEMAPHORE_LIMIT")
+    # Batch progress-persistence debounce: how often the drive loop flushes
+    # partial progress to the DB while a batch is running.  Terminal states
+    # always force one final complete persist regardless of these.
+    batch_progress_persist_every: int = Field(5, alias="BATCH_PROGRESS_PERSIST_EVERY")
+    batch_progress_persist_interval: float = Field(2.0, alias="BATCH_PROGRESS_PERSIST_INTERVAL")
+    # Shared provider fan-out budget: clamps batch IOC concurrency so
+    # concurrency * per-IOC-fanout stays under the budget, capping the
+    # worst-case simultaneous provider burst (API-key protection).  Budget 0
+    # disables the clamp.
+    batch_provider_fanout_budget: int = Field(90, alias="BATCH_PROVIDER_FANOUT_BUDGET")
+    batch_provider_fanout_per_ioc: int = Field(18, alias="BATCH_PROVIDER_FANOUT_PER_IOC")
     max_batch_iocs: int = Field(100, alias="MAX_BATCH_IOCS")
     max_concurrent_lookups: int = Field(4, alias="MAX_CONCURRENT_LOOKUPS")
     max_pending_lookups: int = Field(32, alias="MAX_PENDING_LOOKUPS")

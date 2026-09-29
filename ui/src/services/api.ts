@@ -366,6 +366,120 @@ export interface AbuseReport {
   category_names: string[];
 }
 
+// ─── Context-based enrichment payloads (enrichment.extra.*) ───
+// The backend enriches "context" IOC types into structured objects under
+// `extra`. These are typed so the Investigation view can render dedicated
+// cards instead of forcing the analyst into the Raw Data tab.
+export interface AsnContext {
+  resource: string;
+  holder?: string;
+  announced_prefix_count?: number;
+  announced_prefixes?: { prefix?: string; timelines?: unknown[] }[];
+  block?: Record<string, unknown>;
+}
+
+export interface MitreAttackContext {
+  id: string;
+  kind?: "tactic" | "technique" | string;
+  title?: string;
+  description?: string;
+  url?: string;
+}
+
+export interface HostArtifactContext {
+  value: string;
+  type: string;
+  server?: string;
+  pipe_name?: string;
+  hive?: string;
+  key_path?: string;
+  depth?: number;
+  namespace?: string;
+  name?: string;
+}
+
+export interface FilenameContext {
+  value: string;
+  extension?: string;
+  category?: string;
+  double_extension?: boolean;
+  component_extensions?: string[];
+}
+
+export interface FilePathContext {
+  value: string;
+  os?: string;
+  directory?: string;
+  filename?: string;
+  extension?: string;
+  suspicious_location?: boolean;
+  location_marker?: string;
+}
+
+export interface UserAgentContext {
+  value: string;
+  client?: string;
+  platform?: string;
+  is_automation?: boolean;
+}
+
+export interface MacContext {
+  value: string;
+  oui?: string;
+  vendor?: string;
+  locally_administered?: boolean;
+  multicast?: boolean;
+  virtualization?: boolean;
+}
+
+export interface HashResultEntry {
+  filename?: string;
+  size?: string | number;
+  mime?: string;
+  source?: string;
+  database?: string;
+  trust?: unknown;
+  md5?: string;
+  sha1?: string;
+  sha256?: string;
+  ssdeep?: string;
+  tlsh?: string;
+}
+
+export interface SsdeepContext {
+  block_size?: number | null;
+  first_chunk_length?: number;
+  second_chunk_length?: number;
+  alphabet?: string;
+}
+
+export interface CryptoContext {
+  address: string;
+  hash160?: string;
+  n_tx?: number;
+  total_received_btc?: number;
+  total_sent_btc?: number;
+  final_balance_btc?: number;
+  balance_eth?: number;
+  transaction_count?: number;
+  recent_transactions?: Record<string, unknown>[];
+}
+
+export interface EnrichmentExtra {
+  bitcoin?: CryptoContext;
+  ethereum?: CryptoContext;
+  asn?: AsnContext;
+  mitre_attack?: MitreAttackContext;
+  host_artifact?: HostArtifactContext;
+  filename?: FilenameContext;
+  file_path?: FilePathContext;
+  user_agent?: UserAgentContext;
+  mac?: MacContext;
+  hash_results?: HashResultEntry[];
+  ssdeep?: SsdeepContext;
+  [key: string]: unknown;
+}
+
 export interface EnrichmentData {
   geoip?: GeoIPInfo;
   open_ports: number[];
@@ -381,7 +495,7 @@ export interface EnrichmentData {
   passive_dns?: PassiveDNSInfo;
   redirect_chain: Record<string, unknown>[];
   url_preview: Record<string, unknown>;
-  extra: Record<string, unknown>;
+  extra: EnrichmentExtra;
   relationships: Relationship[];
   completeness: Record<string, string>;
   analysis_notes?: string[];

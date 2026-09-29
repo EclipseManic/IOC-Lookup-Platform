@@ -1,14 +1,7 @@
 import type { NormalizedResult } from "../services/api";
+import { getVerdictColor } from "../lib/verdictColors";
 
 const VERDICT_ORDER = ["malicious", "breached", "suspicious", "clean", "not_breached", "unknown"] as const;
-const VERDICT_COLORS: Record<string, string> = {
-  malicious: "bg-red-500",
-  breached: "bg-rose-500",
-  suspicious: "bg-amber-500",
-  clean: "bg-green-500",
-  not_breached: "bg-emerald-500",
-  unknown: "bg-gray-500",
-};
 
 export default function ConsensusBar({ results }: { results: NormalizedResult[] }) {
   const counts: Record<string, number> = {};
@@ -33,7 +26,7 @@ export default function ConsensusBar({ results }: { results: NormalizedResult[] 
           return (
             <div
               key={v}
-              className={VERDICT_COLORS[v]}
+              className={getVerdictColor(v).solid}
               style={{ width: `${pct}%` }}
               title={`${v}: ${counts[v]} (${pct.toFixed(0)}%)`}
             />
@@ -45,7 +38,7 @@ export default function ConsensusBar({ results }: { results: NormalizedResult[] 
           if (!counts[v]) return null;
           return (
             <div key={v} className="flex items-center gap-1.5 text-xs">
-              <span className={`w-2 h-2 rounded-full ${VERDICT_COLORS[v]}`} />
+              <span className={`w-2 h-2 rounded-full ${getVerdictColor(v).solid}`} />
               <span className="text-text-secondary">{v.replace(/_/g, " ")}</span>
               <span className="text-text-primary font-mono">{counts[v]}</span>
             </div>

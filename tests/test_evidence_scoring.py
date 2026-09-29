@@ -3,6 +3,7 @@ import sys
 sys.path.insert(0, ".")
 
 from app.backend.adapters.base import EnrichmentData, GeoIPInfo, NormalizedResult
+from app.backend.evidence import normalize_provider_result
 from app.backend.scorer import aggregate_evidence
 
 
@@ -115,3 +116,87 @@ def test_duplicate_provider_results_are_counted_once():
     assert assessment.evidence_summary["providers_aggregated"] == 1
     assert assessment.evidence_summary["duplicate_provider_results_ignored"] == 1
     assert assessment.malicious_sources == ["ThreatFox"]
+
+
+# --- FM-A regression: free-text keywords must not fabricate malicious verdicts ---
+
+# A live md5 hash routes to the ``ioc_reputation`` domain, so nested-evidence
+# promotion runs. (The all-zeros EICAR hash routes to security_test_artifact.)
+_LIVE_MD5 = "6408276cdfd12a1d5d3ed7256bfba639"
+
+
+def test_benign_free_text_no_malware_detected_is_not_promoted():
+    """A benign payload mentioning the keyword must stay unknown, not malicious."""
+    res = NormalizedResult(
+        ioc=_LIVE_MD5,
+        ioc_type="md5",
+        source="MalwareBazaar",
+        provider_verdict="record_found",
+        normalized_verdict="unknown",
+        raw_data={
+            "vendor_intel": {
+                # Prose containing the keyword, plus a zero count and a
+                # negation-laden verdict: none of these are a real detection.
+                "ScanEngine": {"description": "no malware detected", "malicious": 0, "verdict": "clean"},
+                "Sandbox": {"notes": "trojan removal completed; sample is benign"},
+            },
+        },
+    )
+    normalize_provider_result(res, "ioc_reputation")
+    assert res.normalized_verdict == "unknown"
+    assert res.verdict != "malicious"
+    # The evidence is still preserved for the analyst, just not as a detection.
+    classes = {item["evidence_class"] for item in res.evidence_items}
+    assert "direct_positive" not in classes
+
+
+def test_zero_detection_count_and_key_name_alone_do_not_promote():
+    """The key ``malicious`` with value 0 must not read as a detection."""
+    assessment = aggregate_evidence(_LIVE_MD5, "md5", [
+        result("MalwareBazaar", "unknown", ioc=_LIVE_MD5, ioc_type="md5",
+               provider_verdict="record_found",
+               raw_data={"vendor_intel": {"VirusTotal": {"malicious": 0, "suspicious": 0, "harmless": 70}}}),
+    ])
+    assert assessment.final_verdict != "malicious"
+    assert assessment.malicious_sources == []
+
+
+def test_structured_positive_detection_count_is_promoted():
+    """A real positive detection count still promotes to malicious/high."""
+    res = NormalizedResult(
+        ioc=_LIVE_MD5,
+        ioc_type="md5",
+        source="MalwareBazaar",
+        provider_verdict="record_found",
+        normalized_verdict="unknown",
+        raw_data={"vendor_intel": {"VirusTotal": {"malicious": 12, "suspicious": 1, "harmless": 20}}},
+    )
+    normalize_provider_result(res, "ioc_reputation")
+    assert res.normalized_verdict == "malicious"
+    assert res.verdict == "malicious"
+    assert res.confidence == "high"
+
+
+def test_structured_vendor_verdict_field_is_promoted():
+    """A structured verdict field whose value is malicious still promotes."""
+    assessment = aggregate_evidence(_LIVE_MD5, "md5", [
+        result("MalwareBazaar", "unknown", ioc=_LIVE_MD5, ioc_type="md5",
+               provider_verdict="record_found",
+               raw_data={"vendor_intel": {"ANY.RUN": {"verdict": "malicious", "malware_family": "RustyStealer"}}}),
+    ])
+    assert assessment.final_verdict == "malicious"
+    assert "MalwareBazaar" in assessment.malicious_sources
+
+
+def test_vendor_prefixed_tag_with_zero_detection_is_not_promoted():
+    """A vendor_ tag encoding a clean/zero result must not promote."""
+    res = NormalizedResult(
+        ioc=_LIVE_MD5,
+        ioc_type="md5",
+        source="MalwareBazaar",
+        provider_verdict="record_found",
+        normalized_verdict="unknown",
+        tags=["vendor_CrowdStrike: {\"malicious\": 0, \"verdict\": \"clean\"}"],
+    )
+    normalize_provider_result(res, "ioc_reputation")
+    assert res.normalized_verdict != "malicious"

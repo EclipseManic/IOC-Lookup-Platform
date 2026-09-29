@@ -199,3 +199,108 @@ async def test_legacy_batch_payload_gets_complete_api_contract():
         if record is not None:
             await session.delete(record)
             await session.commit()
+
+
+@pytest.mark.asyncio
+async def test_progress_persistence_is_debounced(monkeypatch):
+    """Debounce fix (unit): _maybe_persist_progress must NOT persist on every
+    completed IOC (the "persistence storm"); it flushes only once every
+    BATCH_PROGRESS_PERSIST_EVERY completions when the time trigger is disabled."""
+    import time
+    from app.backend import batch as batch_mod
+
+    bt = batch_mod.BatchTask("dbnc_unit", ["a", "b", "c", "d", "e", "f"])
+
+    calls = {"n": 0}
+
+    async def fake_persist(b, *, required=False):
+        calls["n"] += 1
+
+    monkeypatch.setattr(batch_mod, "_persist_batch", fake_persist)
+    monkeypatch.setattr(batch_mod, "BATCH_PROGRESS_PERSIST_EVERY", 3)
+    monkeypatch.setattr(batch_mod, "BATCH_PROGRESS_PERSIST_INTERVAL", 0.0)  # count-trigger only
+
+    # Baseline exactly as run_batch_analysis sets it before the drive loop.
+    bt._last_progress_persist_ts = time.monotonic()
+    bt._last_progress_persist_completed = 0
+
+    persist_points = []
+    for i in range(1, 7):  # six completions, driven one at a time
+        bt.completed = i
+        await batch_mod._maybe_persist_progress(bt)
+        persist_points.append(calls["n"])
+
+    # No per-completion storm: completions 1,2,4,5 add zero persists.
+    assert persist_points == [0, 0, 1, 1, 1, 2]
+    # Flushes fire exactly at the configured cadence (after the 3rd and 6th).
+    assert calls["n"] == 2
+
+
+@pytest.mark.asyncio
+async def test_completed_batch_fully_persisted_despite_debounce(monkeypatch):
+    """Debounce fix (integration): even when mid-run persistence is fully
+    throttled, the forced terminal persist writes the COMPLETE batch — every
+    subtask — to the DB, so the debounce never loses data."""
+    from app.backend import batch as batch_mod
+    from app.backend.pipeline import AnalysisTask
+    from app.backend.adapters.base import CompositeScore
+
+    batch_id = "test_debounce_complete_789"
+    batch_mod._batch_tasks.pop(batch_id, None)
+    batch_mod._batch_queues.clear()
+
+    # Suppress ALL mid-run persists: an unreachable completion count plus the
+    # time trigger disabled means only the forced terminal persist can fire.
+    monkeypatch.setattr(batch_mod, "BATCH_PROGRESS_PERSIST_EVERY", 10_000)
+    monkeypatch.setattr(batch_mod, "BATCH_PROGRESS_PERSIST_INTERVAL", 0.0)
+
+    persist_calls = {"n": 0}
+    real_persist = batch_mod._persist_batch
+
+    async def counting_persist(bt, *, required=False):
+        persist_calls["n"] += 1
+        await real_persist(bt, required=required)
+
+    monkeypatch.setattr(batch_mod, "_persist_batch", counting_persist)
+
+    async def fake_run(ioc, task_id=None, fp_override=False, **kwargs):
+        t = AnalysisTask(task_id=task_id or "x", ioc_value=ioc, normalized=ioc,
+                         ioc_type="ipv4", status="done", progress=100.0)
+        t.composite = CompositeScore(score=0.0, verdict="clean", confidence="high")
+        return t
+
+    monkeypatch.setattr(batch_mod, "run_analysis", fake_run)
+
+    iocs = ["1.1.1.1", "8.8.8.8", "9.9.9.9", "8.8.4.4"]
+    bt = await batch_mod.run_batch_analysis(
+        iocs, batch_id=batch_id, prenormalized=True, type_overrides={}
+    )
+
+    # Mid-run persistence was fully throttled: the only persist was terminal.
+    assert persist_calls["n"] == 1
+    assert bt.status == "done"
+    assert len(bt.subtasks) == len(iocs)
+
+    # ...and that single terminal persist stored the COMPLETE batch: one
+    # per-IOC LookupResult row for every subtask (the debounce loses no data).
+    from sqlalchemy import select
+    from app.backend.models import LookupResult
+    async with async_session() as session:
+        rows = (await session.execute(
+            select(LookupResult).where(LookupResult.batch_id == batch_id)
+        )).scalars().all()
+    assert len(rows) == len(iocs)
+    assert all(r.composite_verdict == "clean" for r in rows)
+
+    # The consolidated BatchRecord also reflects the full completion count.
+    db_res = await get_batch_from_db(batch_id)
+    assert db_res is not None
+    assert db_res["completed"] == len(iocs)
+
+    # cleanup
+    batch_mod._batch_tasks.pop(batch_id, None)
+    async with async_session() as session:
+        record = await session.get(BatchRecord, batch_id)
+        if record is not None:
+            await session.delete(record)
+            await session.commit()

@@ -15,9 +15,35 @@ from typing import Any
 from app.backend.adapters.base import NormalizedResult, normalize_provider_verdict
 
 
-_MALICIOUS = re.compile(r"\b(malicious|malware|trojan|virus|ransom|stealer|backdoor|botnet|phish|azorult|cobalt\s+strike|agenttesla|eicar)\b", re.I)
-_SUSPICIOUS = re.compile(r"\b(suspicious|harmful|risk|unwanted|injection|credential|steal|exfiltrat|exploit)\b", re.I)
-_NEGATIVE = re.compile(r"\b(clean|benign|harmless|whitelist(?:ed)?)\b", re.I)
+# Structured detection is read from typed fields, never from a substring scan
+# of the stringified payload. A numeric value in one of these fields is a
+# detection tally (VirusTotal-style ``{"malicious": 12}``); the count itself,
+# not the key name, decides promotion.
+_POSITIVE_COUNT_FIELDS = frozenset({
+    "malicious", "malicious_count", "positives", "detections",
+    "detection_count", "detected_count",
+})
+_SUSPICIOUS_COUNT_FIELDS = frozenset({"suspicious", "suspicious_count"})
+# Typed verdict/classification fields whose *value* is normalized through the
+# shared provider vocabulary. ``normalize_provider_verdict`` maps exact tokens
+# only ("malware"/"phishing" -> malicious), so descriptive prose such as
+# "no malware detected" or "trojan removal" resolves to ``unknown`` and never
+# promotes.
+_VERDICT_FIELDS = frozenset({
+    "verdict", "normalized_verdict", "classification", "result",
+    "status", "conclusion", "category", "threat_verdict", "detection",
+})
+_NEGATIVE_VERDICTS = frozenset({"clean", "benign", "harmless", "whitelisted", "undetected"})
+# Typed fields that name a detected threat. A non-empty, non-placeholder value
+# here is a vendor's positive classification, not free-text prose.
+_THREAT_NAME_FIELDS = frozenset({
+    "malware_family", "threat_name", "signature", "family", "detection_name",
+})
+_BENIGN_NAME_VALUES = frozenset({
+    "none", "null", "n/a", "na", "-", "unknown", "clean", "benign",
+    "undetected", "not detected", "no specific threat detected", "goodware",
+})
+_SIGNAL_ORDER = {None: 0, "clean": 1, "suspicious": 2, "malicious": 3}
 
 
 def _jsonish(value: Any) -> Any:
@@ -62,14 +88,94 @@ def _iter_vendor_payloads(result: NormalizedResult) -> list[tuple[str, Any]]:
     return candidates
 
 
+def _as_count(value: Any) -> int | None:
+    """Return a non-negative integer detection tally, or None if not numeric.
+
+    Booleans are rejected here so a ``{"malicious": true}`` flag is not silently
+    read as the integer ``1``; boolean detection flags are handled separately in
+    :func:`_structured_signal`.
+    """
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    count = int(value)
+    return count if count >= 0 else None
+
+
+def _structured_signal(payload: Any) -> str | None:
+    """Derive a detection signal from typed fields only.
+
+    Returns ``"malicious"``, ``"suspicious"``, ``"clean"`` or ``None`` (no
+    structured signal). Never inspects the stringified blob: a signal must come
+    from an explicit positive detection COUNT (or boolean flag), a typed verdict
+    FIELD whose VALUE normalizes to a malicious/suspicious class, or a typed
+    threat-name FIELD carrying a real detection. This is what makes "no malware
+    detected", "trojan removal" and ``{"malicious": 0}`` inert.
+    """
+    if isinstance(payload, list):
+        return _reduce_signal(_structured_signal(item) for item in payload)
+    if not isinstance(payload, dict):
+        return None
+    signals: list[str | None] = []
+    for key, value in payload.items():
+        field = str(key).strip().lower()
+        if field in _POSITIVE_COUNT_FIELDS:
+            if isinstance(value, bool):
+                signals.append("malicious" if value else "clean")
+            else:
+                count = _as_count(value)
+                if count is not None and count > 0:
+                    signals.append("malicious")
+                elif count == 0:
+                    signals.append("clean")
+        elif field in _SUSPICIOUS_COUNT_FIELDS:
+            if isinstance(value, bool):
+                if value:
+                    signals.append("suspicious")
+            else:
+                count = _as_count(value)
+                if count is not None and count > 0:
+                    signals.append("suspicious")
+        elif field in _VERDICT_FIELDS and isinstance(value, str) and value.strip():
+            mapped = normalize_provider_verdict(value)
+            if mapped == "malicious":
+                signals.append("malicious")
+            elif mapped == "suspicious":
+                signals.append("suspicious")
+            elif mapped in _NEGATIVE_VERDICTS:
+                signals.append("clean")
+        elif field in _THREAT_NAME_FIELDS and isinstance(value, str) and value.strip():
+            if value.strip().lower() not in _BENIGN_NAME_VALUES:
+                signals.append("malicious")
+        elif isinstance(value, (dict, list)):
+            signals.append(_structured_signal(value))
+    return _reduce_signal(signals)
+
+
+def _reduce_signal(signals: Any) -> str | None:
+    """Collapse many structured signals into the strongest one seen."""
+    strongest: str | None = None
+    for signal in signals:
+        if _SIGNAL_ORDER.get(signal, 0) > _SIGNAL_ORDER.get(strongest, 0):
+            strongest = signal
+    return strongest
+
+
 def _classify_payload(payload: Any) -> tuple[str, str, float]:
-    text = _value_text(payload)
-    if _MALICIOUS.search(text):
-        return "direct_positive", "Nested vendor intelligence contains a malicious detection or malware classification.", 0.9
-    if _SUSPICIOUS.search(text):
-        return "behavioral", "Nested vendor intelligence contains suspicious behavior or a threat rule.", 0.65
-    if _NEGATIVE.search(text):
-        return "weak_negative", "Nested vendor intelligence contains a negative classification.", 0.3
+    """Classify a vendor payload from structured detection signals only.
+
+    The previous implementation ran a keyword regex over the whole stringified
+    blob, so a key name (``"malicious": 0``), a benign description ("no malware
+    detected", "trojan removal") or a zero count all falsely promoted to a
+    malicious detection. Promotion now fires only on a typed positive count, a
+    typed verdict value, or a typed threat name.
+    """
+    signal = _structured_signal(payload)
+    if signal == "malicious":
+        return "direct_positive", "Nested vendor intelligence records a positive malicious detection (count or verdict field).", 0.9
+    if signal == "suspicious":
+        return "behavioral", "Nested vendor intelligence records a suspicious detection in a structured field.", 0.65
+    if signal == "clean":
+        return "weak_negative", "Nested vendor intelligence records a negative (clean/zero-detection) classification.", 0.3
     return "metadata", "Nested vendor metadata was preserved for analyst review.", 0.2
 
 

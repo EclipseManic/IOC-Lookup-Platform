@@ -54,6 +54,11 @@ async def enrich(value: str, ioc_type: str) -> EnrichmentData:
         "named_pipe": lambda value: enrich_host_artifact(value, "named_pipe"),
         "registry_key": lambda value: enrich_host_artifact(value, "registry_key"),
         "service_name": lambda value: enrich_host_artifact(value, "service_name"),
+        "filename": enrich_filename,
+        "windows_path": lambda value: enrich_filepath(value, "windows"),
+        "linux_path": lambda value: enrich_filepath(value, "linux"),
+        "user_agent": enrich_user_agent,
+        "mac": enrich_mac,
     }
     fn = dispatch.get(ioc_type, enrich_unknown)
     return await fn(value)
@@ -955,6 +960,201 @@ async def enrich_host_artifact(value: str, ioc_type: str = "") -> EnrichmentData
     return EnrichmentData(
         completeness={"structural_analysis": "ok", "threat_corpus": "unavailable"},
         extra={"host_artifact": details},
+    )
+
+
+async def enrich_filename(value: str) -> EnrichmentData:
+    """Local structural context for a filename artifact (keyless, no corpus).
+
+    Surfaces the extension, a coarse category, and double-extension /
+    executable-masquerade heuristics so the analyst sees *something* structured
+    instead of an empty panel."""
+    name = value.strip().strip('"')
+    dot = name.rfind(".")
+    ext = name[dot + 1:].lower() if dot > 0 else ""
+    stem = name[:dot] if dot > 0 else name
+
+    executable = {"exe", "dll", "sys", "scr", "com", "msi", "elf", "so", "dylib", "bin"}
+    script = {"bat", "cmd", "ps1", "vbs", "js", "sh", "py", "pl", "php", "hta", "jar", "wsf"}
+    office = {"doc", "docx", "docm", "xls", "xlsx", "xlsm", "ppt", "pptx", "pptm", "pdf", "rtf"}
+    archive = {"zip", "rar", "7z", "tar", "gz", "iso", "img", "vhd", "cab"}
+    if ext in executable:
+        category = "executable"
+    elif ext in script:
+        category = "script"
+    elif ext in office:
+        category = "document"
+    elif ext in archive:
+        category = "archive"
+    else:
+        category = "other"
+
+    # Double-extension masquerade (e.g. invoice.pdf.exe) is a classic lure.
+    inner = re.findall(r"\.([A-Za-z0-9]{1,5})", stem)
+    masq_office = {"pdf", "doc", "docx", "xls", "xlsx", "ppt", "jpg", "png", "txt"}
+    double_extension = bool(inner and ext in (executable | script) and inner[-1].lower() in masq_office)
+
+    notes: list[str] = []
+    if double_extension:
+        notes.append(
+            f"Double-extension masquerade: a '{inner[-1].lower()}' file name that is actually a .{ext} "
+            f"{category} — a common social-engineering lure."
+        )
+    if category in {"executable", "script"}:
+        notes.append("Executable/script artifact; correlate the associated file hash with malware feeds for a verdict.")
+
+    return EnrichmentData(
+        completeness={"structural_analysis": "ok", "threat_corpus": "unavailable"},
+        analysis_notes=notes,
+        extra={"filename": {
+            "value": name,
+            "extension": ext,
+            "category": category,
+            "double_extension": double_extension,
+            "component_extensions": [e.lower() for e in inner] + ([ext] if ext else []),
+        }},
+    )
+
+
+async def enrich_filepath(value: str, os_family: str) -> EnrichmentData:
+    """Local structural context for a Windows or Linux path (keyless).
+
+    Extracts the directory, leaf filename, and a suspicious-location flag for
+    the common malware staging directories."""
+    raw = value.strip().strip('"')
+    if os_family == "windows":
+        sep = "\\"
+        normalized = raw.replace("/", "\\")
+        drive = normalized[:2] if re.match(r"^[A-Za-z]:", normalized) else ""
+        suspicious_markers = [
+            r"\appdata\local\temp", r"\appdata\roaming", r"\windows\temp",
+            r"\programdata", r"\users\public", r"\$recycle.bin", r"\perflogs",
+        ]
+    else:
+        sep = "/"
+        normalized = raw
+        drive = ""
+        suspicious_markers = ["/tmp/", "/var/tmp/", "/dev/shm/", "/run/", "/var/www/"]
+
+    leaf = normalized.rstrip(sep).rsplit(sep, 1)[-1] if sep in normalized.rstrip(sep) else normalized
+    directory = normalized[: len(normalized) - len(leaf)].rstrip(sep) or (drive or sep)
+    low = normalized.lower()
+    hit = next((m for m in suspicious_markers if m in low), "")
+
+    notes: list[str] = []
+    if hit:
+        notes.append(
+            f"Path resides in a common malware staging location ({hit.strip(sep)}); "
+            "execution from here is frequently associated with dropped payloads."
+        )
+
+    file_ext = leaf.rsplit(".", 1)[-1].lower() if "." in leaf else ""
+    return EnrichmentData(
+        completeness={"structural_analysis": "ok", "threat_corpus": "unavailable"},
+        analysis_notes=notes,
+        extra={"file_path": {
+            "value": raw,
+            "os": os_family,
+            "directory": directory,
+            "filename": leaf,
+            "extension": file_ext,
+            "suspicious_location": bool(hit),
+            "location_marker": hit.strip(sep) if hit else "",
+        }},
+    )
+
+
+async def enrich_user_agent(value: str) -> EnrichmentData:
+    """Local structural parse of a User-Agent string (keyless).
+
+    Identifies the declared client family and flags the automation/scripting
+    clients that rarely represent a human browser."""
+    ua = value.strip()
+    low = ua.lower()
+    client = ua.split("/", 1)[0].strip() if "/" in ua else ua
+
+    automation = {
+        "curl": "curl", "wget": "wget", "python-requests": "python-requests",
+        "go-http-client": "Go net/http", "java": "Java", "python-urllib": "urllib",
+        "libwww-perl": "libwww-perl", "okhttp": "OkHttp", "axios": "axios",
+        "postmanruntime": "Postman", "aiohttp": "aiohttp",
+    }
+    tool = next((label for key, label in automation.items() if low.startswith(key) or key in low), "")
+    is_automation = bool(tool)
+
+    if not is_automation and ("mozilla" in low or "applewebkit" in low or "gecko" in low):
+        client = "Browser (Mozilla-compatible)"
+
+    platform = ""
+    for token, label in (("windows nt", "Windows"), ("mac os x", "macOS"), ("android", "Android"),
+                         ("iphone", "iOS"), ("linux", "Linux"), ("x11", "Unix/X11")):
+        if token in low:
+            platform = label
+            break
+
+    notes: list[str] = []
+    if is_automation:
+        notes.append(
+            f"Automation/scripting client ({tool}); rarely a human browser — common in scanners, "
+            "scrapers, and C2 beacons. Correlate with the source IP's request pattern."
+        )
+    return EnrichmentData(
+        completeness={"structural_analysis": "ok", "threat_corpus": "unavailable"},
+        analysis_notes=notes,
+        extra={"user_agent": {
+            "value": ua,
+            "client": tool or client,
+            "platform": platform,
+            "is_automation": is_automation,
+        }},
+    )
+
+
+# OUI prefixes for common virtualization / hypervisor vendors — a MAC in one of
+# these ranges usually indicates a VM or sandbox rather than physical hardware.
+_MAC_VENDOR_OUIS = {
+    "00:05:69": "VMware", "00:0c:29": "VMware", "00:1c:14": "VMware", "00:50:56": "VMware",
+    "08:00:27": "VirtualBox (Oracle)", "0a:00:27": "VirtualBox (Oracle)",
+    "00:03:ff": "Microsoft Hyper-V", "00:15:5d": "Microsoft Hyper-V",
+    "00:16:3e": "Xen", "52:54:00": "QEMU/KVM", "00:1c:42": "Parallels",
+    "00:e0:4c": "Realtek", "00:0f:4b": "Oracle VM",
+}
+
+
+async def enrich_mac(value: str) -> EnrichmentData:
+    """Local structural context for a MAC address (keyless).
+
+    Decodes the OUI, the locally-administered / multicast bits, and flags known
+    virtualization vendor ranges (VMware, VirtualBox, Hyper-V, QEMU, ...)."""
+    norm = value.lower().replace("-", ":")
+    octets = norm.split(":")
+    oui = ":".join(octets[:3]) if len(octets) >= 3 else norm
+    vendor = _MAC_VENDOR_OUIS.get(oui, "")
+
+    locally_administered = False
+    multicast = False
+    if octets and re.fullmatch(r"[0-9a-f]{2}", octets[0]):
+        first = int(octets[0], 16)
+        locally_administered = bool(first & 0b10)
+        multicast = bool(first & 0b01)
+
+    notes: list[str] = []
+    if vendor:
+        notes.append(f"OUI belongs to {vendor}; this endpoint is likely a virtual machine or sandbox, not physical hardware.")
+    if locally_administered:
+        notes.append("Locally-administered address (not a burned-in vendor MAC) — may be spoofed or randomized.")
+
+    return EnrichmentData(
+        completeness={"structural_analysis": "ok", "vendor_lookup": "ok" if vendor else "unknown_oui"},
+        analysis_notes=notes,
+        extra={"mac": {
+            "value": norm,
+            "oui": oui,
+            "vendor": vendor or "Unknown",
+            "locally_administered": locally_administered,
+            "multicast": multicast,
+            "virtualization": bool(vendor),
+        }},
     )
 
 

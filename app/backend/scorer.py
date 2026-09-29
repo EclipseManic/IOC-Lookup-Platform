@@ -652,18 +652,72 @@ def aggregate_evidence(
         applicable = [o for o in observations if o.status not in {"not_applicable"}]
         evaluated = [o for o in applicable if o.status in {"success", "not_found"}]
         context = _context_values(list(chosen.values()), enrichment)
-        reason = route_assessment_domain(ioc_type, ioc).recommended_action
-        if not applicable:
-            reason = f"Context-only indicator ({ioc_type}); no configured provider supports this assessment domain. {reason}"
+        base_action = route_assessment_domain(ioc_type, ioc).recommended_action
+
+        # BUG-FIX (FC-A): these domains are context-first, but an explicit
+        # positive provider verdict (e.g. a provider flagging an ASN, filename,
+        # MAC, or other artifact as malicious/suspicious) must not be silently
+        # discarded. Read the already-normalized threat/supporting observations
+        # and escalate using the same corroboration ladder as ioc_reputation.
+        # With no positive signal the verdict stays context_only exactly as
+        # before. Only real provider verdicts escalate -- nothing is fabricated,
+        # and clean/not-found results never create a benign verdict here.
+        positive = [o for o in observations if o.role in {"threat", "supporting"} and o.contribution == "positive"]
+        provenance_positive: dict[str, EvidenceObservation] = {}
+        for observation in positive:
+            key = observation.source_independence_group or observation.provenance_family or observation.provenance or observation.source
+            prior = provenance_positive.get(key)
+            if prior is None or observation.normalized_signal * observation.weight > prior.normalized_signal * prior.weight:
+                provenance_positive[key] = observation
+        corroboration = len(provenance_positive)
+        positive_strength = sum(o.normalized_signal * o.weight for o in positive)
+        max_signal = max((o.normalized_signal for o in positive), default=0.0)
+        strong_positive = [o for o in positive if o.normalized_signal >= 0.72]
+        strongest = sorted(positive, key=lambda o: o.normalized_signal * o.weight, reverse=True)[:3]
+
+        review_reasons: list[str] = []
+        analyst_review = False
+        if corroboration >= 2 and len(strong_positive) >= 1 and positive_strength >= 1.10:
+            classification = final_verdict = "malicious"
+            confidence = "high" if (len(strong_positive) >= 2 or positive_strength >= 1.60) else "medium"
+            reason = f"Multiple independent providers report this {ioc_type} as malicious. {base_action}"
+            review_reasons.append("High-risk verdict on a context-first domain; confirm the provider evidence.")
+        elif corroboration == 1 and len(strong_positive) == 1 and max_signal >= 0.90:
+            classification = final_verdict = "malicious"
+            confidence = "medium"
+            reason = f"One exceptionally strong provider record reports this {ioc_type} as malicious; independent corroboration is limited. {base_action}"
+            analyst_review = True
+            review_reasons.append("Malicious verdict relies on a single provider record.")
+        elif positive:
+            classification = final_verdict = "suspicious"
+            confidence = "medium" if positive_strength >= 0.45 else "low"
+            reason = f"A provider supplied positive threat evidence for this {ioc_type}; this is not conclusive for malicious. {base_action}"
+            analyst_review = True
+            review_reasons.append("Positive provider evidence on a context-first domain requires analyst confirmation.")
+        else:
+            classification = final_verdict = "context_only"
+            confidence = "medium" if evaluated else "low"
+            reason = base_action
+            if not applicable:
+                reason = f"Context-only indicator ({ioc_type}); no configured provider supports this assessment domain. {reason}"
+
+        score = (0.55 * max_signal + 0.45 * min(positive_strength / 1.20, 1.0)) if positive else 0.0
+        normalized_score = round(min(1.0, score) * 100, 1)
+        evidence_strength = min(1.0, max_signal * 0.65 + min(positive_strength / 1.2, 1.0) * 0.35) if positive else 0.0
         return IOCAssessment(
             ioc=ioc, normalized_ioc=ioc, ioc_type=ioc_type, assessment_domain=domain,
-            classification="context_only", final_verdict="context_only", risk_score=0.0, normalized_score=0.0,
+            classification=classification, final_verdict=final_verdict,
+            risk_score=round(normalized_score / 100.0, 4), normalized_score=normalized_score,
             confidence_score=round(len(evaluated) / len(applicable), 4) if applicable else 0.0,
-            confidence="medium" if evaluated else "low", evidence_strength=0.0, coverage=round(len(evaluated) / len(applicable), 4) if applicable else 0.0,
+            confidence=confidence, evidence_strength=round(evidence_strength, 4), coverage=round(len(evaluated) / len(applicable), 4) if applicable else 0.0,
             assessment_status="complete" if applicable and len(evaluated) == len(applicable) else "partial" if applicable else "not_applicable",
-            freshness="fresh" if evaluated else "unavailable", evidence_counts={"contextual": len(context), "providers": len(applicable)},
-            evidence_summary={"assessment_domain": domain, "context_only": True, "expected_providers": len(applicable), "evaluated_providers": len(evaluated)},
+            freshness="fresh" if evaluated else "unavailable", evidence_counts={"contextual": len(context), "providers": len(applicable), "direct_positive": len(positive)},
+            evidence_summary={"assessment_domain": domain, "context_only": final_verdict == "context_only", "expected_providers": len(applicable), "evaluated_providers": len(evaluated), "independent_corroborating_groups": corroboration, "positive_strength": round(positive_strength, 4)},
             provider_breakdown=observations, provider_health=_provider_health(list(chosen.values())), context=context,
+            malicious_sources=[o.source for o in positive if o.verdict == "malicious"],
+            suspicious_sources=[o.source for o in positive if o.verdict == "suspicious"],
+            strongest_evidence=strongest,
+            needs_review=bool(positive), review_reasons=review_reasons, analyst_review_recommended=analyst_review,
             reason=reason, analyzed_at=datetime.now(timezone.utc),
         )
 

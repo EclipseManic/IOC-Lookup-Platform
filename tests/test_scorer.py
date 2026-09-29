@@ -342,3 +342,78 @@ def test_malicious_without_raw_score_is_not_found_unknown():
     r = _result("VirusTotal", "malicious", None, "high")
     c = compute_composite([r])
     assert c.verdict == "unknown"
+
+
+# --------------------------------------------------------------------------
+# Provider-aware aggregation regressions (aggregate_evidence)
+# --------------------------------------------------------------------------
+
+from app.backend.scorer import aggregate_evidence
+
+
+def _obs(source, verdict, ioc, ioc_type, confidence="high", **kwargs):
+    return NormalizedResult(
+        ioc=ioc, ioc_type=ioc_type, source=source,
+        verdict=verdict, confidence=confidence, **kwargs,
+    )
+
+
+def test_context_domain_escalates_on_explicit_malicious_provider_verdict():
+    # BUG-FIX (FC-A): a provider flagging an artifact/ASN as malicious must not
+    # be silently dropped in the infrastructure/identity/artifact_metadata
+    # domains. A single strong positive escalates beyond context_only.
+    assessment = aggregate_evidence("AS64500", "asn", [
+        _obs("VirusTotal", "malicious", "AS64500", "asn", raw_score=0.99,
+             raw_data={"malicious": 40, "suspicious": 0, "harmless": 5, "undetected": 55}),
+    ])
+    assert assessment.assessment_domain == "infrastructure"
+    assert assessment.final_verdict in {"malicious", "suspicious"}
+    assert assessment.final_verdict != "context_only"
+    assert assessment.normalized_score > 0.0
+    assert "VirusTotal" in (assessment.malicious_sources + assessment.suspicious_sources)
+
+
+def test_artifact_metadata_escalates_to_suspicious_on_single_positive():
+    assessment = aggregate_evidence(r"C:\Users\Public\payload.exe", "windows_path", [
+        _obs("ThreatFox", "suspicious", r"C:\Users\Public\payload.exe", "windows_path"),
+    ])
+    assert assessment.assessment_domain == "artifact_metadata"
+    assert assessment.final_verdict == "suspicious"
+    assert assessment.needs_review is True
+
+
+def test_context_domain_stays_context_only_without_positive_signal():
+    # No positive provider evidence -> the verdict must remain context_only,
+    # exactly as before the fix (no fabricated escalation, no benign).
+    assessment = aggregate_evidence("AS64500", "asn", [
+        _obs("Shodan", "unknown", "AS64500", "asn", tags=["org:Example"]),
+        _obs("IPinfo", "clean", "AS64500", "asn"),
+    ])
+    assert assessment.final_verdict == "context_only"
+    assert assessment.normalized_score == 0.0
+
+
+def test_btc_with_only_balance_context_is_not_benign():
+    # BUG-FIX (crypto context): blockchain.info/Etherscan are context-only
+    # sources. A funded wallet reported by them alone must not score benign or
+    # malicious -- it stays unknown/context_only (no clean ladder off context).
+    wallet = "1A1zP1eP5QGefi2DMPTfTL5SLmv7DivfNa"
+    assessment = aggregate_evidence(wallet, "btc", [
+        _obs("Blockchain.info", "unknown", wallet, "btc", confidence="low",
+             tags=["final_balance_btc:12.5", "n_tx:340"]),
+    ])
+    assert assessment.final_verdict not in {"benign", "malicious"}
+    assert assessment.final_verdict in {"unknown", "context_only"}
+    assert assessment.normalized_score == 0.0
+
+
+def test_btc_context_plus_chainabuse_report_is_not_benign():
+    # ChainAbuse reports ARE abuse evidence; context balance must never dilute
+    # them into benign. With a real abuse report the wallet is not benign.
+    wallet = "1A1zP1eP5QGefi2DMPTfTL5SLmv7DivfNa"
+    assessment = aggregate_evidence(wallet, "btc", [
+        _obs("Blockchain.info", "unknown", wallet, "btc", confidence="low",
+             tags=["final_balance_btc:12.5"]),
+        _obs("ChainAbuse", "malicious", wallet, "btc", raw_score=1.0, reports_count=8),
+    ])
+    assert assessment.final_verdict != "benign"

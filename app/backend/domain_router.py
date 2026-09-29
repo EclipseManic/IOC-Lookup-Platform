@@ -65,6 +65,15 @@ def route_assessment_domain(ioc_type: str, normalized_ioc: str = "") -> DomainRo
             "infrastructure", "infrastructure_context", "Network indicators need reputation plus ownership and infrastructure context.",
             "Enrich ownership, routing, hosting, DNS, and applicable threat feeds.",
         )
+    if ioc_type in {"btc", "eth"}:
+        chain = "Bitcoin" if ioc_type == "btc" else "Ethereum"
+        return DomainRoute(
+            "ioc_reputation", "cryptocurrency_wallet",
+            f"{chain} wallet addresses are evaluated against public abuse reports and on-chain activity; "
+            "the address itself carries no reputation until a source attributes abuse to it.",
+            "Check the address against community abuse reports (ChainAbuse) and review on-chain balance and "
+            "transaction history for links to known scams, ransomware, or sanctioned entities.",
+        )
     if ioc_type in {
         "filename", "windows_path", "linux_path", "mutex", "named_pipe",
         "registry_key", "service_name", "user_agent",
