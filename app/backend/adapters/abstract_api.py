@@ -242,8 +242,31 @@ class AbstractAPIAdapter(SourceAdapter):
             confidence=confidence,
             tags=tags,
             raw_data=data,
+            provider_summary=self._summary(data, verdict),
             source_link="https://app.abstractapi.com/api/email-reputation",
         )
+
+    def _summary(self, data, verdict: str) -> str:
+        parts = []
+        deliverability = _nested(data, "email_deliverability", "status")
+        if isinstance(deliverability, str) and deliverability:
+            parts.append(f"deliverability {deliverability}")
+        for label, path in (
+            ("disposable provider", ("email_quality", "is_disposable")),
+            ("role account", ("email_quality", "is_role")),
+            ("catch-all", ("email_quality", "is_catchall")),
+            ("no MX record", ("email_deliverability", "is_mx_valid")),
+        ):
+            if _nested(data, *path) is False:
+                parts.append(label)
+        domain_risk = _nested(data, "email_risk", "domain_risk_status")
+        if isinstance(domain_risk, str) and domain_risk:
+            parts.append(f"domain risk {domain_risk}")
+        breaches = _nested(data, "email_breaches", "total_breaches")
+        if isinstance(breaches, int) and breaches:
+            parts.append(f"{breaches} breach(es)")
+        parts.append(f"provider verdict {verdict}")
+        return "; ".join(parts)
 
 
 class AbstractAPIIPAdapter(SourceAdapter):
@@ -331,8 +354,33 @@ class AbstractAPIIPAdapter(SourceAdapter):
             confidence=confidence,
             tags=tags,
             raw_data=data,
+            provider_summary=self._summary(data, verdict),
             source_link="https://app.abstractapi.com/api/ip-intelligence",
         )
+
+    def _summary(self, data, verdict: str) -> str:
+        security = data.get("security") or {}
+        parts = []
+        for label, flag in (
+            ("TOR exit", security.get("is_tor")),
+            ("VPN", security.get("is_vpn")),
+            ("proxy", security.get("is_proxy")),
+            ("abuse reported", security.get("is_abuse")),
+            ("datacenter", security.get("is_hosting")),
+        ):
+            if flag is True:
+                parts.append(label)
+        asn = _nested(data, "asn", "asn")
+        name = _nested(data, "asn", "name")
+        if name or asn:
+            parts.append(f"{name} (AS{asn})" if name and asn else (str(name) if name else f"AS{asn}"))
+        country = _nested(data, "location", "country_code")
+        if country:
+            parts.append(str(country))
+        if not parts:
+            parts.append("no risk flags returned")
+        parts.append(f"provider verdict {verdict}")
+        return "; ".join(parts)
 
 
 class AbstractAPIPhoneAdapter(SourceAdapter):
@@ -426,5 +474,31 @@ class AbstractAPIPhoneAdapter(SourceAdapter):
             confidence=confidence,
             tags=tags,
             raw_data=data,
+            provider_summary=self._summary(data, verdict),
             source_link="https://app.abstractapi.com/api/phone-intelligence",
         )
+
+    def _summary(self, data, verdict: str) -> str:
+        parts = []
+        risk = _nested(data, "phone_risk", "risk_level")
+        if isinstance(risk, str) and risk:
+            parts.append(f"risk level {risk}")
+        for label, path in (
+            ("abuse detected", ("phone_risk", "is_abuse_detected")),
+            ("disposable number", ("phone_risk", "is_disposable")),
+        ):
+            if _nested(data, *path) is True:
+                parts.append(label)
+        carrier = _nested(data, "phone_carrier", "name")
+        if carrier:
+            parts.append(f"carrier {carrier}")
+        line_type = _nested(data, "phone_carrier", "line_type")
+        if line_type:
+            parts.append(str(line_type))
+        breaches = _nested(data, "phone_breaches", "total_breaches")
+        if isinstance(breaches, int) and breaches:
+            parts.append(f"{breaches} breach(es)")
+        if not parts:
+            parts.append("no risk data returned")
+        parts.append(f"provider verdict {verdict}")
+        return "; ".join(parts)

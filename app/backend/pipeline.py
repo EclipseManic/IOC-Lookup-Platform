@@ -24,6 +24,11 @@ from app.backend.adapters.abstract_api import (
     AbstractAPIIPAdapter,
     AbstractAPIPhoneAdapter,
 )
+from app.backend.adapters.ipquality import (
+    IPQualityEmailAdapter,
+    IPQualityIPAdapter,
+    IPQualityPhoneAdapter,
+)
 from app.backend.adapters.hunter_io import HunterIOAdapter
 from app.backend.adapters.team_cymru import TeamCymruAdapter
 from app.backend.adapters.nvd import NvdAdapter
@@ -98,6 +103,9 @@ def _init_adapters():
         AbstractAPIAdapter(),
         AbstractAPIIPAdapter(),
         AbstractAPIPhoneAdapter(),
+        IPQualityPhoneAdapter(),
+        IPQualityIPAdapter(),
+        IPQualityEmailAdapter(),
         HunterIOAdapter(),
         TeamCymruAdapter(),
         CveOrgAdapter(),

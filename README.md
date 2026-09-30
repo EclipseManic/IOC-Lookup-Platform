@@ -35,16 +35,16 @@ an expected-providers count. The **Sources** tab lists, per lookup, which
 sources were queried, which were not, and why — including keys that are
 configured but were never spent.
 
-**Sixteen of the thirty sources need an API key.** Without keys you get
+**Nineteen of the thirty-three sources need an API key.** Without keys you get
 fourteen key-free sources and partial coverage. The Sources tab names the exact
 environment variable for each source that is applicable and unconfigured, so a
 missing key is visible rather than silent.
 
 **Some indicator types have very little coverage.** `phone` is served by exactly
-one provider (AbstractAPI Phone Intelligence). There is no key-free phone
-reputation service, so without that key a phone lookup returns no intelligence
-and no enrichment. This is a known single point of failure, documented in
-`tests/test_coverage.py`.
+two providers, AbstractAPI Phone Intelligence and IPQualityScore Phone, and
+**both need a key**. There is no key-free phone reputation service, so a fresh
+clone gets nothing for phone numbers at all. The coverage test in
+`tests/test_coverage.py` records this as a known gap rather than passing quietly.
 
 **Free tiers are small.** AbstractAPI allows 100 requests per month, 1 per
 second. Expect quota exhaustion, which the tool surfaces as
@@ -118,10 +118,9 @@ can also force a type with a prefix: `phone:+14152007986`, `msisdn:+44...`,
 
 ## Sources
 
-30 registered sources: 14 work without a key, 16 need one. `GET /api/sources`
+33 registered sources: 14 work without a key, 19 need one. `GET /api/sources`
 returns the live list, including which credential each source expects and
 whether it is configured. Secret values are never returned.
-
 ### No key required
 
 | Source | Covers |
@@ -149,6 +148,7 @@ whether it is configured. Secret values are never returned.
 | Variable | Source | Covers |
 |---|---|---|
 | `VT_API_KEY` | VirusTotal | Most types |
+| `IPQUALITY_API_KEY` | IPQualityScore | Phone, IPv4, IPv6, email |
 | `ABUSEIPDB_API_KEY` | AbuseIPDB | IPv4, IPv6 |
 | `URL_SCAN_API_KEY` | urlscan.io | Active submissions |
 | `MB_AUTH_KEY` | MalwareBazaar | Hashes |
@@ -172,6 +172,15 @@ whether it is configured. Secret values are never returned.
 > product hostnames are not derivable from the product names
 > (`ip-intelligence`, `phoneintelligence`, `emailreputation`), which is why they
 > are spelled out in `app/backend/adapters/abstract_api.py`.
+>
+> **IPQualityScore is the opposite:** one key serves all three of its products
+> (phone, IP and email). Two details matter if you add your own adapter for it.
+> It answers **HTTP 200 to every error, including a rejected API key**, so the
+> `success` field and the `message` text must be inspected rather than the
+> status code. And it reports plan limitations by returning `null` fields with a
+> nested `"... required."` status string, which the adapter records as
+> `ipqs:blocked:<field>` so an unavailable field is never read as "no risk
+> found".
 
 See `.env.example` for the complete list.
 

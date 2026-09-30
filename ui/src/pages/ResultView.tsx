@@ -8,6 +8,7 @@ import type { ResultSourceMeta } from "../hooks/useLookup";
 import type { NavigateEvent } from "../App";
 import ConsensusBar from "../components/ConsensusBar";
 import BitcoinWalletCard from "../components/BitcoinWalletCard";
+import PhoneIntelligenceCard from "../components/PhoneIntelligenceCard";
 import EthereumWalletCard from "../components/EthereumWalletCard";
 import CoverageNotice from "../components/CoverageNotice";
 import EnrichmentPanel from "../components/EnrichmentPanel";
@@ -355,6 +356,11 @@ export default function ResultView({
             {ethereumContext && (
               <PanelBoundary label="Ethereum wallet">
                 <EthereumWalletCard wallet={ethereumContext} onPivot={handleEthPivot} />
+              </PanelBoundary>
+            )}
+            {result.ioc_type === "phone" && visibleResults.length > 0 && (
+              <PanelBoundary label="Phone intelligence">
+                <PhoneIntelligenceCard results={visibleResults} />
               </PanelBoundary>
             )}
 

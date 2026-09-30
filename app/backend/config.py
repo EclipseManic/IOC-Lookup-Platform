@@ -143,6 +143,10 @@ class Settings(BaseSettings):
     hybridanalysis_api_key: str = Field("", alias="HA_API_KEY")
 
     greynoise_api_key: str = Field("", alias="GREYNOISE_API_KEY")
+    # One IPQualityScore key unlocks all three of its products (phone, IP, email).
+    ipquality_api_key: str = Field(
+        "", validation_alias=AliasChoices("IPQUALITY_API_KEY", "IPQUALITYSCORE_API_KEY")
+    )
     abstractapi_api_key: str = Field("", validation_alias=AliasChoices("ABSTRACTAPI_API_KEY", "ABSTRACT_API_KEY"))
     # AbstractAPI issues one key per product, and a key for one product is
     # rejected by the others.  Each field below is scoped to a single endpoint.
@@ -336,6 +340,7 @@ _API_KEY_FIELDS = (
     "shodan_api_key",
     "censys_api_key",
     "ipinfo_api_key",
+    "ipquality_api_key",
     "abstractapi_api_key",
     "abstractapi_email_api_key",
     "abstractapi_ip_api_key",

@@ -315,6 +315,9 @@ CACHE_TTL = {
     "AbstractAPI": 3600,
     "AbstractAPI IP": 3600,
     "AbstractAPI Phone": 3600,
+    "IPQualityScore Phone": 3600,
+    "IPQualityScore IP": 3600,
+    "IPQualityScore Email": 3600,
 
     "Hunter.io": 3600,
     "Team Cymru": 3600,
