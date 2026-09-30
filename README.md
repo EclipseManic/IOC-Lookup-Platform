@@ -1,70 +1,76 @@
 # IOC Platform
 
-A local IOC investigation workstation. It classifies indicators, queries available threat-intelligence sources, enriches results, calculates a composite verdict, stores lookup history in SQLite, supports investigations and batch analysis, and exports results in common security formats.
+A self-hosted indicator-of-compromise lookup tool. Give it an IP, domain, URL,
+email address, phone number, hash, CVE or wallet address and it queries the
+threat-intelligence sources you have configured, scores what comes back, and
+shows you which sources said what.
 
-The project is designed to run directly on one computer with Python, SQLite, and its bundled web interface.
+It is a single-user tool. It runs on your machine, stores its data in a local
+SQLite file, and binds to loopback unless you explicitly change that.
 
-## What it supports
+**Status: alpha.** Version 0.2.0. It works and is tested, but it has not been
+hardened for hostile networks. Read the limitations below before trusting a
+verdict.
 
-- IP addresses, domains, URLs, email addresses, CVEs, and common hashes
-- Refanging of values such as `hxxp://example[.]com`
-- Multiple threat-intelligence adapters with graceful skipping when a key is absent
-- DNS, WHOIS/RDAP, SSL, GeoIP, email-security, CVE, and relationship enrichment
-- Composite scoring with source confidence and false-positive feedback
-- Lookup history and investigation cases
-- CSV/JSON batch analysis
-- CSV, HTML, STIX 2.1, MISP, Splunk, ECS, and LEEF exports
-- A local React user interface served by FastAPI
+---
 
-## Intelligence sources and what “free” means
+## Read this before you trust a verdict
 
-The application never contains provider credentials. Adapter credentials are
-loaded from the repo `.env` file (primary) and process environment variables (fallback) through `app/backend/config.py`.
-The `/api/sources` endpoint and the Source coverage panel show each provider's
-IOC coverage, whether it is public or key-backed, and whether its configured
-credential came from `.env` or the process environment. Secret values are never
-returned.
+These are the things a lookup tool can get wrong, and what this one does about
+them.
 
-The current source set includes 28 provider adapters, plus public enrichment
-services used for context:
+**"Not found" does not mean "clean".** Most threat-intelligence sources only
+know about things someone reported. If a source has never seen an indicator, it
+returns nothing — and nothing is not evidence of safety. This tool keeps
+*not-found*, *provider errored*, *rate limited* and *no key configured* as
+separate states, none of which contribute to the malicious score. A result built
+only from not-found responses is reported as `unknown`, not `clean`, and the
+review reason says so.
 
+**Absence of a risk flag is not a clean bill.** A residential IP with no VPN,
+proxy or abuse flag is reported as `unknown`, not `clean`.
 
-| Source | Free/public behavior | IOC coverage |
-|---|---|---|
-| OpenPhish | Public phishing feed | URL |
-| URLhaus | Public Abuse.ch API | URL, domain, MD5/SHA-1/SHA-256 |
-| Tor Exit | Public Tor exit list/DNSBL | IPv4 |
-| IPinfo | Public lite endpoint; optional token improves detail | IPv4, IPv6 |
-| GreyNoise | Public community endpoint with quota; optional key | IPv4 |
-| Shodan | Public InternetDB; optional key unlocks host API | IPv4 |
-| urlscan.io | Public search; key required only for active submissions | URL, domain |
-| StopForumSpam | Public email abuse reputation | Email |
-| CIRCL HashLookup | Public hash/package corpus enrichment | MD5, SHA-1, SHA-256 |
-| RDAP/DNS/CRT.sh/Cloudflare DNS | Public contextual enrichment | IPs, domains, URLs, email domains |
-| CISA KEV/EPSS/NVD | Public CVE intelligence; optional NVD key for quota | CVE |
-| RIPEstat | Public ASN enrichment | ASN |
-| MITRE ATT&CK | Public technique/tactic enrichment | ATT&CK IDs |
-| blockchain.info | Public Bitcoin address statistics | Bitcoin |
-| XposedOrNot | Public breach exposure lookup | Email |
-| MalwareBazaar | API key required by the current endpoint | MD5/SHA-1/SHA-256 |
-| ThreatFox | API key required by the current endpoint | IPs, domains, URLs, hashes |
-| VirusTotal, AbuseIPDB, OTX, Tria.ge, Hybrid Analysis, Censys | Optional API keys | Type-specific coverage shown in `/api/sources` |
-| AbstractAPI, Hunter.io, Team Cymru | Optional API keys or public enrichment | Type-specific coverage shown in `/api/sources` |
+**Coverage is reported, not hidden.** Every result carries a coverage figure and
+an expected-providers count. The **Sources** tab lists, per lookup, which
+sources were queried, which were not, and why — including keys that are
+configured but were never spent.
 
-Public context is not a clean verdict. If no reputation provider covers an IOC,
-the result is explicitly marked as contextual/enrichment-only. Source errors,
-missing keys, rate limits, and not-found responses are kept separate from the
-malicious/clean score.
+**Sixteen of the thirty sources need an API key.** Without keys you get
+fourteen key-free sources and partial coverage. The Sources tab names the exact
+environment variable for each source that is applicable and unconfigured, so a
+missing key is visible rather than silent.
 
-## Run locally
+**Some indicator types have very little coverage.** `phone` is served by exactly
+one provider (AbstractAPI Phone Intelligence). There is no key-free phone
+reputation service, so without that key a phone lookup returns no intelligence
+and no enrichment. This is a known single point of failure, documented in
+`tests/test_coverage.py`.
 
-Requirements:
+**Free tiers are small.** AbstractAPI allows 100 requests per month, 1 per
+second. Expect quota exhaustion, which the tool surfaces as
+`monthly_quota_exhausted` and stops retrying rather than hammering.
 
-- Python 3.11 or newer
-- Internet access for external intelligence sources
-- Optional API keys for the sources you want to use
+**Wallet data is scraped, not licensed.** Bitcoin statistics come from
+Blockchain.info and Ethereum context from Etherscan's public pages. No fiat
+conversion is shown anywhere, because the platform does not fetch a price and a
+fixed rate would be wrong within hours.
 
-On Windows PowerShell:
+**Enrichment does not apply to every type.** The backend reports
+`completeness: {module: skipped}` for modules that do not apply to an indicator
+type. The Enrichment tab says which modules were skipped, unavailable, or ran
+and found nothing, instead of rendering an empty panel.
+
+**There is no authentication on the default configuration.** The service binds
+to `127.0.0.1` and trusts anything that can reach it. If you need remote access,
+see [Exposing it on a network](#exposing-it-on-a-network) — it requires keys and
+TLS, and you should put a reverse proxy in front of it.
+
+---
+
+## Quick start
+
+Requires Python 3.11 or newer. Node.js is only needed if you want to change the
+frontend.
 
 ```powershell
 python -m venv .venv
@@ -74,141 +80,247 @@ Copy-Item .env.example .env
 python run.py
 ```
 
-The application runs the Alembic migration to `head` during startup. To inspect or
-perform migrations explicitly, use `python -m alembic upgrade head`; use a
-separate `DATABASE_URL` when testing migrations. Startup refuses to adopt an
-unversioned SQLite file whose existing tables are missing required columns, and
-`alembic downgrade` refuses to run once batch records exist, because that step
-would drop batch history and `lookup_results.batch_id` associations. Back up the
-database file before any downgrade attempt.
+The browser opens at <http://127.0.0.1:8000/>. Press `Ctrl+C` to stop.
+
+That works with no API keys at all — you will simply get less coverage.
+
+On macOS or Linux the activation line is `source .venv/bin/activate`.
+
+### Migrations
+
+Migrations run automatically at startup. To run them by hand, or against a
+separate database:
 
 ```powershell
-$env:DATABASE_URL="sqlite+aiosqlite:///./data/ioc_platform.db"
 python -m alembic upgrade head
 ```
 
-The browser opens at `http://127.0.0.1:8000/`. Press `Ctrl+C` in the terminal to stop the tool.
+Startup refuses to adopt an unversioned SQLite file whose existing tables are
+missing required columns. `alembic downgrade` refuses to run once batch records
+exist, because that step drops batch history. Back up `data/ioc_platform.db`
+before any downgrade.
 
-The included UI build is ready to use. Node.js is needed only when changing frontend source code:
+---
 
-```powershell
-cd ui
-npm install
-npm run build
+## What it supports
+
+**31 indicator types:** `ipv4` `ipv6` `domain` `url` `email` `phone` `asn`
+`btc` `eth` `cve` `mitre_attack` `md5` `sha1` `sha256` `sha512` `ssdeep` `tlsh`
+`mac` `ja3` `ja4` `user_agent` `username` `password` `password_sha1` `filename`
+`windows_path` `linux_path` `mutex` `named_pipe` `registry_key` `service_name`
+
+Refanged values are unwrapped automatically, so `hxxp://example[.]com` and
+`1A1zP1eP5QGefi2DMPTfTL5SLmv7DivfNa`-style pastes are detected correctly. You
+can also force a type with a prefix: `phone:+14152007986`, `msisdn:+44...`,
+`tel:+1...`.
+
+---
+
+## Sources
+
+30 registered sources: 14 work without a key, 16 need one. `GET /api/sources`
+returns the live list, including which credential each source expects and
+whether it is configured. Secret values are never returned.
+
+### No key required
+
+| Source | Covers |
+|---|---|
+| OpenPhish | URL |
+| URLhaus | URL, domain, MD5, SHA-1, SHA-256 |
+| Tor Exit | IPv4 |
+| IPinfo (lite) | IPv4, IPv6 |
+| GreyNoise (community) | IPv4 |
+| Shodan InternetDB | IPv4 |
+| urlscan.io search | URL, domain |
+| StopForumSpam | Email |
+| CIRCL HashLookup | MD5, SHA-1, SHA-256 |
+| XposedOrNot | Email |
+| RDAP, DNS, CRT.sh, Cloudflare DNS | IPs, domains, URLs, email domains |
+| CISA KEV, EPSS, NVD | CVE |
+| RIPEstat | ASN |
+| MITRE ATT&CK | ATT&CK IDs |
+| blockchain.info | Bitcoin |
+| Etherscan (public pages) | Ethereum |
+| Team Cymru | IP, ASN |
+
+### Requires an API key
+
+| Variable | Source | Covers |
+|---|---|---|
+| `VT_API_KEY` | VirusTotal | Most types |
+| `ABUSEIPDB_API_KEY` | AbuseIPDB | IPv4, IPv6 |
+| `URL_SCAN_API_KEY` | urlscan.io | Active submissions |
+| `MB_AUTH_KEY` | MalwareBazaar | Hashes |
+| `THREATFOX_API_KEY` | ThreatFox | IPs, domains, URLs, hashes |
+| `URLHAUS_API_KEY` | URLhaus | Higher quota |
+| `TRIAGE_API_KEY` | Tria.ge | Host artifacts |
+| `HA_API_KEY` | Hybrid Analysis | Host artifacts |
+| `GREYNOISE_API_KEY` | GreyNoise | Higher quota |
+| `OTX_API_KEY` | AlienVault OTX | Pulses, malware URLs |
+| `SHODAN_API_KEY` | Shodan | Full host API |
+| `CENSYS_API_KEY` | Censys (`ID:secret`) | Host certificates |
+| `IPINFO_API_KEY` | IPinfo | Better geo |
+| `NVD_API_KEY` | NVD | Higher CVE quota |
+| `ABSTRACTAPI_EMAIL_KEY` | AbstractAPI Email Reputation | Email |
+| `ABSTRACTAPI_IP_KEY` | AbstractAPI IP Intelligence | IPv4, IPv6 |
+| `ABSTRACTAPI_No_KEY` | AbstractAPI Phone Intelligence | Phone |
+
+> **AbstractAPI issues one key per product.** A key issued for one product is
+> rejected by the others with `401 Invalid API key provided`. The three keys
+> above are not interchangeable, and each unlocks exactly one adapter. The
+> product hostnames are not derivable from the product names
+> (`ip-intelligence`, `phoneintelligence`, `emailreputation`), which is why they
+> are spelled out in `app/backend/adapters/abstract_api.py`.
+
+See `.env.example` for the complete list.
+
+---
+
+## Configuring keys
+
+`.env` is the primary configuration source; process and system environment
+variables are a fallback for anything `.env` does not set. `.env` is gitignored.
+Never commit a real key.
+
+A key can be written three ways:
+
+```dotenv
+VT_API_KEY=actual_key_here
+VT_API_KEY=${MY_VT_KEY}      # explicit reference to another variable
+VT_API_KEY=my_vt_key         # bare reference; resolved .env first, then env
 ```
 
-## Configure intelligence sources
+References resolve through `.env` first, then the process environment. Set
+`IOC_ENV_FILE` to load a different file, or to an empty value to disable file
+loading entirely — the test suite does this so it never reads real credentials.
 
-**`.env` is the primary configuration source.** This is a single-user local tool — every setting, including provider credentials, is read from the repo `.env` first; process/system environment variables are only a fallback for values `.env` does not set. `.env` is gitignored. Keep `HOST=127.0.0.1`; if another device must reach the service, set `ALLOW_NETWORK_BIND=true`, use a strong `API_KEYS` value, and set an HTTPS `BASE_URL` behind a trusted TLS reverse proxy.
+**A missing key never stops the app from starting.** The source is reported as
+unconfigured, excluded from the score, and named in the Sources tab.
 
-```powershell
-# Recommended: put keys in .env as a literal, ${REF} or bare env-var name
-# VT_API_KEY=actual_key
-# VT_API_KEY=${MY_VT_KEY}
-# VT_API_KEY=my_vt_key   # resolves my_vt_key (.env first, then system env)
+### Application settings
 
-# Fallback: variables set in the shell are used only when .env does not set them
-$env:VT_API_KEY="your_key"; python run.py
-```
+| Variable | Default | Purpose |
+|---|---|---|
+| `HOST` | `127.0.0.1` | Bind address; keep on loopback |
+| `PORT` | `8000` | Bind port |
+| `RELOAD` | `false` | Auto-reload the backend on code changes |
+| `DATABASE_URL` | SQLite in `data/` | Database location |
+| `REDIS_URL` | unset | Shared cache and rate-limit backend |
+| `FAIL_FAST_MISSING_KEYS` | `false` | Refuse to start if provider keys are missing or placeholders |
+| `ALLOW_NETWORK_BIND` | `false` | Must be `true` to bind anywhere but loopback |
+| `API_KEYS` | unset | Required when network binding; comma-separated |
+| `BASE_URL` | unset | Required HTTPS base URL when network binding |
+| `REQUIRE_NETWORK_TLS` | `true` | Keep TLS enforcement on |
+| `TRUST_PROXY` | `false` | Trust forwarded headers, only behind a controlled proxy |
+| `TRUSTED_PROXY_HOSTS` | unset | Required when `TRUST_PROXY=true` |
+| `TRUSTED_HOSTS` | unset | Optional host allowlist |
+| `WEBHOOKS_ENABLED` | `false` | Outbound result webhooks |
+| `WEBHOOK_SECRET_KEY` | unset | Required when webhooks are on; encrypts stored secrets |
+| `ENABLE_PUBLIC_URL_SUBMISSION` | `false` | Submit URLs to urlscan |
+| `ENABLE_URL_CONTENT_FETCH` | `false` | Fetch remote URL content |
 
-Missing keys do not prevent the application from starting; unavailable adapters are reported as skipped or unknown. Check `/api/sources` or the Sources panel to see `credential_source: environment | .env | public_no_key`.
+---
 
-Common variables include:
+## Exposing it on a network
 
-| Variable | Source |
-|---|---|
-| `VT_API_KEY` | VirusTotal |
-| `ABUSEIPDB_API_KEY` | AbuseIPDB |
-| `URL_SCAN_API_KEY` | urlscan.io |
-| `MB_AUTH_KEY` | MalwareBazaar |
-| `THREATFOX_API_KEY` | ThreatFox |
-| `URLHAUS_API_KEY` | URLhaus |
-| `TRIAGE_API_KEY` | Tria.ge |
-| `HA_API_KEY` | Hybrid Analysis |
-| `GREYNOISE_API_KEY` | GreyNoise |
-| `OTX_API_KEY` | AlienVault OTX |
-| `SHODAN_API_KEY` | Shodan |
-| `CENSYS_API_KEY` | Censys (`ID:secret`) |
-| `IPINFO_API_KEY` | IPinfo |
+Do not skip this section if you bind anywhere but `127.0.0.1`.
 
-Credential priority — every API key is resolved as follows:
-1. `.env` file value under any of the key's accepted names — the literal key, an explicit reference (`VT_API_KEY=${MY_VT_KEY}`), or a bare reference to another variable (`VT_API_KEY=my_vt_key`). References resolve through `.env` first, then the process environment.
-2. Process/system environment variable (e.g. `VT_API_KEY`) — used only when `.env` does not provide the key.
+1. Put a TLS reverse proxy (nginx, Caddy) in front of the service.
+2. Set `ALLOW_NETWORK_BIND=true`, a strong random `API_KEYS`, and an HTTPS
+   `BASE_URL`.
+3. Leave `REQUIRE_NETWORK_TLS=true`.
+4. Set `TRUST_PROXY=true` and `TRUSTED_PROXY_HOSTS` to your proxy's address.
+5. Keep `ALLOW_GLOBAL_FEEDBACK=false` unless global analyst feedback is
+   intentional.
 
-Set `IOC_ENV_FILE` to load a different file, or to an empty value to disable file loading (the test suite does this so it never reads real credentials).
+Interactive API docs at `/docs` switch off automatically once `API_KEYS` is set.
 
-Additional app-level settings:
+---
 
-| Variable | Purpose |
-|---|---|
-| `API_KEYS` | Required when network binding is enabled; use strong random keys |
-| `ALLOW_NETWORK_BIND` | Must be `true` for an explicit non-loopback bind; keep `false` locally |
-| `BASE_URL` | Required HTTPS URL when network binding is enabled |
-| `REQUIRE_NETWORK_TLS` | Defaults to `true`; keep TLS enforcement enabled for remote use |
-| `TRUST_PROXY` | Trust forwarded headers only behind a controlled proxy |
-| `TRUSTED_PROXY_HOSTS` | Required when `TRUST_PROXY=true`; comma-separated proxy peer addresses |
-| `TRUSTED_HOSTS` | Optional comma-separated host allowlist for local or reverse-proxy access |
-| `ALLOW_GLOBAL_FEEDBACK` | Keep `false` in network mode unless global analyst feedback is intentional |
-| `FAIL_FAST_MISSING_KEYS` | Set to `true` to reject startup when required provider keys are missing or placeholders |
-| `REDIS_URL` | Optional shared cache/rate-limit backend; unset uses local files/in-process limits |
-| `WEBHOOK_SECRET_KEY` | Required when `WEBHOOKS_ENABLED=true`; encrypts stored delivery secrets |
-| `ENABLE_PUBLIC_URL_SUBMISSION` | Explicit opt-in for active urlscan submissions |
-| `ENABLE_URL_CONTENT_FETCH` | Explicit opt-in for remote URL content enrichment |
+## How a verdict is produced
 
-Summary:
+Each source returns a verdict, a score and a confidence. Sources are grouped by
+kind — identity and reputation sources carry more weight than context-only
+sources such as geolocation — and combined into a weighted score with a stated
+confidence. Disagreement between sources lowers confidence rather than averaging
+away.
 
-- Provider keys are resolved from `.env` before the process environment; see `.env.example` for the complete list.
-- HIBP password lookups use the k-anonymity range API and do not require a key.
-- Host-artifact types (`mutex`, `named_pipe`, `registry_key`, `service_name`, `ssdeep`) now query Hybrid Analysis / Tria.ge search when keys are present, otherwise show structural enrichment as `context only`.
-- The sample `.env.example` ships empty — copy it to `.env` and add your keys there.
+Every result records which sources contributed, which were excluded, and why.
+False positives you mark feed back into scoring.
 
-The local SQLite database is stored at `data/ioc_platform.db`. Cached task and adapter data is stored under `.cache/`.
+Exports are available as CSV, an HTML report, STIX 2.1, MISP, and SIEM formats
+(Splunk, ECS, LEEF).
 
-## Main local workflows
+---
 
-1. Enter an IOC on the Lookup page.
-2. Watch source and enrichment stages complete.
-3. Review the score, verdict, source evidence, enrichment, and relationships.
-4. Mark false positives when needed.
-5. Save related IOCs in an investigation or process multiple values on the Batch page.
-6. Export the result from the Export tab.
+## API
 
-## Tests
+| Method | Path | Purpose |
+|---|---|---|
+| `POST` | `/api/lookup` | Start a lookup |
+| `GET` | `/api/tasks/{task_id}` | Progress |
+| `GET` | `/api/tasks/{task_id}/result` | Completed result |
+| `POST` | `/api/tasks/{task_id}/cancel` | Cancel a lookup |
+| `GET` | `/api/sources` | Source inventory and credential state |
+| `GET` | `/api/health` | Application health |
+| `GET` | `/api/health/keys` | Credential health per source |
+| `GET` | `/api/recent` | Lookup history |
+| `GET` | `/api/investigations` | Investigation cases |
+| `POST` | `/api/batch` | Batch analysis |
+| `GET` | `/api/batches` | Batch list |
+| `POST` | `/api/export/csv` | CSV export |
+| `POST` | `/api/export/stix` | STIX 2.1 export |
+| `POST` | `/api/export/misp` | MISP export |
+| `POST` | `/api/export/siem` | Splunk, ECS, LEEF export |
+| `POST` | `/api/export/report` | HTML report |
+| `POST` | `/api/feedback` | Mark a false positive |
+
+---
+
+## Development
 
 Backend:
 
 ```powershell
-python -m pip install -r requirements-dev.txt
-python -m pytest -q
+pip install -r requirements-dev.txt
+python -m pytest -q          # 901 tests
 pip-audit -r requirements.txt
 ```
+
+This is the same set of checks CI runs on every push, so a green local run means
+a green build. The `frontend` job additionally runs `npm run lint`, which has no
+Python equivalent configured.
 
 Frontend:
 
 ```powershell
 cd ui
-npm test
+npm install
+npm test                     # 154 tests
 npm run lint
 npm run build
 ```
 
-## Useful local endpoints
+The frontend build output (`ui/dist/`) is not tracked; `npm run build`
+regenerates it. The server serves whatever is currently in that directory.
 
-| Method | Path | Purpose |
-|---|---|---|
-| `POST` | `/api/lookup` | Start analysis |
-| `GET` | `/api/tasks/{task_id}` | Read task progress |
-| `GET` | `/api/tasks/{task_id}/result` | Read completed results |
-| `POST` | `/api/tasks/{task_id}/cancel` | Cancel a running analysis |
-| `GET` | `/api/recent` | Lookup history |
-| `GET/POST` | `/api/investigations` | Investigation cases |
-| `POST` | `/api/batch` | Batch analysis |
-| `POST` | `/api/batch/{batch_id}/cancel` | Cancel a running batch |
-| `POST` | `/api/export/stix` | STIX export |
-| `POST` | `/api/export/misp` | MISP export |
-| `POST` | `/api/export/siem` | SIEM export |
-| `GET` | `/api/health` | Local application health |
+---
 
-Interactive API documentation is available at `http://127.0.0.1:8000/docs` for
-the default loopback configuration. It is disabled automatically when
-`API_KEYS` is configured.
+## Project layout
+
+```
+app/backend/       FastAPI service
+  adapters/        one module per intelligence source
+  classifier.py    indicator type detection and normalisation
+  scorer.py        weighted verdict combination
+  evidence.py      source provenance and evidence strength
+  enrichment.py    DNS, WHOIS, TLS, geo, CVE and related context
+alembic/           database migrations
+ui/src/            React frontend
+tests/             Backend tests
+```
+
+## License
+
+MIT. See [LICENSE](LICENSE).
