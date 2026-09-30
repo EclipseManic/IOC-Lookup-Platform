@@ -1,4 +1,4 @@
-import { useState } from "react";
+﻿import { useState } from "react";
 
 export default function Tag({ label, variant = "default" }: { label: string; variant?: "default" | "accent" | "cached" }) {
   const cls =
@@ -9,7 +9,7 @@ export default function Tag({ label, variant = "default" }: { label: string; var
   if (!trimmed) return null;
   return (
     <span
-      className={`inline-flex max-w-full items-center truncate px-2 py-0.5 text-[11px] rounded-full border font-mono ${cls}`}
+      className={`inline-flex max-w-full items-center truncate px-2 py-0.5 text-xs rounded-full border font-mono ${cls}`}
       title={trimmed.length > 40 ? trimmed : undefined}
     >
       {trimmed.length > 40 ? `${trimmed.slice(0, 39)}…` : trimmed}
@@ -30,7 +30,7 @@ export function TagList({ labels, max = 6 }: { labels: string[]; max?: number })
         <button
           type="button"
           onClick={() => setExpanded((value) => !value)}
-          className="rounded-full border border-border/80 bg-bg-secondary px-2 py-0.5 text-[11px] font-semibold text-accent hover:border-accent transition-colors"
+          className="rounded-full border border-border/80 bg-bg-secondary px-2 py-0.5 text-xs font-semibold text-accent hover:border-accent transition-colors"
         >
           {expanded ? "Show less" : `+${hidden} more`}
         </button>

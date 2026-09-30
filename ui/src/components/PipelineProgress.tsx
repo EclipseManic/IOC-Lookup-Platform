@@ -1,4 +1,4 @@
-import type { StageInfo } from "../services/api";
+﻿import type { StageInfo } from "../services/api";
 
 const STATUS_COLORS: Record<string, string> = {
   pending: "bg-border",
@@ -42,7 +42,7 @@ export default function PipelineProgress({
         {stages.map((s) => (
           <div
             key={s.name}
-            className="flex items-center gap-1 text-[11px]"
+            className="flex items-center gap-1 text-xs"
             title={s.message || s.name}
           >
             <span className={`w-1.5 h-1.5 rounded-full ${STATUS_COLORS[s.status] || STATUS_COLORS.pending}`} />

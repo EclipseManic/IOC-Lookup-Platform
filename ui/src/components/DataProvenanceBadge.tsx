@@ -1,4 +1,4 @@
-interface DataProvenanceBadgeProps {
+﻿interface DataProvenanceBadgeProps {
   tier?: number;
   privacyProtected?: boolean;
   isNewlyRegistered?: boolean;
@@ -12,7 +12,7 @@ export default function DataProvenanceBadge({
   sourceName,
 }: DataProvenanceBadgeProps) {
   return (
-    <div className="flex flex-wrap items-center gap-1.5 text-[11px]">
+    <div className="flex flex-wrap items-center gap-1.5 text-xs">
       {tier === 1 && (
         <span className="inline-flex items-center gap-1 rounded-full border border-emerald-500/30 bg-emerald-500/10 px-2.5 py-0.5 font-medium text-emerald-400">
           <span className="h-1.5 w-1.5 rounded-full bg-emerald-400"></span>
@@ -48,7 +48,7 @@ export default function DataProvenanceBadge({
         </span>
       )}
       {sourceName && (
-        <span className="text-[10px] text-text-secondary">
+        <span className="text-xs text-text-secondary">
           via {sourceName}
         </span>
       )}

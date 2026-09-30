@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState } from "react";
+﻿import { useCallback, useEffect, useState } from "react";
 import Modal from "../components/Modal";
 import Tag from "../components/Tag";
 import { showToast } from "../components/Toast";
@@ -32,7 +32,7 @@ function InvestigationCard({ inv, onClick }: { inv: InvestigationSummary; onClic
       {inv.description && (
         <p className="text-xs text-text-secondary line-clamp-2 mb-2">{inv.description}</p>
       )}
-      <p className="text-[10px] text-text-secondary">
+      <p className="text-xs text-text-secondary">
         Updated {timeAgo(inv.updated_at)}
       </p>
     </button>
@@ -207,7 +207,7 @@ export default function Investigations() {
               <button onClick={() => setConfirmDelete(true)} className="text-xs text-verdict-malicious hover:underline">Delete</button>
             </div>
           </div>
-          <p className="text-[10px] text-text-secondary">
+          <p className="text-xs text-text-secondary">
             Created {timeAgo(detail.created_at)} · Updated {timeAgo(detail.updated_at)}
           </p>
         </div>
@@ -280,7 +280,7 @@ export default function Investigations() {
                     className="w-full text-left px-3 pb-3 text-xs text-text-secondary hover:text-text-primary transition-colors"
                   >
                     {entry.notes ? (
-                      <span className="font-mono text-[11px]">{entry.notes}</span>
+                      <span className="font-mono text-xs">{entry.notes}</span>
                     ) : (
                       <span className="italic">Add notes...</span>
                     )}

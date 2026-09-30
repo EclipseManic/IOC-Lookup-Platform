@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+﻿import { useEffect, useState } from "react";
 import { getSourceInventory, type SourceInventory } from "../services/api";
 
 export default function SourceCoveragePanel() {
@@ -33,7 +33,7 @@ export default function SourceCoveragePanel() {
       <div className="grid grid-cols-1 md:grid-cols-2 gap-2 mt-3">
         {inventory.sources.map((source) => (
           <div key={source.name} className="flex items-center justify-between gap-3 bg-bg-elevated rounded p-2">
-            <span><span className="block">{source.name}</span><span className="block text-[10px] text-text-secondary">{source.supported_types.join(", ")}</span></span>
+            <span><span className="block">{source.name}</span><span className="block text-xs text-text-secondary">{source.supported_types.join(", ")}</span></span>
             <span className={source.enabled_by_policy && (source.configured || source.public_without_key) ? "text-green-400" : "text-amber-400"}>
               {!source.enabled_by_policy
                 ? "disabled by policy"

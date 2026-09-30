@@ -1,4 +1,4 @@
-import type {
+﻿import type {
   AsnContext,
   MitreAttackContext,
   HostArtifactContext,
@@ -12,7 +12,7 @@ import type {
 
 /**
  * Dedicated Investigation-view cards for "context" IOC types whose structured
- * enrichment previously only appeared in the Raw Data tab. Each card reads the
+ * enrichment previously only appeared in the Sources tab. Each card reads the
  * typed `enrichment.extra.*` payload the backend produces and renders it inline
  * so an analyst never has to open raw JSON to see it.
  */
@@ -32,7 +32,7 @@ function CardShell({
     <section className={`rounded-xl border ${accent} bg-bg-card p-4 space-y-3`}>
       <div className="flex items-center justify-between border-b border-border/60 pb-2">
         <h4 className="text-xs font-bold uppercase tracking-wider text-text-primary">{title}</h4>
-        <span className="text-[10px] text-text-secondary">{source}</span>
+        <span className="text-xs text-text-secondary">{source}</span>
       </div>
       {children}
     </section>
@@ -42,8 +42,8 @@ function CardShell({
 function Field({ label, value, mono, tone }: { label: string; value: React.ReactNode; mono?: boolean; tone?: string }) {
   return (
     <div className="rounded-lg bg-bg-elevated/50 p-2.5 border border-border/50">
-      <span className="text-[10px] uppercase tracking-wider text-text-secondary block">{label}</span>
-      <span className={`font-semibold mt-0.5 block break-all ${mono ? "font-mono text-[11px]" : ""} ${tone ?? "text-text-primary"}`}>
+      <span className="text-xs uppercase tracking-wider text-text-secondary block">{label}</span>
+      <span className={`font-semibold mt-0.5 block break-all ${mono ? "font-mono text-xs" : ""} ${tone ?? "text-text-primary"}`}>
         {value ?? "—"}
       </span>
     </div>
@@ -53,7 +53,7 @@ function Field({ label, value, mono, tone }: { label: string; value: React.React
 function Flag({ on, label }: { on: boolean; label: string }) {
   return (
     <span
-      className={`rounded px-1.5 py-0.5 text-[10px] font-bold uppercase tracking-wider border ${
+      className={`rounded px-1.5 py-0.5 text-xs font-bold uppercase tracking-wider border ${
         on
           ? "bg-amber-500/15 text-amber-400 border-amber-500/30"
           : "bg-emerald-500/10 text-emerald-400/80 border-emerald-500/20"
@@ -75,10 +75,10 @@ export function AsnCard({ asn }: { asn: AsnContext }) {
       </div>
       {prefixes.length > 0 && (
         <div className="space-y-1 pt-1">
-          <span className="text-[10px] uppercase tracking-wider text-text-secondary block">
+          <span className="text-xs uppercase tracking-wider text-text-secondary block">
             Announced Prefixes ({prefixes.length})
           </span>
-          <div className="max-h-40 overflow-y-auto flex flex-wrap gap-1 font-mono text-[11px]">
+          <div className="max-h-40 overflow-y-auto flex flex-wrap gap-1 font-mono text-xs">
             {prefixes.slice(0, 60).map((p, i) => (
               <span key={i} className="rounded bg-bg-elevated px-1.5 py-0.5 border border-border/60 text-slate-300">
                 {String((p as { prefix?: string })?.prefix ?? "—")}
@@ -96,25 +96,25 @@ export function MitreCard({ mitre }: { mitre: MitreAttackContext }) {
     <CardShell title="MITRE ATT&CK Context" source="attack.mitre.org">
       <div className="space-y-2 text-xs">
         <div className="flex items-center gap-2">
-          <span className="rounded bg-accent/15 px-2 py-0.5 text-[11px] font-bold font-mono text-accent border border-accent/30">
+          <span className="rounded bg-accent/15 px-2 py-0.5 text-xs font-bold font-mono text-accent border border-accent/30">
             {mitre.id}
           </span>
           {mitre.kind && (
-            <span className="rounded bg-bg-elevated px-1.5 py-0.5 text-[10px] uppercase tracking-wider text-text-secondary border border-border/60">
+            <span className="rounded bg-bg-elevated px-1.5 py-0.5 text-xs uppercase tracking-wider text-text-secondary border border-border/60">
               {mitre.kind}
             </span>
           )}
         </div>
         {mitre.title && <div className="font-semibold text-text-primary">{mitre.title}</div>}
         {mitre.description && (
-          <p className="text-[11px] leading-relaxed text-text-secondary">{mitre.description}</p>
+          <p className="text-xs leading-relaxed text-text-secondary">{mitre.description}</p>
         )}
         {mitre.url && (
           <a
             href={mitre.url}
             target="_blank"
             rel="noopener noreferrer"
-            className="inline-flex items-center gap-1 text-[11px] font-semibold text-accent hover:underline"
+            className="inline-flex items-center gap-1 text-xs font-semibold text-accent hover:underline"
           >
             View on MITRE ATT&CK
             <svg className="w-3 h-3" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
@@ -143,15 +143,15 @@ export function HostArtifactCard({ artifact }: { artifact: HostArtifactContext }
   return (
     <CardShell title="Host Artifact Structure" source="Structural Analysis">
       <div className="rounded-lg bg-bg-elevated/50 p-2.5 border border-border/50">
-        <span className="text-[10px] uppercase tracking-wider text-text-secondary block">Value</span>
-        <span className="font-mono text-[11px] text-text-primary mt-0.5 block break-all">{artifact.value}</span>
+        <span className="text-xs uppercase tracking-wider text-text-secondary block">Value</span>
+        <span className="font-mono text-xs text-text-primary mt-0.5 block break-all">{artifact.value}</span>
       </div>
       <div className="grid grid-cols-2 gap-2 text-xs">
         {fields.map(([label, value], i) => (
           <Field key={i} label={label} value={value} mono={label !== "Type"} />
         ))}
       </div>
-      <p className="text-[10px] text-text-secondary">
+      <p className="text-xs text-text-secondary">
         Threat corpus unavailable locally — structure shown for correlation and pivoting.
       </p>
     </CardShell>
@@ -174,7 +174,7 @@ export function FilenameCard({ filename }: { filename: FilenameContext }) {
         <Flag on={Boolean(filename.double_extension)} label="Double extension" />
       </div>
       {filename.double_extension && (
-        <p className="text-[11px] leading-relaxed text-amber-300/90 rounded bg-amber-500/10 border border-amber-500/25 p-2">
+        <p className="text-xs leading-relaxed text-amber-300/90 rounded bg-amber-500/10 border border-amber-500/25 p-2">
           Double-extension masquerade detected — the visible extension differs from the real file type,
           a common social-engineering lure. Correlate the file hash with malware feeds.
         </p>
@@ -191,8 +191,8 @@ export function FilePathCard({ path }: { path: FilePathContext }) {
       accent={path.suspicious_location ? "border-amber-500/40" : "border-border"}
     >
       <div className="rounded-lg bg-bg-elevated/50 p-2.5 border border-border/50">
-        <span className="text-[10px] uppercase tracking-wider text-text-secondary block">Full Path</span>
-        <span className="font-mono text-[11px] text-text-primary mt-0.5 block break-all">{path.value}</span>
+        <span className="text-xs uppercase tracking-wider text-text-secondary block">Full Path</span>
+        <span className="font-mono text-xs text-text-primary mt-0.5 block break-all">{path.value}</span>
       </div>
       <div className="grid grid-cols-2 gap-2 text-xs">
         <Field label="Directory" value={path.directory} mono />
@@ -202,7 +202,7 @@ export function FilePathCard({ path }: { path: FilePathContext }) {
         <Flag on={Boolean(path.suspicious_location)} label="Staging location" />
       </div>
       {path.suspicious_location && (
-        <p className="text-[11px] leading-relaxed text-amber-300/90 rounded bg-amber-500/10 border border-amber-500/25 p-2">
+        <p className="text-xs leading-relaxed text-amber-300/90 rounded bg-amber-500/10 border border-amber-500/25 p-2">
           Located in a common malware staging directory
           {path.location_marker ? ` (${path.location_marker})` : ""}; execution from here is frequently
           associated with dropped payloads.
@@ -220,8 +220,8 @@ export function UserAgentCard({ ua }: { ua: UserAgentContext }) {
       accent={ua.is_automation ? "border-amber-500/40" : "border-border"}
     >
       <div className="rounded-lg bg-bg-elevated/50 p-2.5 border border-border/50">
-        <span className="text-[10px] uppercase tracking-wider text-text-secondary block">User-Agent</span>
-        <span className="font-mono text-[11px] text-text-primary mt-0.5 block break-all">{ua.value}</span>
+        <span className="text-xs uppercase tracking-wider text-text-secondary block">User-Agent</span>
+        <span className="font-mono text-xs text-text-primary mt-0.5 block break-all">{ua.value}</span>
       </div>
       <div className="grid grid-cols-2 gap-2 text-xs">
         <Field label="Client" value={ua.client} />
@@ -231,7 +231,7 @@ export function UserAgentCard({ ua }: { ua: UserAgentContext }) {
         <Flag on={Boolean(ua.is_automation)} label="Automation client" />
       </div>
       {ua.is_automation && (
-        <p className="text-[11px] leading-relaxed text-amber-300/90 rounded bg-amber-500/10 border border-amber-500/25 p-2">
+        <p className="text-xs leading-relaxed text-amber-300/90 rounded bg-amber-500/10 border border-amber-500/25 p-2">
           Automation/scripting client — rarely a human browser. Common in scanners, scrapers and C2
           beacons; correlate with the source IP's request pattern.
         </p>
@@ -262,7 +262,7 @@ export function MacCard({ mac }: { mac: MacContext }) {
         <Flag on={Boolean(mac.multicast)} label="Multicast" />
       </div>
       {mac.virtualization && (
-        <p className="text-[11px] leading-relaxed text-sky-200/90 rounded bg-sky-500/10 border border-sky-500/25 p-2">
+        <p className="text-xs leading-relaxed text-sky-200/90 rounded bg-sky-500/10 border border-sky-500/25 p-2">
           OUI belongs to {mac.vendor} — this endpoint is likely a virtual machine or sandbox rather than
           physical hardware.
         </p>
@@ -285,13 +285,13 @@ export function HashFileCard({ results }: { results: HashResultEntry[] }) {
             {entry.source && <Field label="Source" value={entry.source} />}
             {entry.trust != null && <Field label="Trust" value={String(entry.trust)} mono />}
           </div>
-          <p className="text-[11px] leading-relaxed text-emerald-300/80 rounded bg-emerald-500/10 border border-emerald-500/25 p-2">
+          <p className="text-xs leading-relaxed text-emerald-300/80 rounded bg-emerald-500/10 border border-emerald-500/25 p-2">
             Present in a known-file reference database. A known file is not automatically benign — weigh
             against the reputation providers above.
           </p>
         </>
       ) : (
-        <p className="text-[11px] leading-relaxed text-text-secondary">
+        <p className="text-xs leading-relaxed text-text-secondary">
           Not present in the CIRCL known-file corpus. The verdict above is derived from reputation and
           malware providers.
         </p>
@@ -309,7 +309,7 @@ export function SsdeepCard({ ssdeep }: { ssdeep: SsdeepContext }) {
         <Field label="Chunk 2 Length" value={ssdeep.second_chunk_length ?? "—"} mono />
         <Field label="Alphabet Size" value={ssdeep.alphabet ? ssdeep.alphabet.length : "—"} mono />
       </div>
-      <p className="text-[10px] text-text-secondary">
+      <p className="text-xs text-text-secondary">
         Fuzzy-match corpus unavailable locally — structure shown for similarity pivoting.
       </p>
     </CardShell>

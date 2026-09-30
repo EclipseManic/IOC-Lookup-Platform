@@ -1,39 +1,26 @@
-import { useMemo, useState } from "react";
-import type { EthereumContext, LookupResponse, NormalizedResult } from "../services/api";
+﻿import { useMemo, useState } from "react";
+import type { EthereumContext, LookupResponse } from "../services/api";
 import { buildHeadline, isCredentialDomain, type HeadlineMetric, type MetricTone } from "../lib/assessmentView";
-import { formatDate, formatDateTime, formatDuration, formatNumber, formatPercent, titleCase } from "../lib/format";
+import { formatDateTime } from "../lib/format";
 import { buildProviderRows, groupProviderRows } from "../lib/providerEvidence";
 import { getVerdictBand } from "../lib/verdictColors";
 import type { ResultSourceMeta } from "../hooks/useLookup";
 import type { NavigateEvent } from "../App";
-import AbuseReportsPanel from "../components/AbuseReportsPanel";
 import ConsensusBar from "../components/ConsensusBar";
-import ContextIntelCard, { hasContextIntel } from "../components/ContextIntelCard";
+import BitcoinWalletCard from "../components/BitcoinWalletCard";
+import EthereumWalletCard from "../components/EthereumWalletCard";
 import CoverageNotice from "../components/CoverageNotice";
 import EnrichmentPanel from "../components/EnrichmentPanel";
-import EthereumWalletCard from "../components/EthereumWalletCard";
-import EvidencePanel from "../components/EvidencePanel";
+import SourcesPanel from "../components/SourcesPanel";
 import ExportMenu, { ExportTab } from "../components/ExportMenu";
 import PanelBoundary from "../components/PanelBoundary";
 import FeedbackWidget from "../components/FeedbackWidget";
-import HostingPivotCard from "../components/HostingPivotCard";
-import HostVulnerabilityMatrix from "../components/HostVulnerabilityMatrix";
-import InfostealerExposureCard from "../components/InfostealerExposureCard";
 import RelationshipGraph from "../components/RelationshipGraph";
 import ScoreRing from "../components/ScoreRing";
 import ProviderEvidenceList from "../components/ProviderEvidenceList";
-import SubdomainsCard from "../components/SubdomainsCard";
 import TabBar, { type TabName } from "../components/TabBar";
 import VerdictBadge from "../components/VerdictBadge";
-import WebPreviewCard from "../components/WebPreviewCard";
-import WhoisCard from "../components/WhoisCard";
 
-
-function hashType(value: string): "md5" | "sha1" | "sha256" {
-  if (value.length === 32) return "md5";
-  if (value.length === 40) return "sha1";
-  return "sha256";
-}
 
 function defangValue(text: string): string {
   return text
@@ -53,72 +40,12 @@ function StatCard({ metric }: { metric: HeadlineMetric }) {
   return (
     <div className="rounded-xl border border-border/80 bg-bg-card/70 p-3.5 flex flex-col justify-between transition-colors hover:border-border">
       <div>
-        <div className="text-[10px] font-bold uppercase tracking-wider text-text-secondary">{metric.label}</div>
+        <div className="text-xs font-bold uppercase tracking-wider text-text-secondary">{metric.label}</div>
         <div className={`mt-1 text-lg font-extrabold tracking-tight ${METRIC_TONES[metric.tone ?? "neutral"]}`}>{metric.value}</div>
       </div>
       {metric.detail && (
-        <div className="mt-2 border-t border-border/40 pt-1.5 text-[11px] text-text-secondary">{metric.detail}</div>
+        <div className="mt-2 border-t border-border/40 pt-1.5 text-xs text-text-secondary">{metric.detail}</div>
       )}
-    </div>
-  );
-}
-
-function RawDataView({ results }: { results: NormalizedResult[] }) {
-  const [filter, setFilter] = useState("");
-  const filtered = filter.trim()
-    ? results.filter((r) => r.source.toLowerCase().includes(filter.toLowerCase()))
-    : results;
-
-  const copyAll = () => {
-    const allJson = Object.fromEntries(results.map((r) => [r.source, r.raw_data ?? {}]));
-    void navigator.clipboard?.writeText(JSON.stringify(allJson, null, 2));
-  };
-
-  return (
-    <div className="space-y-3">
-      <div className="flex flex-wrap items-center justify-between gap-2 rounded-xl border border-border bg-bg-card p-3">
-        <div className="flex items-center gap-2">
-          <input
-            type="text"
-            placeholder="Filter provider payloads..."
-            value={filter}
-            onChange={(e) => setFilter(e.target.value)}
-            className="rounded-lg border border-border bg-bg-elevated px-3 py-1.5 text-xs text-text-primary placeholder:text-text-secondary/60 focus:border-accent focus:outline-none w-56"
-          />
-          <span className="text-xs text-text-secondary">
-            Showing {filtered.length} of {results.length}
-          </span>
-        </div>
-        <button
-          type="button"
-          onClick={copyAll}
-          className="rounded-md border border-border bg-bg-elevated px-3 py-1.5 text-xs font-semibold text-text-secondary hover:text-accent hover:border-accent transition-colors"
-        >
-          Copy All Raw JSON
-        </button>
-      </div>
-
-      <div className="space-y-2">
-        {filtered.map((item) => (
-          <details key={item.source} className="group rounded-xl border border-border bg-bg-card transition-all" open={false}>
-            <summary className="flex cursor-pointer list-none items-center justify-between gap-3 px-4 py-3 text-xs font-semibold select-none hover:bg-bg-elevated/30 rounded-xl">
-              <div className="flex min-w-0 items-center gap-2.5">
-                <span className="text-accent font-bold">{item.source}</span>
-                <span className="text-[11px] font-normal text-text-secondary truncate">
-                  {item.provider_summary || (item.verdict ? `verdict: ${item.verdict}` : "payload")}
-                </span>
-              </div>
-              <div className="flex items-center gap-2 text-[10px] text-text-secondary font-mono">
-                {item.latency_ms != null && <span>{formatDuration(item.latency_ms)}</span>}
-                <span className="rounded bg-bg-elevated px-1.5 py-0.5 border border-border/60">JSON</span>
-              </div>
-            </summary>
-            <pre className="max-h-[460px] overflow-auto whitespace-pre-wrap break-all border-t border-border bg-[#06080e] p-4 font-mono text-[11px] leading-relaxed text-slate-300">
-              {Object.keys(item.raw_data ?? {}).length ? JSON.stringify(item.raw_data, null, 2) : "No raw JSON payload returned."}
-            </pre>
-          </details>
-        ))}
-      </div>
     </div>
   );
 }
@@ -172,58 +99,22 @@ export default function ResultView({
   // Counterparties, funders and creators on the wallet card are always ETH addresses.
   const handleEthPivot = (value: string) => onNewSearch(value, "eth");
 
-  // Determine if domain-aware technical intelligence exists for the right column
+  // Every enrichment card used to be mounted here as well as on the Enrichment
+  // tab, so the same data appeared in both. This tab is now the verdict, the
+  // indicator's own dashboard and provider evidence. The per-type flags that
+  // selected the old enrichment cards are gone with them.
   const enrichment = result.enrichment;
-  const isDomainOrUrl = result.ioc_type === "domain" || result.ioc_type === "url";
-  const isIp = result.ioc_type === "ipv4" || result.ioc_type === "ipv6";
-  // password_sha1 is the type Batch.tsx navigates with for credential rows, so it
-  // must be treated as a credential here or its column collapses.
-  const isCred = result.ioc_type === "email" || result.ioc_type === "username"
-    || result.ioc_type === "password" || result.ioc_type === "password_sha1";
-  const isCve = result.ioc_type === "cve";
-  const ethereumWallet =
+  const bitcoinContext =
+    result.ioc_type === "btc" && enrichment?.extra?.bitcoin && typeof enrichment.extra.bitcoin === "object"
+      ? enrichment.extra.bitcoin
+      : null;
+  // Both chain wallets get the same treatment: a dashboard on Investigation,
+  // full field depth on Enrichment. Keeping one on each tab was an oversight
+  // when the duplicated enrichment cards were moved out.
+  const ethereumContext =
     result.ioc_type === "eth" && enrichment?.extra?.ethereum && typeof enrichment.extra.ethereum === "object"
       ? (enrichment.extra.ethereum as EthereumContext)
       : null;
-  // An ETH wallet renders as a full-width card above the columns, so only a
-  // BTC wallet (or an ETH lookup without wallet data) needs the right column.
-  const isCrypto = result.ioc_type === "btc" || (result.ioc_type === "eth" && !ethereumWallet);
-  // "Context" indicator types: the backend produces structured enrichment.extra.*
-  // data for these (ASN routing, MITRE ATT&CK metadata, host artifacts, file
-  // hashes, filenames/paths, user-agents, MACs, fuzzy hashes). They previously
-  // had no dedicated card, so their data was only reachable in the Raw Data tab.
-  const isContextType = [
-    "asn", "mitre_attack", "mutex", "named_pipe", "registry_key", "service_name",
-    "filename", "windows_path", "linux_path", "user_agent", "mac",
-    "md5", "sha1", "sha256", "ssdeep",
-  ].includes(result.ioc_type);
-
-  const spfValue = enrichment?.email_security?.spf;
-  const spfConfigured = Boolean(spfValue && spfValue !== "missing");
-
-  const hasTechnicalIntel = Boolean(
-    enrichment?.web_preview ||
-    enrichment?.whois ||
-    (enrichment?.hosting_ip_intel && Object.keys(enrichment.hosting_ip_intel).length > 0) ||
-    (enrichment?.subdomains?.subdomains && enrichment.subdomains.subdomains.length > 0) ||
-    enrichment?.host_intel ||
-    (enrichment?.open_ports && enrichment.open_ports.length > 0) ||
-    (enrichment?.abuse_reports && enrichment.abuse_reports.length > 0) ||
-    enrichment?.infostealer ||
-    enrichment?.breach ||
-    enrichment?.email_security ||
-    enrichment?.cve ||
-    enrichment?.geoip ||
-    enrichment?.extra?.bitcoin ||
-    hasContextIntel(enrichment?.extra)
-  );
-
-  // Indicator types that have a dedicated technical-intelligence module in the
-  // right column. For these, we keep the two-column layout and show a small
-  // placeholder when no enrichment came back, instead of silently collapsing to
-  // a single column (which reads as a broken/empty panel).
-  const expectsTechnicalIntel = isDomainOrUrl || isIp || isCred || isCve || isCrypto || isContextType;
-  const showRightColumn = hasTechnicalIntel || expectsTechnicalIntel;
 
   return (
     <div className="space-y-6">
@@ -235,7 +126,7 @@ export default function ResultView({
               <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-accent opacity-75" />
               <span className="relative inline-flex rounded-full h-2.5 w-2.5 bg-accent" />
             </span>
-            <span className="text-[11px] font-bold uppercase tracking-[0.2em] text-accent">
+            <span className="text-xs font-bold uppercase tracking-[0.2em] text-accent">
               Threat Intelligence Console
             </span>
           </div>
@@ -350,7 +241,7 @@ export default function ResultView({
               <button
                 type="button"
                 onClick={handleCopyRaw}
-                className="rounded border border-border/80 bg-bg-elevated px-2 py-1 text-[11px] font-medium text-text-secondary hover:border-accent hover:text-accent transition-colors"
+                className="rounded border border-border/80 bg-bg-elevated px-2 py-1 text-xs font-medium text-text-secondary hover:border-accent hover:text-accent transition-colors"
                 title="Copy raw indicator"
               >
                 {copiedRaw ? "Copied!" : "Copy"}
@@ -358,7 +249,7 @@ export default function ResultView({
               <button
                 type="button"
                 onClick={handleCopyDefanged}
-                className="rounded border border-border/80 bg-bg-elevated px-2 py-1 text-[11px] font-medium text-text-secondary hover:border-accent hover:text-accent transition-colors"
+                className="rounded border border-border/80 bg-bg-elevated px-2 py-1 text-xs font-medium text-text-secondary hover:border-accent hover:text-accent transition-colors"
                 title="Copy defanged (safe for tickets & chats)"
               >
                 {copiedDefanged ? "Defanged Copied!" : "Defang"}
@@ -378,7 +269,7 @@ export default function ResultView({
               <ScoreRing score={headline.score} verdict={verdict} size={86} />
             </div>
             <div className="min-w-0 flex-1">
-              <div className="text-[10px] font-bold uppercase tracking-wider text-text-secondary">
+              <div className="text-xs font-bold uppercase tracking-wider text-text-secondary">
                 {headline.domainLabel} verdict
               </div>
               <div
@@ -394,7 +285,7 @@ export default function ResultView({
                 {headline.score !== null && <span>· {headline.scoreCaption}</span>}
               </div>
               {headline.needsReview && (
-                <div className="mt-1.5 inline-flex rounded border border-amber-500/40 bg-amber-500/10 px-1.5 py-0.5 text-[10px] font-semibold uppercase tracking-wider text-amber-300">
+                <div className="mt-1.5 inline-flex rounded border border-amber-500/40 bg-amber-500/10 px-1.5 py-0.5 text-xs font-semibold uppercase tracking-wider text-amber-300">
                   Analyst review recommended
                 </div>
               )}
@@ -411,7 +302,7 @@ export default function ResultView({
           <div className="border-t border-border/80 bg-bg-secondary/40 px-6 py-3.5 text-xs leading-relaxed text-text-secondary space-y-1.5">
             {headline.reason && (
               <p className="flex items-start gap-3">
-                <span className="shrink-0 rounded bg-accent/15 px-2 py-0.5 text-[10px] font-bold uppercase tracking-wider text-accent border border-accent/30 mt-0.5">
+                <span className="shrink-0 rounded bg-accent/15 px-2 py-0.5 text-xs font-bold uppercase tracking-wider text-accent border border-accent/30 mt-0.5">
                   Why
                 </span>
                 <span className="text-text-primary/90 font-medium" data-testid="headline-reason">{headline.reason}</span>
@@ -424,7 +315,7 @@ export default function ResultView({
             )}
             {result.executive_summary && result.executive_summary.trim() !== headline.reason.trim() && (
               <details className="pl-12">
-                <summary className="cursor-pointer text-[11px] font-semibold text-text-secondary hover:text-text-primary">Analyst brief</summary>
+                <summary className="cursor-pointer text-xs font-semibold text-text-secondary hover:text-text-primary">Analyst brief</summary>
                 <p className="mt-1 text-text-primary/80">{result.executive_summary}</p>
               </details>
             )}
@@ -441,379 +332,37 @@ export default function ResultView({
         onChange={setTab}
         badges={{
           Relationships: result.relationships?.length || 0,
-          "Raw Data": visibleResults.length,
+          Sources: visibleResults.length,
         }}
       />
 
       {/* 4. Tab Content Panels */}
       <div id="result-panel" role="tabpanel" aria-label={`${tab} results`}>
         {tab === "Investigation" && (
-          <div className="space-y-6">
+          <div className="space-y-4">
             {domain === "ioc_reputation" && grouped.findings.length > 1 && (
               <ConsensusBar results={grouped.findings.flatMap((row) => (row.result ? [row.result] : []))} />
             )}
 
-            {ethereumWallet && (
+            {/* The indicator's own dashboard, above the evidence. Chain wallets
+                have on-chain context worth leading with; a single figure for an
+                IP or domain does not. BTC and ETH are treated identically. */}
+            {bitcoinContext && (
+              <PanelBoundary label="Bitcoin wallet">
+                <BitcoinWalletCard context={bitcoinContext} onPivot={onNewSearch} />
+              </PanelBoundary>
+            )}
+            {ethereumContext && (
               <PanelBoundary label="Ethereum wallet">
-                <EthereumWalletCard wallet={ethereumWallet} onPivot={handleEthPivot} />
+                <EthereumWalletCard wallet={ethereumContext} onPivot={handleEthPivot} />
               </PanelBoundary>
             )}
 
-            {/* Unified 2-Column Responsive Workspace */}
-            <div className="grid grid-cols-1 gap-6 lg:grid-cols-12 items-start">
-              {/* LEFT COLUMN: Threat Feeds & Provider Consensus */}
-              <div className={`space-y-4 ${showRightColumn ? "lg:col-span-7" : "lg:col-span-12"}`}>
-                <ProviderEvidenceList grouped={grouped} emptyFindingsText={emptyFindingsText} />
-
-                {/* Correlated Malware Indicators (AlienVault OTX / URLhaus) */}
-                {Boolean((enrichment?.malware_urls?.length ?? 0) > 0 || (enrichment?.associated_hashes?.length ?? 0) > 0) && (
-                  <section className="rounded-xl border border-red-500/30 bg-red-950/10 p-4 space-y-3">
-                    <div className="flex items-center justify-between border-b border-red-500/20 pb-2">
-                      <div className="flex items-center gap-2">
-                        <span className="flex h-5 w-5 items-center justify-center rounded bg-red-500/20 text-red-400">
-                          <svg className="w-3.5 h-3.5" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
-                            <path d="M10.29 3.86L1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0z" />
-                            <line x1="12" y1="9" x2="12" y2="13" />
-                            <line x1="12" y1="17" x2="12.01" y2="17" />
-                          </svg>
-                        </span>
-                        <h4 className="text-xs font-bold uppercase tracking-wider text-red-300">
-                          Correlated Malware & C2 Indicators
-                        </h4>
-                      </div>
-                      <span className="text-[10px] text-text-secondary">AlienVault OTX Threat Pulses</span>
-                    </div>
-
-                    {enrichment.malware_urls && enrichment.malware_urls.length > 0 && (
-                      <div className="space-y-1.5">
-                        <span className="text-[11px] font-semibold text-red-400 block">
-                          Malicious URLs Observed on Host ({enrichment.malware_urls.length})
-                        </span>
-                        <div className="max-h-36 overflow-y-auto space-y-1 font-mono text-xs">
-                          {enrichment.malware_urls.map((url, i) => (
-                            <div
-                              key={i}
-                              onClick={() => onNewSearch(url, "url")}
-                              className="truncate rounded bg-bg-elevated/70 p-2 text-slate-300 border border-border/50 hover:border-accent hover:text-accent cursor-pointer transition-colors"
-                              title={`Click to pivot into: ${url}`}
-                            >
-                              {url}
-                            </div>
-                          ))}
-                        </div>
-                      </div>
-                    )}
-
-                    {enrichment.associated_hashes && enrichment.associated_hashes.length > 0 && (
-                      <div className="space-y-1.5 pt-1">
-                        <span className="text-[11px] font-semibold text-amber-400 block">
-                          Associated Malware Hashes ({enrichment.associated_hashes.length})
-                        </span>
-                        <div className="flex flex-wrap gap-1.5 font-mono text-xs max-h-32 overflow-y-auto">
-                          {enrichment.associated_hashes.map((hash, i) => (
-                            <button
-                              key={i}
-                              type="button"
-                              onClick={() => onNewSearch(hash, hashType(hash))}
-                              className="rounded bg-bg-elevated px-2 py-1 text-[11px] border border-border/60 text-slate-300 hover:border-accent hover:text-accent transition-colors"
-                              title={`Click to pivot into hash: ${hash}`}
-                            >
-                              {hash.slice(0, 16)}...
-                            </button>
-                          ))}
-                        </div>
-                      </div>
-                    )}
-                  </section>
-                )}
-              </div>
-
-              {/* RIGHT COLUMN: Domain-Aware Contextual Technical Intelligence */}
-              {showRightColumn && (
-                <PanelBoundary label="Technical intelligence">
-                <div className="space-y-4 lg:col-span-5">
-                  {/* Indicator Specific Modules */}
-
-                  {/* DOMAIN / URL INTELLIGENCE */}
-                  {isDomainOrUrl && (
-                    <>
-                      {enrichment?.web_preview && (
-                        <WebPreviewCard preview={enrichment.web_preview} domainOrUrl={result.normalized} />
-                      )}
-                      {enrichment?.whois && (
-                        <WhoisCard whois={enrichment.whois} />
-                      )}
-                      {Boolean(enrichment?.hosting_ip_intel) && (
-                        <HostingPivotCard hostingIpIntel={enrichment?.hosting_ip_intel} />
-                      )}
-                      {enrichment?.subdomains && (
-                        <SubdomainsCard subdomainsData={enrichment.subdomains} />
-                      )}
-                    </>
-                  )}
-
-                  {/* IP ADDRESS INTELLIGENCE */}
-                  {isIp && (
-                    <>
-                      {/* Network & Geo Context Widget */}
-                      {enrichment?.geoip && (
-                        <section className="rounded-xl border border-border bg-bg-card p-4 space-y-3">
-                          <div className="flex items-center justify-between border-b border-border/60 pb-2">
-                            <h4 className="text-xs font-bold uppercase tracking-wider text-text-primary">
-                              Network & Routing Context
-                            </h4>
-                            <span className="text-[10px] text-text-secondary">BGP / ASN</span>
-                          </div>
-                          <div className="grid grid-cols-2 gap-2 text-xs">
-                            <div className="rounded-lg bg-bg-elevated/50 p-2.5 border border-border/50">
-                              <span className="text-[10px] uppercase text-text-secondary block">Country</span>
-                              <span className="font-semibold text-text-primary mt-0.5 block truncate">
-                                {enrichment.geoip.country || enrichment.geoip.country_code || "—"}
-                              </span>
-                            </div>
-                            <div className="rounded-lg bg-bg-elevated/50 p-2.5 border border-border/50">
-                              <span className="text-[10px] uppercase text-text-secondary block">City</span>
-                              <span className="font-semibold text-text-primary mt-0.5 block truncate">
-                                {enrichment.geoip.city || "—"}
-                              </span>
-                            </div>
-                            <div className="rounded-lg bg-bg-elevated/50 p-2.5 border border-border/50 col-span-2">
-                              <span className="text-[10px] uppercase text-text-secondary block">ISP / Autonomous System</span>
-                              <span className="font-semibold text-text-primary mt-0.5 block truncate">
-                                {enrichment.geoip.isp || enrichment.geoip.org || "—"} {enrichment.geoip.asn ? `(${enrichment.geoip.asn})` : ""}
-                              </span>
-                            </div>
-                          </div>
-                        </section>
-                      )}
-
-                      {/* Shodan Host Vulnerability Matrix */}
-                      {(enrichment?.host_intel || (enrichment?.open_ports && enrichment.open_ports.length > 0)) && (
-                        <HostVulnerabilityMatrix
-                          hostIntel={enrichment?.host_intel}
-                          geoip={enrichment?.geoip}
-                          legacyPorts={enrichment?.open_ports}
-                        />
-                      )}
-
-                      {/* AbuseIPDB Reports Timeline */}
-                      {enrichment?.abuse_reports && enrichment.abuse_reports.length > 0 && (
-                        <AbuseReportsPanel reports={enrichment.abuse_reports} />
-                      )}
-                    </>
-                  )}
-
-                  {/* CREDENTIAL / IDENTITY INTELLIGENCE */}
-                  {isCred && (
-                    <>
-                      {enrichment?.infostealer && (
-                        <InfostealerExposureCard infostealer={enrichment.infostealer} domainOrUser={result.normalized} />
-                      )}
-
-                      {/* Identity & Breach Exposure Highlight */}
-                      {Boolean(enrichment?.breach || enrichment?.email_security) && (
-                        <section className="rounded-xl border border-red-500/25 bg-red-950/10 p-4 space-y-3">
-                          <div className="flex items-center justify-between border-b border-red-500/20 pb-2">
-                            <h4 className="text-xs font-bold uppercase tracking-wider text-red-300">
-                              Identity & Exposure Verification
-                            </h4>
-                            <span className="text-[10px] text-text-secondary">HIBP & XposedOrNot</span>
-                          </div>
-                          <div className="grid grid-cols-2 gap-2 text-xs">
-                            <div className="rounded-lg bg-bg-elevated/50 p-2.5 border border-border/50">
-                              <span className="text-[10px] uppercase text-text-secondary block">Public Breaches</span>
-                              <span className={`font-bold mt-0.5 block ${
-                                (enrichment?.breach?.breach_count ?? 0) > 0 ? "text-red-400" : "text-emerald-400"
-                              }`}>
-                                {enrichment?.breach?.breach_count ?? "0"}
-                              </span>
-                            </div>
-                            <div className="rounded-lg bg-bg-elevated/50 p-2.5 border border-border/50">
-                              <span className="text-[10px] uppercase text-text-secondary block">Email Security (SPF)</span>
-                              <span className={`font-semibold mt-0.5 block ${
-                                spfConfigured ? "text-emerald-400" : "text-amber-400"
-                              }`}>
-                                {spfConfigured ? spfValue : "Unverified"}
-                              </span>
-                            </div>
-                          </div>
-                        </section>
-                      )}
-                    </>
-                  )}
-
-                  {/* CVE / VULNERABILITY INTELLIGENCE */}
-                  {isCve && (
-                    enrichment?.cve ? (
-                    <section className="rounded-xl border border-border bg-bg-card p-4 space-y-3">
-                      <div className="flex items-center justify-between border-b border-border/60 pb-2">
-                        <h4 className="text-xs font-bold uppercase tracking-wider text-text-primary">
-                          CVE Exploitability Context
-                        </h4>
-                        <span className="text-[10px] text-text-secondary">NVD / NIST</span>
-                      </div>
-                      <div className="space-y-2 text-xs">
-                        {enrichment?.cve?.cvss_score != null && (
-                          <div className="flex justify-between border-b border-border/40 pb-1.5">
-                            <span className="text-text-secondary">CVSS Score:</span>
-                            <span className="font-bold text-red-400">
-                              {formatNumber(enrichment.cve.cvss_score, { maxFractionDigits: 1 })}
-                              {enrichment.cve.cvss_severity ? ` (${titleCase(enrichment.cve.cvss_severity.toLowerCase())})` : ""}
-                            </span>
-                          </div>
-                        )}
-                        {enrichment?.cve?.epss_score != null && (
-                          <div className="flex justify-between border-b border-border/40 pb-1.5">
-                            <span className="text-text-secondary">EPSS exploit probability:</span>
-                            <span className="font-mono text-amber-400">
-                              {formatPercent(enrichment.cve.epss_score, 1)}
-                              {enrichment.cve.epss_percentile != null ? ` · ${formatPercent(enrichment.cve.epss_percentile, 0)} pctl` : ""}
-                            </span>
-                          </div>
-                        )}
-                        {enrichment?.cve?.cvss_vector && (
-                          <div className="flex justify-between gap-3 border-b border-border/40 pb-1.5">
-                            <span className="text-text-secondary">Vector:</span>
-                            <span className="break-all text-right font-mono text-[11px] text-text-primary">{enrichment.cve.cvss_vector}</span>
-                          </div>
-                        )}
-                        {enrichment?.cve?.is_in_kev && (
-                          <div className="rounded bg-red-500/15 border border-red-500/30 p-2 text-[11px] text-red-300 font-semibold">
-                            Listed in CISA Known Exploited Vulnerabilities
-                            {enrichment.cve.kev_date_added ? ` (added ${formatDate(enrichment.cve.kev_date_added)})` : ""}
-                          </div>
-                        )}
-                        {Array.isArray(enrichment?.cve?.affected_products) && enrichment.cve.affected_products.length > 0 && (
-                          <div className="text-[11px] text-text-secondary pt-1">
-                            <span className="font-semibold text-text-primary">Affected products:</span>{" "}
-                            {enrichment.cve.affected_products.slice(0, 3).join(", ")}
-                            {enrichment.cve.affected_products.length > 3 ? ` +${enrichment.cve.affected_products.length - 3} more` : ""}
-                          </div>
-                        )}
-                      </div>
-                    </section>
-                    ) : (
-                    <section className="rounded-xl border border-border bg-bg-card p-4 space-y-3">
-                      <div className="flex items-center justify-between border-b border-border/60 pb-2">
-                        <h4 className="text-xs font-bold uppercase tracking-wider text-text-primary">
-                          CVE Exploitability Context
-                        </h4>
-                        <span className="text-[10px] text-text-secondary">NVD / NIST</span>
-                      </div>
-                      <p className="text-[11px] text-text-secondary">
-                        No CVE enrichment available for this indicator. The verdict above is
-                        derived from provider intelligence; CVSS, EPSS, and CISA KEV context
-                        could not be retrieved from the vulnerability feeds.
-                      </p>
-                    </section>
-                    )
-                  )}
-
-                  {/* CRYPTO WALLET METRICS */}
-                  {Boolean(enrichment?.extra?.bitcoin) && (
-                    <section className="rounded-xl border border-border bg-bg-card p-4 space-y-3">
-                      <div className="flex items-center justify-between border-b border-border/60 pb-2">
-                        <h4 className="text-xs font-bold uppercase tracking-wider text-text-primary">
-                          On-Chain Ledger Activity
-                        </h4>
-                        <span className="text-[10px] text-text-secondary">Blockchain Explorer</span>
-                      </div>
-
-                      {/* BITCOIN */}
-                      {Boolean(enrichment?.extra?.bitcoin) && (() => {
-                        const btc = (enrichment?.extra?.bitcoin as unknown as Record<string, unknown>) ?? {};
-                        const recent = Array.isArray(btc.recent_transactions)
-                          ? (btc.recent_transactions as Record<string, unknown>[])
-                          : [];
-                        return (
-                          <div className="space-y-2 text-xs">
-                            <div className="flex items-center gap-1.5">
-                              <span className="rounded bg-amber-500/15 px-1.5 py-0.5 text-[10px] font-bold uppercase tracking-wider text-amber-400 border border-amber-500/30">
-                                BTC
-                              </span>
-                              <span className="text-[10px] text-text-secondary">Bitcoin</span>
-                            </div>
-                            <div className="space-y-1.5 font-mono">
-                              <div className="flex justify-between">
-                                <span className="text-text-secondary">Balance:</span>
-                                <span className="text-text-primary font-bold">
-                                  {formatNumber(btc.final_balance_btc, { unit: "BTC", maxFractionDigits: 8 })}
-                                </span>
-                              </div>
-                              <div className="flex justify-between">
-                                <span className="text-text-secondary">Transactions:</span>
-                                <span className="text-text-primary">{formatNumber(btc.n_tx)}</span>
-                              </div>
-                              <div className="flex justify-between">
-                                <span className="text-text-secondary">Total Received:</span>
-                                <span className="text-emerald-400">{formatNumber(btc.total_received_btc, { unit: "BTC", maxFractionDigits: 8 })}</span>
-                              </div>
-                              <div className="flex justify-between">
-                                <span className="text-text-secondary">Total Sent:</span>
-                                <span className="text-rose-400">{formatNumber(btc.total_sent_btc, { unit: "BTC", maxFractionDigits: 8 })}</span>
-                              </div>
-                            </div>
-                            {recent.length > 0 && (
-                              <div className="space-y-1 pt-1">
-                                <span className="text-[10px] uppercase tracking-wider text-text-secondary block">
-                                  Recent Transactions ({recent.length})
-                                </span>
-                                <div className="max-h-32 overflow-y-auto space-y-1 font-mono text-[11px]">
-                                  {recent.map((tx, i) => {
-                                    const hash = tx.hash != null ? String(tx.hash) : "";
-                                    return (
-                                      <div
-                                        key={hash || i}
-                                        className="flex items-center justify-between gap-2 rounded bg-bg-elevated/60 px-2 py-1 border border-border/50"
-                                      >
-                                        <span className="truncate text-slate-300" title={hash}>
-                                          {hash ? `${hash.slice(0, 18)}…` : "—"}
-                                        </span>
-                                        <span className="shrink-0 text-text-secondary">
-                                          {formatNumber(tx.result_btc, { unit: "BTC", maxFractionDigits: 8 })}
-                                        </span>
-                                      </div>
-                                    );
-                                  })}
-                                </div>
-                              </div>
-                            )}
-                          </div>
-                        );
-                      })()}
-
-                    </section>
-                  )}
-
-                  {/* Fallback WHOIS if not rendered yet */}
-                  {!isDomainOrUrl && enrichment?.whois && (
-                    <WhoisCard whois={enrichment.whois} />
-                  )}
-
-                  {/* CONTEXT INDICATOR INTELLIGENCE: ASN, MITRE ATT&CK, host
-                      artifacts, file hashes, filenames/paths, user-agents, MACs
-                      and fuzzy hashes. These render inline so structured data is
-                      never buried in the Raw Data tab. */}
-                  <ContextIntelCard extra={enrichment?.extra} />
-
-                  {/* No-data placeholder: column is shown because this indicator
-                      type has technical modules, but no enrichment was returned. */}
-                  {!hasTechnicalIntel && (
-                    <section className="rounded-xl border border-dashed border-border bg-bg-card/50 p-6 text-center">
-                      <h4 className="text-xs font-bold uppercase tracking-wider text-text-secondary">
-                        Technical Intelligence
-                      </h4>
-                      <p className="mt-2 text-[11px] leading-relaxed text-text-secondary">
-                        No technical intelligence available for this indicator. Enrichment
-                        providers returned no infrastructure, on-chain, or contextual data —
-                        the assessment above is based on provider reputation signals.
-                      </p>
-                    </section>
-                  )}
-                </div>
-                </PanelBoundary>
-              )}
-            </div>
+            {/* Full width. Every enrichment card used to be mounted here as well
+                as on the Enrichment tab, so the same data appeared twice. This
+                tab is the verdict, the indicator dashboard and provider evidence;
+                the Enrichment tab owns every enrichment module at full depth. */}
+            <ProviderEvidenceList grouped={grouped} emptyFindingsText={emptyFindingsText} />
           </div>
         )}
 
@@ -823,20 +372,13 @@ export default function ResultView({
             <EnrichmentPanel
               enrichment={result.enrichment}
               iocType={result.ioc_type}
-              onPivot={handleEthPivot}
             />
           </PanelBoundary>
         )}
 
-        {tab === "Evidence" && (
-          <PanelBoundary label="Evidence">
-            <EvidencePanel result={result} />
-          </PanelBoundary>
-        )}
-
-        {tab === "Raw Data" && (
-          <PanelBoundary label="Raw data">
-            <RawDataView results={visibleResults} />
+        {tab === "Sources" && (
+          <PanelBoundary label="Sources">
+            <SourcesPanel result={result} />
           </PanelBoundary>
         )}
 

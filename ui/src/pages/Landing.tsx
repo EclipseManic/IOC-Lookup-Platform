@@ -1,4 +1,4 @@
-import type { NavigateEvent, Page, Tool } from "../App";
+﻿import type { NavigateEvent, Page, Tool } from "../App";
 import { DISPLAY_CLEAN, DISPLAY_SUSPICIOUS, DISPLAY_MALICIOUS } from "../lib/thresholds";
 
 const STATS = [
@@ -105,7 +105,7 @@ function navigateTo(page: Page, tool?: Tool | null) {
 export default function Landing() {
   return (
     <div className="page-enter">
-      {/* ═══ HERO ═══ */}
+      {/* â•â•â• HERO â•â•â• */}
       <section className="relative overflow-hidden rounded-xl border border-border bg-bg-secondary/40">
         <div className="hero-grid-bg" aria-hidden="true" />
         <div className="hero-radial" aria-hidden="true" />
@@ -148,11 +148,11 @@ export default function Landing() {
                   <span className="term-dot y" />
                   <span className="term-dot g" />
                   <span className="term-title">lookup_result.json</span>
-                  <span className="ml-auto text-[10px] font-bold tracking-wider text-green-400 border border-green-500/40 bg-green-500/10 px-2 py-0.5 rounded-full">
+                  <span className="ml-auto text-xs font-bold tracking-wider text-green-400 border border-green-500/40 bg-green-500/10 px-2 py-0.5 rounded-full">
                     LIVE
                   </span>
                 </div>
-                <div className="p-5 font-mono text-[13px] leading-[1.9]">
+                <div className="p-5 font-mono text-sm leading-[1.9]">
                   <div className="text-text-secondary">{"{"}</div>
                   <div className="pl-4"><span className="text-accent">"input"</span>: <span className="text-green-400">"8.8.8.8"</span>,</div>
                   <div className="pl-4"><span className="text-accent">"verdict"</span>: <span className="text-green-400">"clean"</span>,</div>
@@ -166,8 +166,8 @@ export default function Landing() {
                   <div className="text-text-secondary">{"}"}</div>
                   <span className="term-cursor" aria-hidden="true" />
                 </div>
-                <div className="term-chrome text-[11px] text-text-secondary border-t border-border bg-bg-secondary">
-                  <span className="font-mono">⏱ 2.4s · 6 engines · 812 YARA rules</span>
+                <div className="term-chrome text-xs text-text-secondary border-t border-border bg-bg-secondary">
+                  <span className="font-mono">â± 2.4s · 6 engines · 812 YARA rules</span>
                   <span className="ml-auto flex items-center gap-2 font-mono text-green-400">
                     <span className="status-dot" />
                     live
@@ -179,19 +179,19 @@ export default function Landing() {
         </div>
       </section>
 
-      {/* ═══ STATS BAR ═══ */}
+      {/* â•â•â• STATS BAR â•â•â• */}
       <section className="mt-8 rounded-xl border border-border bg-bg-secondary/60">
         <div className="flex flex-wrap justify-center items-stretch divide-x divide-border">
           {STATS.map((stat, i) => (
             <div key={stat.label} className={`px-8 py-5 text-center ${i > 0 ? "border-l border-border" : ""}`}>
               <div className="stat-num">{stat.value}</div>
-              <div className="mt-1 text-[11px] uppercase tracking-wider text-text-secondary">{stat.label}</div>
+              <div className="mt-1 text-xs uppercase tracking-wider text-text-secondary">{stat.label}</div>
             </div>
           ))}
         </div>
       </section>
 
-      {/* ═══ CAPABILITIES ═══ */}
+      {/* â•â•â• CAPABILITIES â•â•â• */}
       <section className="mt-16">
         <div className="text-center mb-10">
           <span className="section-tag">Capabilities</span>
@@ -211,13 +211,13 @@ export default function Landing() {
               >
                 {f.icon}
               </div>
-              <h3 className="text-[15px] font-bold text-text-primary">{f.title}</h3>
-              <p className="mt-2 text-[13px] text-text-secondary leading-relaxed">{f.desc}</p>
+              <h3 className="text-sm font-bold text-text-primary">{f.title}</h3>
+              <p className="mt-2 text-sm text-text-secondary leading-relaxed">{f.desc}</p>
               <div className="mt-4 flex flex-wrap gap-2">
                 {f.tags.map((t) => (
                   <span
                     key={t}
-                    className="text-[10px] px-2 py-0.5 rounded-full border border-border bg-bg-elevated text-text-secondary font-mono"
+                    className="text-xs px-2 py-0.5 rounded-full border border-border bg-bg-elevated text-text-secondary font-mono"
                   >
                     {t}
                   </span>
@@ -228,7 +228,7 @@ export default function Landing() {
         </div>
       </section>
 
-      {/* ═══ VERDICT TIERS ═══ */}
+      {/* â•â•â• VERDICT TIERS â•â•â• */}
       <section className="mt-16">
         <div className="text-center mb-10">
           <span className="section-tag">Risk Classification</span>
@@ -242,7 +242,7 @@ export default function Landing() {
               className="tier-card bg-bg-card border border-border rounded-xl p-6 text-center"
               style={{ ["--tier-color" as string]: tier.color }}
             >
-              <div className="text-[11px] font-bold uppercase tracking-widest text-text-secondary">{tier.range}</div>
+              <div className="text-xs font-bold uppercase tracking-widest text-text-secondary">{tier.range}</div>
               <div className="mt-3 text-3xl font-black font-mono" style={{ color: tier.color }}>
                 {tier.name}
               </div>
@@ -252,7 +252,7 @@ export default function Landing() {
         </div>
       </section>
 
-      {/* ═══ WORKFLOW ═══ */}
+      {/* â•â•â• WORKFLOW â•â•â• */}
       <section className="mt-16 mb-8">
         <div className="text-center mb-10">
           <span className="section-tag">Workflow</span>
@@ -263,7 +263,7 @@ export default function Landing() {
             <div key={w.step} className="flex items-start">
               <div className="wf-step text-center px-4">
                 <div className="wf-num mx-auto">{w.step}</div>
-                <h4 className="text-[17px] font-bold text-text-primary">{w.title}</h4>
+                <h4 className="text-lg font-bold text-text-primary">{w.title}</h4>
                 <p className="mt-1.5 text-sm text-text-secondary leading-relaxed max-w-[190px] mx-auto">{w.desc}</p>
               </div>
               {i < WORKFLOW.length - 1 && <div className="wf-connector" aria-hidden="true" />}
@@ -272,7 +272,7 @@ export default function Landing() {
         </div>
       </section>
 
-      {/* ═══ CTA ═══ */}
+      {/* â•â•â• CTA â•â•â• */}
       <section className="rounded-xl border border-border bg-bg-secondary/60 py-10 text-center relative overflow-hidden">
         <div className="hero-grid-bg" aria-hidden="true" />
         <div className="hero-radial" aria-hidden="true" />

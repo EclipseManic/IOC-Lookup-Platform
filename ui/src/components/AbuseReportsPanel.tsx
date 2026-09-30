@@ -1,4 +1,4 @@
-import { useState } from "react";
+﻿import { useState } from "react";
 import type { AbuseReport } from "../services/api";
 
 interface AbuseReportsPanelProps {
@@ -25,7 +25,7 @@ export default function AbuseReportsPanel({ reports = [] }: AbuseReportsPanelPro
             Sysadmin Abuse & Incident Reports ({reports.length})
           </h4>
         </div>
-        <span className="text-[10px] text-text-secondary bg-bg-elevated px-2 py-0.5 rounded border border-border/60">
+        <span className="text-xs text-text-secondary bg-bg-elevated px-2 py-0.5 rounded border border-border/60">
           AbuseIPDB Verified Community Reports
         </span>
       </div>
@@ -43,13 +43,13 @@ export default function AbuseReportsPanel({ reports = [] }: AbuseReportsPanelPro
               key={idx}
               className="rounded-lg border border-border/70 bg-bg-elevated/40 p-3 space-y-2 text-xs font-mono"
             >
-              <div className="flex flex-wrap items-center justify-between gap-2 text-[11px] text-text-secondary">
+              <div className="flex flex-wrap items-center justify-between gap-2 text-xs text-text-secondary">
                 <div className="flex items-center gap-2">
                   <span className="font-semibold text-text-primary">
                     {report.reported_at ? report.reported_at.replace("T", " ").replace("Z", " UTC") : "Recent"}
                   </span>
                   {report.reporter_country && (
-                    <span className="rounded bg-bg-card px-1.5 py-0.5 border border-border/50 text-[10px]">
+                    <span className="rounded bg-bg-card px-1.5 py-0.5 border border-border/50 text-xs">
                       Reporter: {report.reporter_country}
                     </span>
                   )}
@@ -58,7 +58,7 @@ export default function AbuseReportsPanel({ reports = [] }: AbuseReportsPanelPro
                   {categories.map((cat, cIdx) => (
                     <span
                       key={cIdx}
-                      className="rounded bg-amber-950/40 text-amber-300 border border-amber-500/30 px-1.5 py-0.2 text-[10px] font-medium"
+                      className="rounded bg-amber-950/40 text-amber-300 border border-amber-500/30 px-1.5 py-0.2 text-xs font-medium"
                     >
                       {cat}
                     </span>
@@ -67,11 +67,11 @@ export default function AbuseReportsPanel({ reports = [] }: AbuseReportsPanelPro
               </div>
 
               {report.comment ? (
-                <p className="text-text-primary whitespace-pre-wrap break-all bg-bg-card/70 p-2 rounded border border-border/40 text-[11px]">
+                <p className="text-text-primary whitespace-pre-wrap break-all bg-bg-card/70 p-2 rounded border border-border/40 text-xs">
                   {report.comment}
                 </p>
               ) : (
-                <span className="text-text-secondary italic text-[11px]">
+                <span className="text-text-secondary italic text-xs">
                   No reporter commentary attached.
                 </span>
               )}

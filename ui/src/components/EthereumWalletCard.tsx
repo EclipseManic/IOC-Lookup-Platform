@@ -1,4 +1,4 @@
-import { useState } from "react";
+﻿import { useState } from "react";
 import type {
   EthChainHolding,
   EthCounterparty,
@@ -52,9 +52,9 @@ function ExternalLink({ href, children, className = "" }: { href: string; childr
 function Stat({ label, value, detail, accent = "text-text-primary" }: { label: string; value: string; detail?: string; accent?: string }) {
   return (
     <div className="rounded-lg border border-border/70 bg-bg-elevated/50 p-3 min-w-0">
-      <div className="text-[10px] uppercase tracking-wider text-text-secondary">{label}</div>
+      <div className="text-xs uppercase tracking-wider text-text-secondary">{label}</div>
       <div className={`mt-1 truncate text-sm font-bold font-mono ${accent}`} title={value}>{value}</div>
-      {detail && <div className="mt-0.5 truncate text-[10px] text-text-secondary" title={detail}>{detail}</div>}
+      {detail && <div className="mt-0.5 truncate text-xs text-text-secondary" title={detail}>{detail}</div>}
     </div>
   );
 }
@@ -81,12 +81,12 @@ function PartyLink({ party, self, onPivot }: { party?: EthParty; self: string; o
 function Provenance({ title, party, tx, onPivot, self }: { title: string; party?: EthParty; tx?: EthTxRef; onPivot?: (value: string) => void; self: string }) {
   return (
     <div className="rounded-lg border border-border/60 bg-bg-elevated/30 p-3 text-xs min-w-0">
-      <div className="text-[10px] uppercase tracking-wider text-text-secondary">{title}</div>
+      <div className="text-xs uppercase tracking-wider text-text-secondary">{title}</div>
       <div className="mt-1 font-mono truncate">
         {party ? <PartyLink party={party} self={self} onPivot={onPivot} /> : null}
       </div>
       {tx?.tx_hash && (
-        <ExternalLink href={`${ETHERSCAN}/tx/${tx.tx_hash}`} className="mt-0.5 block text-[10px] text-text-secondary">
+        <ExternalLink href={`${ETHERSCAN}/tx/${tx.tx_hash}`} className="mt-0.5 block text-xs text-text-secondary">
           {tx.age || "view transaction"} ↗
         </ExternalLink>
       )}
@@ -99,7 +99,7 @@ function ChainBars({ chains }: { chains: EthChainHolding[] }) {
   return (
     <div className="space-y-1.5">
       {chains.slice(0, 10).map((chain) => (
-        <div key={chain.chain_id || chain.chain} className="text-[11px]">
+        <div key={chain.chain_id || chain.chain} className="text-xs">
           <div className="flex justify-between gap-2">
             <span className="truncate text-text-primary">
               {chain.chain}
@@ -127,8 +127,8 @@ function Section({ title, meta, children }: { title: string; meta?: string; chil
   return (
     <div className="rounded-lg border border-border/60 bg-bg-elevated/20 p-3 min-w-0">
       <div className="mb-2 flex items-center justify-between gap-2 border-b border-border/40 pb-1.5">
-        <span className="text-[10px] font-bold uppercase tracking-wider text-text-primary">{title}</span>
-        {meta && <span className="text-[10px] text-text-secondary">{meta}</span>}
+        <span className="text-xs font-bold uppercase tracking-wider text-text-primary">{title}</span>
+        {meta && <span className="text-xs text-text-secondary">{meta}</span>}
       </div>
       {children}
     </div>
@@ -169,11 +169,11 @@ export default function EthereumWalletCard({
       <div className="flex flex-wrap items-start justify-between gap-3 border-b border-border/60 pb-3">
         <div className="min-w-0 space-y-1">
           <div className="flex flex-wrap items-center gap-2">
-            <span className="rounded bg-indigo-500/15 px-1.5 py-0.5 text-[10px] font-bold uppercase tracking-wider text-indigo-300 border border-indigo-500/30">
+            <span className="rounded bg-indigo-500/15 px-1.5 py-0.5 text-xs font-bold uppercase tracking-wider text-indigo-300 border border-indigo-500/30">
               ETH
             </span>
             <h4 className="text-xs font-bold uppercase tracking-wider text-text-primary">Ethereum Wallet Intelligence</h4>
-            <span className="rounded-full border border-border/70 px-2 py-0.5 text-[10px] text-text-secondary">
+            <span className="rounded-full border border-border/70 px-2 py-0.5 text-xs text-text-secondary">
               {wallet.account_type === "contract" ? "Smart contract" : "Externally owned account"}
             </span>
           </div>
@@ -186,13 +186,13 @@ export default function EthereumWalletCard({
               )}
               {wallet.ens_name && <span className="font-mono text-sky-300">{wallet.ens_name}</span>}
               {wallet.website && (
-                <ExternalLink href={wallet.website} className="text-[11px] text-text-secondary">{wallet.website} ↗</ExternalLink>
+                <ExternalLink href={wallet.website} className="text-xs text-text-secondary">{wallet.website} ↗</ExternalLink>
               )}
             </div>
           )}
-          <div className="font-mono text-[11px] text-text-secondary break-all">{self}</div>
+          <div className="font-mono text-xs text-text-secondary break-all">{self}</div>
         </div>
-        <div className="text-right text-[10px] text-text-secondary space-y-0.5">
+        <div className="text-right text-xs text-text-secondary space-y-0.5">
           <ExternalLink href={wallet.source_link || `${ETHERSCAN}/address/${self}`} className="text-accent">
             Open in Etherscan ↗
           </ExternalLink>
@@ -215,14 +215,14 @@ export default function EthereumWalletCard({
       {/* Threat banner */}
       {flagged && (
         <div className="rounded-lg border border-red-500/40 bg-red-500/10 p-3 space-y-1.5">
-          <div className="text-[10px] font-bold uppercase tracking-wider text-red-300">Flagged by Etherscan</div>
+          <div className="text-xs font-bold uppercase tracking-wider text-red-300">Flagged by Etherscan</div>
           {warnings.map((warning) => (
             <p key={warning} className="text-xs text-red-200">{warning}</p>
           ))}
           {riskLabels.length > 0 && (
             <div className="flex flex-wrap gap-1.5">
               {riskLabels.map((label) => (
-                <span key={label} className="rounded-full border border-red-500/50 bg-red-500/15 px-2 py-0.5 text-[10px] font-semibold text-red-300">
+                <span key={label} className="rounded-full border border-red-500/50 bg-red-500/15 px-2 py-0.5 text-xs font-semibold text-red-300">
                   {label}
                 </span>
               ))}
@@ -234,12 +234,12 @@ export default function EthereumWalletCard({
       {/* Labels */}
       {labels.length > 0 && (
         <div className="flex flex-wrap items-center gap-1.5">
-          <span className="text-[10px] uppercase tracking-wider text-text-secondary mr-1">Labels</span>
+          <span className="text-xs uppercase tracking-wider text-text-secondary mr-1">Labels</span>
           {labels.map((label) => {
             const isRisk = RISK_PATTERN.test(label.name);
             const chip = (
               <span
-                className={`rounded-full border px-2 py-0.5 text-[10px] ${
+                className={`rounded-full border px-2 py-0.5 text-xs ${
                   isRisk ? "border-red-500/50 bg-red-500/10 text-red-300" : "border-border/70 bg-bg-elevated text-text-secondary"
                 }`}
                 title={label.description}
@@ -300,7 +300,7 @@ export default function EthereumWalletCard({
           {wallet.latest_tx_sent && <Provenance title="Latest txn sent" tx={wallet.latest_tx_sent} self={self} />}
           {wallet.token_tracker && (
             <div className="rounded-lg border border-border/60 bg-bg-elevated/30 p-3 text-xs min-w-0">
-              <div className="text-[10px] uppercase tracking-wider text-text-secondary">Token tracker</div>
+              <div className="text-xs uppercase tracking-wider text-text-secondary">Token tracker</div>
               <div className="mt-1 truncate text-text-primary">{wallet.token_tracker}</div>
             </div>
           )}
@@ -315,9 +315,9 @@ export default function EthereumWalletCard({
               title="Token Holdings"
               meta={`top ${tokens.length} by value${wallet.token_list_size ? ` of ${wallet.token_list_size}` : ""}`}
             >
-              <table className="w-full text-[11px] font-mono">
+              <table className="w-full text-xs font-mono">
                 <thead>
-                  <tr className="text-left text-[10px] uppercase text-text-secondary">
+                  <tr className="text-left text-xs uppercase text-text-secondary">
                     <th className="pb-1 font-normal">Token</th>
                     <th className="pb-1 font-normal text-right">Amount</th>
                     <th className="pb-1 font-normal text-right">Value</th>
@@ -346,7 +346,7 @@ export default function EthereumWalletCard({
                 <button
                   type="button"
                   onClick={() => setShowAllTokens((v) => !v)}
-                  className="mt-2 text-[10px] text-accent hover:underline"
+                  className="mt-2 text-xs text-accent hover:underline"
                 >
                   {showAllTokens ? "Show fewer" : `Show all ${tokens.length}`}
                 </button>
@@ -366,7 +366,7 @@ export default function EthereumWalletCard({
             >
               <ChainBars chains={chains} />
               {nativeOnly && (
-                <p className="mt-2 text-[10px] text-text-secondary">
+                <p className="mt-2 text-xs text-text-secondary">
                   Etherscan did not include its multichain portfolio for this address, so these are native-coin balances from
                   the Etherscan V2 API. Tokens held on other chains
                   {wallet.multichain_chains_unsupported?.length
@@ -390,7 +390,7 @@ export default function EthereumWalletCard({
                 type="button"
                 onClick={() => onPivot?.(party.address)}
                 title={`${party.address}\nClick to investigate`}
-                className="rounded-md border border-red-500/40 bg-red-500/10 px-2 py-1 text-[11px] font-mono text-red-300 hover:bg-red-500/20"
+                className="rounded-md border border-red-500/40 bg-red-500/10 px-2 py-1 text-xs font-mono text-red-300 hover:bg-red-500/20"
               >
                 {party.label} <span className="text-red-400/70">×{party.tx_count}</span>
               </button>
@@ -403,9 +403,9 @@ export default function EthereumWalletCard({
       {transactions.length > 0 && (
         <Section title="Recent Transactions" meta={`latest ${transactions.length} of ${txTotal}`}>
           <div className="max-h-80 overflow-auto">
-            <table className="w-full min-w-[640px] text-[11px] font-mono">
+            <table className="w-full min-w-[640px] text-xs font-mono">
               <thead className="sticky top-0 bg-bg-card">
-                <tr className="text-left text-[10px] uppercase text-text-secondary">
+                <tr className="text-left text-xs uppercase text-text-secondary">
                   <th className="pb-1 font-normal">Time (UTC)</th>
                   <th className="pb-1 font-normal">Dir</th>
                   <th className="pb-1 font-normal">Method</th>
@@ -428,7 +428,7 @@ export default function EthereumWalletCard({
                     <tr key={tx.hash ?? index} className={`border-t border-border/30 ${tx.failed ? "opacity-60" : ""}`}>
                       <td className="py-1 pr-2 whitespace-nowrap text-text-secondary">{txTime(tx)}</td>
                       <td className="py-1 pr-2">
-                        <span className={`rounded border px-1 text-[9px] font-bold ${dirClass}`}>{tx.direction ?? "—"}</span>
+                        <span className={`rounded border px-1 text-xs font-bold ${dirClass}`}>{tx.direction ?? "—"}</span>
                       </td>
                       <td className="py-1 pr-2 max-w-[8rem] truncate text-text-primary" title={tx.method ?? undefined}>
                         {tx.method ?? "—"}
@@ -439,7 +439,7 @@ export default function EthereumWalletCard({
                       </td>
                       <td className="py-1 pr-2 text-right whitespace-nowrap text-text-primary">
                         {num(tx.value_eth)} ETH
-                        {tx.value_usd ? <span className="block text-[10px] text-text-secondary">{usd(tx.value_usd)}</span> : null}
+                        {tx.value_usd ? <span className="block text-xs text-text-secondary">{usd(tx.value_usd)}</span> : null}
                       </td>
                       <td className="py-1 pr-2 text-right text-text-secondary">{tx.fee_eth != null ? num(tx.fee_eth, 6) : "—"}</td>
                       <td className="py-1 text-right">

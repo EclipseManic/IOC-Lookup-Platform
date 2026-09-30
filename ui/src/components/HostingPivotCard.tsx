@@ -1,4 +1,4 @@
-export default function HostingPivotCard({
+﻿export default function HostingPivotCard({
   hostingIpIntel,
 }: {
   hostingIpIntel?: Record<string, unknown>;
@@ -20,7 +20,7 @@ export default function HostingPivotCard({
             Hosting Infrastructure & CDN Bypass
           </h4>
         </div>
-        <span className="text-[10px] text-text-secondary">Resolved Host IPs ({entries.length})</span>
+        <span className="text-xs text-text-secondary">Resolved Host IPs ({entries.length})</span>
       </div>
 
       <div className="grid grid-cols-1 sm:grid-cols-2 gap-2.5">
@@ -40,28 +40,28 @@ export default function HostingPivotCard({
               <div className="flex items-center justify-between font-bold">
                 <span className="text-text-primary text-sm">{ip}</span>
                 {isRiot ? (
-                  <span className="rounded-full bg-emerald-500/10 text-emerald-400 border border-emerald-500/30 px-2 py-0.5 text-[10px] font-semibold">
+                  <span className="rounded-full bg-emerald-500/10 text-emerald-400 border border-emerald-500/30 px-2 py-0.5 text-xs font-semibold">
                     RIOT Verified CDN
                   </span>
                 ) : isDatacenter ? (
-                  <span className="rounded-full bg-purple-500/10 text-purple-400 border border-purple-500/30 px-2 py-0.5 text-[10px] font-semibold">
+                  <span className="rounded-full bg-purple-500/10 text-purple-400 border border-purple-500/30 px-2 py-0.5 text-xs font-semibold">
                     Datacenter Host
                   </span>
                 ) : null}
               </div>
 
-              <div className="text-[11px] text-text-secondary pt-0.5">
+              <div className="text-xs text-text-secondary pt-0.5">
                 {isRiot ? (
                   <div className="text-emerald-300 font-medium">
                     CDN Provider: <strong>{riotName}</strong>
-                    <div className="text-[10px] text-text-secondary font-normal mt-0.5">
+                    <div className="text-xs text-text-secondary font-normal mt-0.5">
                       Port scanning bypassed to eliminate shared CDN false positives.
                     </div>
                   </div>
                 ) : (
                   <div>
                     {org && <span className="block text-text-primary truncate">Org: {org}</span>}
-                    {country && <span className="block text-text-secondary text-[10px]">Location: {country}</span>}
+                    {country && <span className="block text-text-secondary text-xs">Location: {country}</span>}
                   </div>
                 )}
               </div>

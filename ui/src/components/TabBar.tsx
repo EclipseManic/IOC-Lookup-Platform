@@ -1,6 +1,10 @@
-import { useRef } from "react";
+﻿import { useRef } from "react";
 
-const TABS = ["Investigation", "Enrichment", "Relationships", "Evidence", "Raw Data", "Export"] as const;
+// "Sources" merges what used to be two tabs. "Evidence" answered *what the
+// sources said*; "Raw Data" answered *what each one actually returned* — but an
+// analyst asking "which APIs ran, and which of my keys went unused" had to
+// cross-reference both. They are one question, so they are one tab.
+const TABS = ["Investigation", "Enrichment", "Relationships", "Sources", "Export"] as const;
 export type TabName = (typeof TABS)[number];
 
 export default function TabBar({
@@ -52,7 +56,7 @@ export default function TabBar({
           >
             <span>{tab}</span>
             {badge !== undefined && badge !== null && badge !== 0 && (
-              <span className={`rounded-full px-1.5 py-0.2 text-[10px] font-mono ${
+              <span className={`rounded-full px-1.5 py-0.2 text-xs font-mono ${
                 active === tab ? "bg-accent/20 text-accent font-bold" : "bg-bg-elevated text-text-secondary"
               }`}>
                 {badge}

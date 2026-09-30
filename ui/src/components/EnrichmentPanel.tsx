@@ -1,22 +1,30 @@
-import type { ReactNode } from "react";
+﻿import { useState, type ReactNode } from "react";
 import type { EnrichmentData } from "../services/api";
 import HostVulnerabilityMatrix from "./HostVulnerabilityMatrix";
 import InfostealerExposureCard from "./InfostealerExposureCard";
 import WebPreviewCard from "./WebPreviewCard";
 import AbuseReportsPanel from "./AbuseReportsPanel";
 import DataProvenanceBadge from "./DataProvenanceBadge";
-import EthereumWalletCard from "./EthereumWalletCard";
-import type { EthereumContext } from "../services/api";
+import PayloadFields from "./PayloadFields";
+import ContextIntelCard from "./ContextIntelCard";
+import SubdomainsCard from "./SubdomainsCard";
+import {
+  describeEmptyState,
+  isEnrichmentEmpty,
+  keysRenderedByCards,
+  MODULE_STATE_LABEL,
+  parseCollectionStatus,
+  type CollectionStatus,
+  type ModuleState,
+} from "../lib/enrichment";
 
-function formatValue(value: unknown): string {
-  if (Array.isArray(value))
-    return value.every((item) => typeof item !== "object" || item === null)
-      ? value.join(", ")
-      : JSON.stringify(value, null, 2);
-  if (typeof value === "object" && value !== null) return JSON.stringify(value, null, 2);
-  return String(value);
-}
-
+/**
+ * A section renders its data as readable fields at every depth.
+ *
+ * It previously used JSON.stringify for anything nested, which turned a deep
+ * module such as host_intel or whois into a wall of braces. The raw JSON is still
+ * one click away for audit, but it is no longer the only view.
+ */
 function Section({
   title,
   data,
@@ -26,6 +34,7 @@ function Section({
   data: object;
   badge?: ReactNode;
 }) {
+  const [showJson, setShowJson] = useState(false);
   const entries = Object.entries(data).filter(
     ([_, value]) =>
       value !== null &&
@@ -40,14 +49,51 @@ function Section({
         <h4 className="text-xs font-semibold uppercase tracking-[0.14em] text-accent">{title}</h4>
         {badge}
       </div>
-      <div className="space-y-1.5 text-xs font-mono">
-        {entries.map(([key, value]) => (
-          <div key={key} className="flex gap-3 border-b border-border/50 pb-1.5 last:border-0">
-            <span className="shrink-0 text-text-secondary">{key.replace(/_/g, " ")}:</span>
-            <span className="min-w-0 whitespace-pre-wrap break-all text-text-primary">
-              {formatValue(value)}
-            </span>
-          </div>
+      <div className="rounded-lg border border-border/70 bg-bg-elevated/30 p-3">
+        <PayloadFields raw={data} />
+      </div>
+      <button
+        type="button"
+        onClick={() => setShowJson((value) => !value)}
+        className="rounded-md border border-border bg-bg-elevated px-2.5 py-1.5 text-xs font-semibold text-text-secondary hover:border-accent/50 hover:text-accent transition-colors"
+      >
+        {showJson ? "Hide raw JSON" : "Raw JSON"}
+      </button>
+      {showJson && (
+        <pre className="max-h-72 overflow-auto whitespace-pre-wrap break-all rounded-lg border border-border bg-[#080b12] p-3 font-mono text-xs leading-relaxed text-slate-300">
+          {JSON.stringify(data, null, 2)}
+        </pre>
+      )}
+    </section>
+  );
+}
+
+const MODULE_TONE: Record<ModuleState, string> = {
+  ok: "border-verdict-clean/30 bg-verdict-clean/10 text-verdict-clean",
+  not_found: "border-border bg-bg-elevated text-text-secondary",
+  unavailable: "border-amber-500/30 bg-amber-500/10 text-amber-200",
+  skipped: "border-border bg-bg-elevated/50 text-text-secondary",
+  error: "border-verdict-malicious/30 bg-verdict-malicious/10 text-verdict-malicious",
+};
+
+/** Per-module collection state, so a sparse tab explains itself. */
+function CollectionStatusPanel({ status }: { status: CollectionStatus }) {
+  if (status.modules.length === 0) return null;
+  return (
+    <section className="rounded-xl border border-border bg-bg-card p-4 space-y-3">
+      <div>
+        <h4 className="text-xs font-semibold uppercase tracking-[0.14em] text-accent">Collection status</h4>
+        <p className="mt-1 text-xs text-text-secondary">{status.summary}</p>
+      </div>
+      <div className="flex flex-wrap gap-1.5">
+        {status.modules.map((module) => (
+          <span
+            key={module.module}
+            title={module.title}
+            className={`rounded border px-1.5 py-0.5 text-xs font-semibold ${MODULE_TONE[module.state]}`}
+          >
+            {module.title}: {MODULE_STATE_LABEL[module.state]}
+          </span>
         ))}
       </div>
     </section>
@@ -65,7 +111,7 @@ function Stat({
 }) {
   return (
     <div className="rounded-lg border border-border/70 bg-bg-elevated/50 p-3">
-      <div className="text-[10px] uppercase tracking-wider text-text-secondary">{label}</div>
+      <div className="text-xs uppercase tracking-wider text-text-secondary">{label}</div>
       <div className={`mt-1 truncate text-sm font-semibold ${accent}`}>{value}</div>
     </div>
   );
@@ -74,22 +120,12 @@ function Stat({
 export default function EnrichmentPanel({
   enrichment,
   iocType,
-  onPivot,
 }: {
   enrichment: EnrichmentData;
   iocType?: string;
-  onPivot?: (value: string) => void;
 }) {
   const sections: [string, object][] = [];
   const extra = enrichment.extra ?? {};
-  const bitcoin =
-    extra.bitcoin && typeof extra.bitcoin === "object"
-      ? (extra.bitcoin as unknown as Record<string, unknown>)
-      : null;
-  const ethereum =
-    extra.ethereum && typeof extra.ethereum === "object"
-      ? extra.ethereum
-      : null;
 
   if (enrichment.dns) sections.push(["DNS records", enrichment.dns]);
   if (enrichment.ssl) sections.push(["SSL certificate", enrichment.ssl]);
@@ -104,17 +140,17 @@ export default function EnrichmentPanel({
     sections.push(["URL preview", enrichment.url_preview]);
   if (enrichment.redirect_chain?.length)
     sections.push(["Redirect chain", { chain: enrichment.redirect_chain }]);
-  if (bitcoin) sections.push(["Bitcoin wallet", bitcoin]);
-  const ethereumWallet: EthereumContext | null = ethereum;
-
-  const consumed = new Set(["bitcoin", "ethereum"]);
+  // The wallet dashboards for BTC and ETH live on the Investigation tab, so
+  // neither is repeated here as a card. `bitcoin` and `ethereum` therefore stay
+  // in `consumed` only so they are not double-registered as sections; they are
+  // rendered once below under "Indicator context" at full field depth.
+  const consumed = new Set<string>();
   const additional = Object.fromEntries(
     Object.entries(extra).filter(([key]) => !consumed.has(key))
   );
-  if (Object.keys(additional).length) sections.push(["Additional context", additional]);
+  if (Object.keys(additional).length) sections.push(["Indicator context", additional]);
 
   const geo = enrichment.geoip;
-  const wallet = bitcoin;
   const breach = enrichment.breach as Record<string, unknown> | undefined;
   const breachCount = typeof breach?.breach_count === "number" ? breach.breach_count : 0;
   const breachSource = typeof breach?.source === "string" ? breach.source : "None";
@@ -126,18 +162,45 @@ export default function EnrichmentPanel({
 
   const hasHostIntel = !!enrichment.host_intel || (enrichment.open_ports && enrichment.open_ports.length > 0);
   const hostingIps = Object.entries(enrichment.hosting_ip_intel ?? {});
+  const hasIdentityData = Boolean(
+    (breach && Object.keys(breach).length > 0) || (emailSec && Object.keys(emailSec).length > 0),
+  );
+  const status = parseCollectionStatus(enrichment);
+  const empty = isEnrichmentEmpty(enrichment);
+  const carded = keysRenderedByCards(enrichment);
+  // Anything a purpose-built card did not claim, rendered generically, so a
+  // module added on the backend is never silently invisible.
+  const uncarded = Object.fromEntries(
+    Object.entries(enrichment ?? {}).filter(
+      ([key, value]) =>
+        key !== "completeness" &&
+        !carded.has(key) &&
+        value !== null &&
+        value !== undefined &&
+        value !== "" &&
+        !(Array.isArray(value) && value.length === 0) &&
+        !(typeof value === "object" && !Array.isArray(value) && Object.keys(value as object).length === 0),
+    ),
+  );
 
   return (
     <div className="space-y-4">
       <div>
-        <div className="text-[10px] font-semibold uppercase tracking-[0.16em] text-accent">{contextLabel}</div>
+        <div className="text-xs font-semibold uppercase tracking-[0.16em] text-accent">{contextLabel}</div>
         <h3 className="mt-1 text-lg font-bold">Enrichment & OSINT Data</h3>
         <p className="mt-1 text-xs text-text-secondary">
-          Corroborating technical signals that augment the composite threat evaluation.
+          Corroborating technical signals that augment the composite threat evaluation. Everything the backend
+          collected is shown here at full depth; the Investigation tab carries only the decision-critical subset.
         </p>
       </div>
 
-      {/* Network Geo Metrics */}
+      {/* Collection status first: it is what explains everything below it. */}
+      <CollectionStatusPanel status={status} />
+
+      {enrichment.analysis_notes?.length ? (
+        <Section title="Analyst Notes" data={{ notes: enrichment.analysis_notes }} />
+      ) : null}
+
       {geo && (
         <div className="grid grid-cols-2 gap-2 sm:grid-cols-4">
           <Stat label="Country" value={geo.country || geo.country_code || "—"} />
@@ -151,6 +214,17 @@ export default function EnrichmentPanel({
       {enrichment.web_preview && (
         <WebPreviewCard preview={enrichment.web_preview} domainOrUrl={iocType} />
       )}
+
+      {/* Subdomain list. Previously only on the Investigation tab. */}
+      {enrichment.subdomains && (
+        <SubdomainsCard subdomainsData={enrichment.subdomains} />
+      )}
+
+      {/* Context indicator types (ASN routing, MITRE ATT&CK, host artifacts,
+          file hashes, filenames/paths, user-agents, MACs, fuzzy hashes). This
+          used to render on the Investigation tab; it lives here now so the two
+          tabs never show the same module. */}
+      <ContextIntelCard extra={enrichment.extra} />
 
       {/* 2. Infostealer Attack Surface (Hudson Rock) */}
       {enrichment.infostealer && (
@@ -178,7 +252,7 @@ export default function EnrichmentPanel({
             <h4 className="text-xs font-semibold uppercase tracking-[0.14em] text-accent">
               Hosting Infrastructure Pivot
             </h4>
-            <span className="text-[10px] text-text-secondary">Resolved A-Records Context</span>
+            <span className="text-xs text-text-secondary">Resolved A-Records Context</span>
           </div>
           <div className="grid grid-cols-1 sm:grid-cols-2 gap-2">
             {hostingIps.map(([ip, rawInfo]) => {
@@ -196,16 +270,16 @@ export default function EnrichmentPanel({
                   <div className="flex items-center justify-between font-bold">
                     <span className="text-text-primary">{ip}</span>
                     {isRiot ? (
-                      <span className="rounded-full bg-emerald-500/10 text-emerald-400 border border-emerald-500/30 px-2 py-0.2 text-[10px]">
+                      <span className="rounded-full bg-emerald-500/10 text-emerald-400 border border-emerald-500/30 px-2 py-0.2 text-xs">
                         RIOT (Known Good CDN)
                       </span>
                     ) : isDatacenter ? (
-                      <span className="rounded-full bg-purple-500/10 text-purple-400 border border-purple-500/30 px-2 py-0.2 text-[10px]">
+                      <span className="rounded-full bg-purple-500/10 text-purple-400 border border-purple-500/30 px-2 py-0.2 text-xs">
                         Datacenter IP
                       </span>
                     ) : null}
                   </div>
-                  <div className="text-[11px] text-text-secondary">
+                  <div className="text-xs text-text-secondary">
                     {isRiot ? (
                       <span>Provider: <strong className="text-emerald-300">{riotName}</strong></span>
                     ) : org ? (
@@ -228,12 +302,12 @@ export default function EnrichmentPanel({
             <h4 className="text-xs font-semibold uppercase tracking-[0.14em] text-accent">
               Associated Malware & C2 Indicators
             </h4>
-            <span className="text-[10px] text-text-secondary">AlienVault OTX Correlated</span>
+            <span className="text-xs text-text-secondary">AlienVault OTX Correlated</span>
           </div>
 
           {enrichment.malware_urls && enrichment.malware_urls.length > 0 && (
             <div className="space-y-1">
-              <span className="text-[11px] font-semibold text-red-400 block">
+              <span className="text-xs font-semibold text-red-400 block">
                 Malicious URLs on Host ({enrichment.malware_urls.length})
               </span>
               <div className="max-h-32 overflow-y-auto space-y-1 font-mono text-xs">
@@ -248,12 +322,12 @@ export default function EnrichmentPanel({
 
           {enrichment.associated_hashes && enrichment.associated_hashes.length > 0 && (
             <div className="space-y-1 pt-2">
-              <span className="text-[11px] font-semibold text-amber-400 block">
+              <span className="text-xs font-semibold text-amber-400 block">
                 Associated Malware Hashes ({enrichment.associated_hashes.length})
               </span>
               <div className="flex flex-wrap gap-1 font-mono text-xs">
                 {enrichment.associated_hashes.map((h, i) => (
-                  <span key={i} className="rounded bg-bg-elevated px-2 py-0.5 text-[11px] border border-border/50 text-text-secondary">
+                  <span key={i} className="rounded bg-bg-elevated px-2 py-0.5 text-xs border border-border/50 text-text-secondary">
                     {h.slice(0, 16)}...
                   </span>
                 ))}
@@ -263,10 +337,15 @@ export default function EnrichmentPanel({
         </section>
       )}
 
-      {/* Identity & Breach Exposure Highlight */}
-      {(breach || emailSec || iocType === "email" || iocType === "password" || iocType === "username") && (
+      {/* Identity & Breach Exposure Highlight.
+          Gated strictly on the presence of breach/email data. It used to also
+          fire on `iocType === "email" | "phone"`, which rendered an all-zero
+          panel (Breach Count 0, Source "None", SPF "Unavailable") for any phone
+          lookup even though the backend collects no breach data for phone at
+          all. A row of zeroes reads as a finding, which is worse than absence. */}
+      {hasIdentityData && (
         <div className="rounded-xl border border-red-500/20 bg-red-950/10 p-3.5">
-          <div className="mb-2 text-[10px] font-bold uppercase tracking-wider text-red-400">
+          <div className="mb-2 text-xs font-bold uppercase tracking-wider text-red-400">
             Identity & Credential Exposure Summary
           </div>
           <div className="grid grid-cols-2 gap-2 sm:grid-cols-4">
@@ -292,16 +371,6 @@ export default function EnrichmentPanel({
         </div>
       )}
 
-      {/* Wallet Metrics */}
-      {wallet && (
-        <div className="grid grid-cols-2 gap-2 sm:grid-cols-4">
-          <Stat label="Balance" value={String(wallet.balance_btc ?? wallet.balance_eth ?? "—")} />
-          <Stat label="Transactions" value={String(wallet.transaction_count ?? wallet.n_tx ?? "—")} />
-          <Stat label="Total received" value={String(wallet.total_received_btc ?? "—")} />
-          <Stat label="Total sent" value={String(wallet.total_sent_btc ?? "—")} />
-        </div>
-      )}
-
       {/* WHOIS section with Data Provenance Badge */}
       {enrichment.whois && (
         <Section
@@ -317,26 +386,21 @@ export default function EnrichmentPanel({
         />
       )}
 
-      {/* Remaining Standard Sections */}
-      {ethereumWallet && (
-        <EthereumWalletCard wallet={ethereumWallet} onPivot={onPivot} />
-      )}
-
       {sections.map(([title, data]) => (
         <Section key={title} title={title} data={data} />
       ))}
 
-      {Object.keys(enrichment.completeness ?? {}).length > 0 && (
-        <Section title="Collection Completeness Audit" data={enrichment.completeness} />
+      {/* Anything the purpose-built cards above did not claim, rendered in
+          depth. This is what keeps a newly added backend module from being
+          invisible in the UI. */}
+      {Object.keys(uncarded).length > 0 && (
+        <Section title="All Other Collected Data" data={uncarded} />
       )}
 
-      {enrichment.analysis_notes?.length ? (
-        <Section title="Analyst Notes" data={{ notes: enrichment.analysis_notes }} />
-      ) : null}
-
-      {sections.length === 0 && !enrichment.whois && !hasHostIntel && !enrichment.web_preview && !enrichment.infostealer && (
-        <div className="rounded-xl border border-border bg-bg-card p-8 text-center text-sm text-text-secondary">
-          No enrichment data available for this IOC.
+      {empty && (
+        <div className="rounded-xl border border-border bg-bg-card p-6 text-center">
+          <div className="text-sm font-semibold text-text-primary">No enrichment data for this indicator</div>
+          <p className="mx-auto mt-2 max-w-xl text-xs text-text-secondary">{describeEmptyState(enrichment, iocType)}</p>
         </div>
       )}
     </div>

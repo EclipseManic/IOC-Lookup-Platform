@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from "react";
+﻿import { useEffect, useMemo, useState } from "react";
 import type {
   CVEInfo,
   EvidenceObservation,
@@ -7,6 +7,7 @@ import type {
   ProviderHealth,
 } from "../services/api";
 import { TagList } from "./Tag";
+import PayloadFields from "./PayloadFields";
 import VerdictBadge from "./VerdictBadge";
 import { domainLabel, isCredentialDomain } from "../lib/assessmentView";
 import { formatDateTime, formatDuration, formatValue as formatDisplayValue } from "../lib/format";
@@ -146,7 +147,7 @@ function CopyButton({ value }: { value: string }) {
         setCopied(true);
         window.setTimeout(() => setCopied(false), 1200);
       }}
-      className="shrink-0 text-[11px] text-text-secondary hover:text-accent"
+      className="shrink-0 text-xs text-text-secondary hover:text-accent"
       aria-label="Copy IOC value"
       title="Copy full value"
     >
@@ -164,10 +165,10 @@ function Metric({ label: metricLabel, value, detail, percent, tone = "unknown" }
 }) {
   return (
     <div className="min-w-0 rounded-md border border-border bg-bg-elevated/60 p-2.5">
-      <div className="text-[10px] uppercase tracking-wider text-text-secondary">{metricLabel}</div>
+      <div className="text-xs uppercase tracking-wider text-text-secondary">{metricLabel}</div>
       <div className="mt-0.5 flex items-baseline justify-between gap-2">
         <span className="text-sm font-semibold text-text-primary">{value}</span>
-        {detail && <span className="truncate text-[10px] text-text-secondary">{detail}</span>}
+        {detail && <span className="truncate text-xs text-text-secondary">{detail}</span>}
       </div>
       {percent != null && (
         <div className="mt-1.5 h-1.5 overflow-hidden rounded-full bg-bg-card" aria-label={`${metricLabel} ${percent}%`}>
@@ -241,8 +242,8 @@ function CveRecordPanel({ cve, results }: { cve?: CVEInfo; results: NormalizedRe
 
   return (
     <section className="border-y border-amber-500/30 bg-amber-500/5 px-4 py-3">
-      <div className="flex flex-wrap items-center justify-between gap-2"><div><div className="text-[10px] font-semibold uppercase tracking-wider text-amber-300">Vulnerability record</div><div className="mt-0.5 text-sm font-semibold text-text-primary">{severity ? `${severity} Vulnerability` : "CVE security record"}</div></div>{kev && <span className="rounded-full border border-red-500/40 bg-red-500/10 px-2 py-0.5 text-[10px] font-semibold uppercase text-red-300">CISA KEV / exploitation signal</span>}</div>
-      <div className="mt-3 grid grid-cols-2 gap-2 text-xs sm:grid-cols-4"><div><div className="text-[10px] uppercase text-text-secondary">CVSS</div><div className="mt-0.5 font-mono text-base text-text-primary">{score != null ? score.toFixed(1) : "—"}</div></div><div><div className="text-[10px] uppercase text-text-secondary">EPSS</div><div className="mt-0.5 font-mono text-text-primary">{cve?.epss_score != null ? `${(cve.epss_score * 100).toFixed(1)}%` : "—"}</div></div><div><div className="text-[10px] uppercase text-text-secondary">CWE</div><div className="mt-0.5 text-text-primary">{cwes.length ? cwes.slice(0, 3).join(", ") : "—"}</div></div><div><div className="text-[10px] uppercase text-text-secondary">Exploit status</div><div className="mt-0.5 text-text-primary">{kev || cve?.public_exploits_exist || cve?.poc_available ? "Reported" : "No signal found"}</div></div></div>
+      <div className="flex flex-wrap items-center justify-between gap-2"><div><div className="text-xs font-semibold uppercase tracking-wider text-amber-300">Vulnerability record</div><div className="mt-0.5 text-sm font-semibold text-text-primary">{severity ? `${severity} Vulnerability` : "CVE security record"}</div></div>{kev && <span className="rounded-full border border-red-500/40 bg-red-500/10 px-2 py-0.5 text-xs font-semibold uppercase text-red-300">CISA KEV / exploitation signal</span>}</div>
+      <div className="mt-3 grid grid-cols-2 gap-2 text-xs sm:grid-cols-4"><div><div className="text-xs uppercase text-text-secondary">CVSS</div><div className="mt-0.5 font-mono text-base text-text-primary">{score != null ? score.toFixed(1) : "—"}</div></div><div><div className="text-xs uppercase text-text-secondary">EPSS</div><div className="mt-0.5 font-mono text-text-primary">{cve?.epss_score != null ? `${(cve.epss_score * 100).toFixed(1)}%` : "—"}</div></div><div><div className="text-xs uppercase text-text-secondary">CWE</div><div className="mt-0.5 text-text-primary">{cwes.length ? cwes.slice(0, 3).join(", ") : "—"}</div></div><div><div className="text-xs uppercase text-text-secondary">Exploit status</div><div className="mt-0.5 text-text-primary">{kev || cve?.public_exploits_exist || cve?.poc_available ? "Reported" : "No signal found"}</div></div></div>
       {(affected.length > 0 || references.length > 0 || cve?.cvss_vector) && <div className="mt-3 space-y-1 text-xs text-text-secondary">{affected.length > 0 && <div><span className="text-text-primary">Affected products: </span>{affected.slice(0, 5).join(", ")}{affected.length > 5 ? ` +${affected.length - 5} more` : ""}</div>}{cve?.cvss_vector && <div><span className="text-text-primary">Vector: </span><span className="break-all font-mono">{cve.cvss_vector}</span></div>}{references.length > 0 && <div><span className="text-text-primary">References: </span>{references.length}</div>}</div>}
     </section>
   );
@@ -263,49 +264,54 @@ function ProviderEvidence({ result, observation }: { result?: NormalizedResult; 
       <div className="flex flex-wrap items-center justify-between gap-2">
         <div className="flex min-w-0 items-center gap-2">
           <span className="truncate text-sm font-semibold">{source}</span>
-          <span className={`rounded-full border px-2 py-0.5 text-[10px] font-semibold uppercase ${stateClass(state)}`}>{label(state)}</span>
+          <span className={`rounded-full border px-2 py-0.5 text-xs font-semibold uppercase ${stateClass(state)}`}>{label(state)}</span>
         </div>
-        <span className="text-[11px] text-text-secondary">{evidenceLabel(observation, result)}</span>
+        <span className="text-xs text-text-secondary">{evidenceLabel(observation, result)}</span>
       </div>
 
       <div className="mt-3 grid grid-cols-1 gap-2 sm:grid-cols-2 lg:grid-cols-3">
         <div className="rounded border border-border/70 bg-bg-elevated/40 p-2">
-          <div className="text-[10px] uppercase tracking-wider text-text-secondary">Execution Status</div>
+          <div className="text-xs uppercase tracking-wider text-text-secondary">Execution Status</div>
           <div className="mt-1 text-xs text-text-primary">{label(state)}</div>
         </div>
         <div className="rounded border border-border/70 bg-bg-elevated/40 p-2">
-          <div className="text-[10px] uppercase tracking-wider text-text-secondary">Assessment</div>
+          <div className="text-xs uppercase tracking-wider text-text-secondary">Assessment</div>
           <div className="mt-1 text-xs text-text-primary">Provider: {label(providerVerdict)} · normalized: {label(normalizedVerdict)}</div>
         </div>
         <div className="rounded border border-border/70 bg-bg-elevated/40 p-2">
-          <div className="text-[10px] uppercase tracking-wider text-text-secondary">Evidence</div>
+          <div className="text-xs uppercase tracking-wider text-text-secondary">Evidence</div>
           <div className="mt-1 text-xs text-text-primary">{evidenceLabel(observation, result)}{observation?.contribution && observation.contribution !== "neutral" ? ` · ${observation.contribution.replace(/_/g, " ")}` : ""}</div>
         </div>
         <div className="rounded border border-border/70 bg-bg-elevated/40 p-2">
-          <div className="text-[10px] uppercase tracking-wider text-text-secondary">Key Metadata</div>
+          <div className="text-xs uppercase tracking-wider text-text-secondary">Key Metadata</div>
           {metadata.length > 0 ? <div className="mt-1 space-y-0.5 text-xs text-text-primary">{metadata.map(([key, value]) => <div key={key} className="break-words"><span className="text-text-secondary">{key}: </span>{value}</div>)}</div> : <div className="mt-1 text-xs text-text-secondary">No provider-specific fields</div>}
         </div>
         <div className="rounded border border-border/70 bg-bg-elevated/40 p-2">
-          <div className="text-[10px] uppercase tracking-wider text-text-secondary">Timestamp</div>
+          <div className="text-xs uppercase tracking-wider text-text-secondary">Timestamp</div>
           <div className="mt-1 text-xs text-text-primary">{result?.source_timestamp || observation?.source_timestamp ? `Source ${formatDateTime(result?.source_timestamp ?? observation?.source_timestamp)}` : "Source time unavailable"}</div>
-          <div className="mt-0.5 text-[10px] text-text-secondary">{result?.observed_at || observation?.observed_at ? `retrieved ${formatDateTime(result?.observed_at ?? observation?.observed_at)}` : "retrieval time unavailable"}</div>
+          <div className="mt-0.5 text-xs text-text-secondary">{result?.observed_at || observation?.observed_at ? `retrieved ${formatDateTime(result?.observed_at ?? observation?.observed_at)}` : "retrieval time unavailable"}</div>
         </div>
         <div className="rounded border border-border/70 bg-bg-elevated/40 p-2">
-          <div className="text-[10px] uppercase tracking-wider text-text-secondary">Freshness / Cache</div>
+          <div className="text-xs uppercase tracking-wider text-text-secondary">Freshness / Cache</div>
           <div className="mt-1 text-xs text-text-primary">{cacheLabel(result, observation)}</div>
-          <div className="mt-0.5 text-[10px] text-text-secondary">{result?.latency_ms != null ? formatDuration(result.latency_ms) : "latency unavailable"}{(result?.retry_count ?? observation?.metadata?.retry_count ?? 0) ? ` · ${result?.retry_count ?? observation?.metadata?.retry_count} retries` : ""}</div>
+          <div className="mt-0.5 text-xs text-text-secondary">{result?.latency_ms != null ? formatDuration(result.latency_ms) : "latency unavailable"}{(result?.retry_count ?? observation?.metadata?.retry_count ?? 0) ? ` · ${result?.retry_count ?? observation?.metadata?.retry_count} retries` : ""}</div>
         </div>
       </div>
 
       {(result?.provider_summary || observation?.reason) && <p className="mt-3 rounded border border-accent/20 bg-accent/5 px-2.5 py-2 text-xs text-text-primary"><span className="font-semibold text-accent">Provider finding: </span>{result?.provider_summary || observation?.reason}</p>}
       {errorDetails.length > 0 && <div className="mt-2 rounded border border-rose-500/25 bg-rose-500/5 p-2 text-xs text-rose-200"><span className="font-semibold">Provider problem: </span>{errorDetails.join(" · ")}</div>}
       {chips.length > 0 && <div className="mt-2"><TagList labels={chips} max={6} /></div>}
-      {nestedEvidence.length > 0 && <details className="mt-2 rounded border border-violet-500/25 bg-violet-500/5 p-2 text-xs"><summary className="cursor-pointer font-semibold text-violet-300">Nested vendor evidence ({nestedEvidence.length})</summary><div className="mt-2 space-y-1.5">{nestedEvidence.map((item, index) => { const details = item.details && typeof item.details === "object" ? item.details : undefined; return <div key={String(item.evidence_id ?? item.evidence_hash ?? index)} className="rounded border border-border/70 bg-bg-elevated/50 p-2"><div className="flex flex-wrap items-center justify-between gap-2"><span className="font-semibold text-text-primary">{String(item.source ?? item.provider ?? "Nested source")}</span><span className="text-[10px] uppercase text-text-secondary">{String(item.evidence_class ?? "metadata")} · {String(item.confidence ?? "low")}</span></div><p className="mt-0.5 text-text-secondary">{String(item.reason ?? "Nested provider evidence preserved for audit.")}</p>{details && <details className="mt-1"><summary className="cursor-pointer text-accent">Details</summary><pre className="mt-1 max-h-32 overflow-auto whitespace-pre-wrap break-all rounded bg-bg-elevated p-1.5 text-[10px] text-text-secondary">{JSON.stringify(details, null, 2)}</pre></details>}</div>; })}</div></details>}
+      {nestedEvidence.length > 0 && <details className="mt-2 rounded border border-violet-500/25 bg-violet-500/5 p-2 text-xs"><summary className="cursor-pointer font-semibold text-violet-300">Nested vendor evidence ({nestedEvidence.length})</summary><div className="mt-2 space-y-1.5">{nestedEvidence.map((item, index) => { const details = item.details && typeof item.details === "object" ? item.details : undefined; return <div key={String(item.evidence_id ?? item.evidence_hash ?? index)} className="rounded border border-border/70 bg-bg-elevated/50 p-2"><div className="flex flex-wrap items-center justify-between gap-2"><span className="font-semibold text-text-primary">{String(item.source ?? item.provider ?? "Nested source")}</span><span className="text-xs uppercase text-text-secondary">{String(item.evidence_class ?? "metadata")} · {String(item.confidence ?? "low")}</span></div><p className="mt-0.5 text-text-secondary">{String(item.reason ?? "Nested provider evidence preserved for audit.")}</p>{details && <details className="mt-1"><summary className="cursor-pointer text-accent">Details</summary><pre className="mt-1 max-h-32 overflow-auto whitespace-pre-wrap break-all rounded bg-bg-elevated p-1.5 text-xs text-text-secondary">{JSON.stringify(details, null, 2)}</pre></details>}</div>; })}</div></details>}
       {result?.raw_data && Object.keys(result.raw_data).length > 0 && (
-        <details className="mt-2 text-xs">
-          <summary className="cursor-pointer text-accent">Raw technical data</summary>
-          <pre className="mt-2 max-h-56 overflow-auto whitespace-pre-wrap break-all rounded bg-bg-elevated p-2 text-[11px] text-text-secondary">{JSON.stringify(result.raw_data, null, 2)}</pre>
-        </details>
+        <>
+          <div className="mt-2 rounded border border-border/70 bg-bg-elevated/40 p-2.5">
+            <PayloadFields raw={result.raw_data} />
+          </div>
+          <details className="mt-2 text-xs">
+            <summary className="cursor-pointer text-accent">Raw JSON payload</summary>
+            <pre className="mt-2 max-h-56 overflow-auto whitespace-pre-wrap break-all rounded bg-bg-elevated p-2 text-xs text-text-secondary">{JSON.stringify(result.raw_data, null, 2)}</pre>
+          </details>
+        </>
       )}
     </article>
   );
@@ -324,7 +330,7 @@ function EvidenceCategory({ title, description, observations, results, tone, ope
     <details className="rounded-lg border border-border bg-bg-secondary/40" open={open}>
       <summary className="flex list-none items-center justify-between gap-3 px-3 py-2.5">
         <span className="flex min-w-0 items-center gap-2"><span className={`h-2 w-2 shrink-0 rounded-full ${tone === "malicious" ? "bg-red-400" : tone === "suspicious" ? "bg-amber-400" : tone === "clean" ? "bg-green-400" : "bg-gray-400"}`} /><span className="text-sm font-semibold">{title}</span><span className="text-xs text-text-secondary">{observations.length}</span></span>
-        <span className="text-[11px] text-text-secondary">{description}</span>
+        <span className="text-xs text-text-secondary">{description}</span>
       </summary>
       <div className="space-y-2 border-t border-border p-3">
         {observations.length === 0 ? <p className="text-xs text-text-secondary">None recorded.</p> : observations.map((observation) => <ProviderEvidence key={observation.source} observation={observation} result={resultBySource.get(observation.source)} />)}
@@ -387,11 +393,11 @@ export default function IocAssessmentCard({
       <div className="w-full p-4 text-left">
         <div className="flex flex-wrap items-start justify-between gap-3">
           <div className="min-w-0 flex-1">
-            <div className="mb-1 flex flex-wrap items-center gap-2 text-[10px] uppercase tracking-wider text-text-secondary"><span>{label(assessment.ioc_type)}</span><span>·</span><span>{status.value}</span></div>
-            <div className="mt-1 text-[10px] uppercase tracking-wider text-text-secondary">Assessment domain: {domainLabel(domain)}</div>
+            <div className="mb-1 flex flex-wrap items-center gap-2 text-xs uppercase tracking-wider text-text-secondary"><span>{label(assessment.ioc_type)}</span><span>·</span><span>{status.value}</span></div>
+            <div className="mt-1 text-xs uppercase tracking-wider text-text-secondary">Assessment domain: {domainLabel(domain)}</div>
             <div className="flex min-w-0 items-center gap-2"><span className="truncate font-mono text-sm sm:text-base" title={displayIoc}>{displayIoc}</span><CopyButton value={displayIoc} /></div>
           </div>
-          <div className="flex shrink-0 items-center gap-2"><VerdictBadge verdict={assessment.final_verdict} size="md" label={label(assessment.final_verdict)} /><span className={`rounded-full border px-2 py-0.5 text-[10px] font-semibold uppercase ${toneClass(status.tone)}`}>{status.value}</span><button type="button" onClick={() => setExpanded((value) => !value)} aria-expanded={expanded} className="text-text-secondary hover:text-text-primary">{expanded ? "Collapse" : "Expand"}</button></div>
+          <div className="flex shrink-0 items-center gap-2"><VerdictBadge verdict={assessment.final_verdict} size="md" label={label(assessment.final_verdict)} /><span className={`rounded-full border px-2 py-0.5 text-xs font-semibold uppercase ${toneClass(status.tone)}`}>{status.value}</span><button type="button" onClick={() => setExpanded((value) => !value)} aria-expanded={expanded} className="text-text-secondary hover:text-text-primary">{expanded ? "Collapse" : "Expand"}</button></div>
         </div>
         <div className="mt-3 grid grid-cols-2 gap-2 md:grid-cols-4">
           <Metric label={scoreLabel} value={scoreless ? "Not scored" : `${Math.round(score)}/100`} percent={scoreless ? undefined : score} tone={verdictTone} />
@@ -399,7 +405,7 @@ export default function IocAssessmentCard({
           <Metric label="Evidence quality" value={`${Math.round((Number(assessment.evidence_strength) || 0) * 100)}%`} percent={(Number(assessment.evidence_strength) || 0) * 100} tone={(Number(assessment.evidence_strength) || 0) >= 0.7 ? "clean" : "unknown"} />
           <Metric label="Provider coverage" value={expected ? `${evaluated}/${expected}` : "No providers"} detail={expected ? `${Math.round((Number(assessment.coverage) || 0) * 100)}%` : undefined} percent={expected ? (Number(assessment.coverage) || 0) * 100 : undefined} tone={(Number(assessment.coverage) || 0) >= 0.8 ? "clean" : "suspicious"} />
         </div>
-        <div className="mt-2 flex flex-wrap items-center gap-x-3 gap-y-1 text-[11px] text-text-secondary"><span>{status.detail}</span>{assessment.needs_review && <span className="font-semibold text-amber-300">Needs analyst review</span>}{assessment.freshness && <span>Freshness: {label(assessment.freshness)}</span>}{assessment.cache_status && <span>Evidence: {label(assessment.cache_status)}</span>}</div>
+        <div className="mt-2 flex flex-wrap items-center gap-x-3 gap-y-1 text-xs text-text-secondary"><span>{status.detail}</span>{assessment.needs_review && <span className="font-semibold text-amber-300">Needs analyst review</span>}{assessment.freshness && <span>Freshness: {label(assessment.freshness)}</span>}{assessment.cache_status && <span>Evidence: {label(assessment.cache_status)}</span>}</div>
         {onOpen && <button type="button" onClick={(event) => { event.stopPropagation(); onOpen(); }} className="mt-3 rounded-md border border-accent/40 bg-accent/10 px-3 py-1.5 text-xs font-semibold text-accent transition-colors hover:bg-accent/20">Open full IOC analysis</button>}
       </div>
 
@@ -408,9 +414,9 @@ export default function IocAssessmentCard({
       {expanded && (
         <div className="space-y-3 border-t border-border p-4">
           <section className={`rounded-lg border p-3 ${toneClass(verdictTone)}`}>
-            <div className="text-[10px] font-semibold uppercase tracking-wider opacity-80">Why this verdict?</div>
+            <div className="text-xs font-semibold uppercase tracking-wider opacity-80">Why this verdict?</div>
             <p className="mt-1 text-sm leading-relaxed text-text-primary">{assessment.reason}</p>
-            <div className="mt-2 flex flex-wrap gap-2 text-[11px]"><span>{positive} positive</span>{exposureCount > 0 && <span>{exposureCount} exposure / related</span>}<span>{negativeCount} negative</span><span>{context.length} context</span><span>{notFound.length} not found</span><span>{health.length} provider problem{health.length === 1 ? "" : "s"}</span></div>
+            <div className="mt-2 flex flex-wrap gap-2 text-xs"><span>{positive} positive</span>{exposureCount > 0 && <span>{exposureCount} exposure / related</span>}<span>{negativeCount} negative</span><span>{context.length} context</span><span>{notFound.length} not found</span><span>{health.length} provider problem{health.length === 1 ? "" : "s"}</span></div>
             {assessment.review_reasons && assessment.review_reasons.length > 0 && <ul className="mt-2 list-disc space-y-0.5 pl-4 text-xs text-amber-200">{assessment.review_reasons.map((reason) => <li key={reason}>{reason}</li>)}</ul>}
           </section>
 
@@ -419,7 +425,7 @@ export default function IocAssessmentCard({
             {context.length > 0 && <EvidenceCategory title="Context / Enrichment" description="infrastructure, ownership, services; does not score" observations={context} results={results} tone="unknown" />}
             {notFound.length > 0 && <EvidenceCategory title="Not Found" description="no record; not proof of benignness" observations={notFound} results={results} tone="unknown" />}
             {health.length > 0 && <EvidenceCategory title="Provider Problems" description="could not answer; excluded from scoring" observations={health} results={results} tone="health" />}
-            {domain === "attack_technique" && Array.isArray(assessment.techniques) && assessment.techniques.length > 0 && <section className="rounded-lg border border-violet-500/30 bg-violet-500/5 p-3 text-sm"><div className="text-[10px] font-semibold uppercase tracking-wider text-violet-300">ATT&amp;CK technique metadata</div><div className="mt-2 space-y-1 text-xs text-text-secondary">{assessment.techniques.map((item, index) => <div key={index}>{formatValue(item)}</div>)}</div></section>}
+            {domain === "attack_technique" && Array.isArray(assessment.techniques) && assessment.techniques.length > 0 && <section className="rounded-lg border border-violet-500/30 bg-violet-500/5 p-3 text-sm"><div className="text-xs font-semibold uppercase tracking-wider text-violet-300">ATT&amp;CK technique metadata</div><div className="mt-2 space-y-1 text-xs text-text-secondary">{assessment.techniques.map((item, index) => <div key={index}>{formatValue(item)}</div>)}</div></section>}
           </div>
 
           {(assessment.provider_health ?? []).length > 0 && <section className="rounded-lg border border-border bg-bg-secondary/40 p-3"><div className="mb-2 text-xs font-semibold uppercase tracking-wider text-text-secondary">Provider health telemetry</div><div className="space-y-1.5">{assessment.provider_health.map((item) => <HealthRow key={item.source} item={item} />)}</div></section>}

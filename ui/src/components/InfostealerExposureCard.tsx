@@ -1,4 +1,4 @@
-import type { InfostealerIntel } from "../services/api";
+﻿import type { InfostealerIntel } from "../services/api";
 
 interface InfostealerExposureCardProps {
   infostealer?: InfostealerIntel;
@@ -40,7 +40,7 @@ export default function InfostealerExposureCard({
             Infostealer Attack Surface
           </h4>
         </div>
-        <span className="text-[10px] text-text-secondary bg-bg-elevated px-2 py-0.5 rounded border border-border/60">
+        <span className="text-xs text-text-secondary bg-bg-elevated px-2 py-0.5 rounded border border-border/60">
           Hudson Rock Cavalier Intelligence
         </span>
       </div>
@@ -58,7 +58,7 @@ export default function InfostealerExposureCard({
             {isCompromised ? "Compromised Credentials Detected" : "No Active Compromises Observed"}
           </span>
           {date_range && (
-            <span className="text-[10px] text-text-secondary opacity-80">
+            <span className="text-xs text-text-secondary opacity-80">
               Active window: {date_range}
             </span>
           )}
@@ -73,7 +73,7 @@ export default function InfostealerExposureCard({
       {/* Dual Metrics */}
       <div className="grid grid-cols-2 gap-2 sm:grid-cols-4">
         <div className="rounded-lg border border-border/70 bg-bg-elevated/50 p-3">
-          <div className="text-[10px] uppercase tracking-wider text-text-secondary">
+          <div className="text-xs uppercase tracking-wider text-text-secondary">
             Employee Compromises
           </div>
           <div
@@ -86,7 +86,7 @@ export default function InfostealerExposureCard({
         </div>
 
         <div className="rounded-lg border border-border/70 bg-bg-elevated/50 p-3">
-          <div className="text-[10px] uppercase tracking-wider text-text-secondary">
+          <div className="text-xs uppercase tracking-wider text-text-secondary">
             Client/User Compromises
           </div>
           <div
@@ -100,7 +100,7 @@ export default function InfostealerExposureCard({
 
         {total_compromised_urls !== undefined && (
           <div className="rounded-lg border border-border/70 bg-bg-elevated/50 p-3">
-            <div className="text-[10px] uppercase tracking-wider text-text-secondary">
+            <div className="text-xs uppercase tracking-wider text-text-secondary">
               Compromised URLs
             </div>
             <div className="mt-1 text-base font-bold text-text-primary">
@@ -111,7 +111,7 @@ export default function InfostealerExposureCard({
 
         {(password_strength_weak_pct !== undefined || password_strength_strong_pct !== undefined) && (
           <div className="rounded-lg border border-border/70 bg-bg-elevated/50 p-3">
-            <div className="text-[10px] uppercase tracking-wider text-text-secondary">
+            <div className="text-xs uppercase tracking-wider text-text-secondary">
               Password Hygiene
             </div>
             <div className="mt-1 text-xs font-semibold">
@@ -137,7 +137,7 @@ export default function InfostealerExposureCard({
               >
                 <span className="h-1.5 w-1.5 rounded-full bg-red-400"></span>
                 <span className="font-semibold text-text-primary">{family}</span>
-                <span className="rounded bg-red-950/40 px-1.5 py-0.2 text-[10px] font-mono text-red-300">
+                <span className="rounded bg-red-950/40 px-1.5 py-0.2 text-xs font-mono text-red-300">
                   {count}
                 </span>
               </div>
@@ -158,7 +158,7 @@ export default function InfostealerExposureCard({
                 key={svc}
                 className="inline-flex items-center gap-1 rounded bg-bg-elevated px-2 py-0.5 text-xs font-mono text-text-primary border border-border/60"
               >
-                <span className="text-accent">🔒</span> {svc}
+                <span className="text-accent">ðŸ”’</span> {svc}
               </span>
             ))}
           </div>
@@ -171,7 +171,7 @@ export default function InfostealerExposureCard({
           <div className="mb-1.5 text-xs font-semibold text-text-secondary">
             Compromised External Integrations
           </div>
-          <div className="flex flex-wrap gap-1 text-[11px] font-mono text-text-secondary">
+          <div className="flex flex-wrap gap-1 text-xs font-mono text-text-secondary">
             {top_external_services.map((svc) => (
               <span key={svc} className="rounded bg-bg-elevated/60 px-1.5 py-0.5">
                 {svc}

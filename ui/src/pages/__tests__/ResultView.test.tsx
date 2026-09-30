@@ -1,6 +1,7 @@
 import { fireEvent, render, screen, within } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import btcFixture from "../../__fixtures__/btc-address.json";
+import ethFixture from "../../__fixtures__/eth-address.json";
 import cveFixture from "../../__fixtures__/cve-2021-44228.json";
 import emailFixture from "../../__fixtures__/email-test.json";
 import ipFixture from "../../__fixtures__/ip-8.8.8.8.json";
@@ -12,6 +13,7 @@ const FIXTURES: [string, unknown][] = [
   ["cve", cveFixture],
   ["email", emailFixture],
   ["btc", btcFixture],
+  ["eth", ethFixture],
 ];
 
 function renderResult(fixture: unknown, onNewSearch = vi.fn()) {
@@ -75,5 +77,73 @@ describe("ResultView", () => {
     renderResult(ipFixture, onNewSearch);
     fireEvent.click(screen.getAllByRole("button", { name: /re-scan/i })[0]);
     expect(onNewSearch).toHaveBeenCalledWith("8.8.8.8", "ipv4", true);
+  });
+
+  it("shows no enrichment module on the Investigation tab", () => {
+    // Investigation is the verdict and provider evidence only. Every enrichment
+    // card used to be mounted here as well as on the Enrichment tab, so the
+    // same data appeared twice.
+    const { container } = renderResult(ipFixture);
+    const panel = container.querySelector("#result-panel") as HTMLElement;
+    const text = panel.textContent ?? "";
+
+    expect(screen.getByRole("region", { name: "Provider findings" })).toBeTruthy();
+    for (const marker of [
+      /Network & Routing Context/,
+      /Host Attack Surface/i,
+      /Abuse Reports/i,
+      /Enrichment & OSINT Data/,
+      /Collection status/,
+    ]) {
+      expect(text).not.toMatch(marker);
+    }
+  });
+
+  it("moves every enrichment module onto the Enrichment tab", () => {
+    const { container } = renderResult(ipFixture);
+    fireEvent.click(screen.getByRole("tab", { name: /Enrichment/i }));
+    const panel = container.querySelector("#result-panel") as HTMLElement;
+    const text = panel.textContent ?? "";
+
+    // The IP lookup that used to render geo + host vulns on Investigation.
+    expect(text).toMatch(/Enrichment & OSINT Data/);
+    expect(text).toMatch(/Collection status/);
+    expect(screen.queryByRole("region", { name: "Provider findings" })).toBeNull();
+  });
+
+  it("lays provider findings out in a multi-column grid", () => {
+    const { container } = renderResult(ipFixture);
+    const findings = screen.getByRole("region", { name: "Provider findings" });
+    const grid = findings.querySelector(".grid") as HTMLElement;
+    expect(grid.className).toMatch(/md:grid-cols-2/);
+    expect(grid.className).toMatch(/2xl:grid-cols-3/);
+    expect(container.querySelector("#result-panel")).toBeTruthy();
+  });
+
+  it("puts the Bitcoin dashboard on the Investigation tab", () => {
+    const { container } = renderResult(btcFixture);
+    const panel = container.querySelector("#result-panel") as HTMLElement;
+    expect(panel.textContent).toMatch(/On-chain wallet activity/);
+    expect(screen.getByRole("region", { name: "Provider findings" })).toBeTruthy();
+  });
+
+  it("puts the Ethereum dashboard on the Investigation tab too", () => {
+    // Consistency: BTC and ETH are the same kind of indicator and get the same
+    // treatment. Leaving the ETH card on Enrichment only was an oversight from
+    // the tab split.
+    const { container } = renderResult(ethFixture);
+    const panel = container.querySelector("#result-panel") as HTMLElement;
+    expect(panel.textContent).not.toMatch(/Enrichment & OSINT Data/);
+    expect(panel.textContent).toMatch(/0x742d35Cc6634C0532925a3b844Bc454e4438f44e/);
+    expect(screen.getByRole("region", { name: "Provider findings" })).toBeTruthy();
+  });
+
+  it("does not repeat the wallet dashboards on the Enrichment tab", () => {
+    const { container } = renderResult(btcFixture);
+    fireEvent.click(screen.getByRole("tab", { name: /Enrichment/i }));
+    const panel = container.querySelector("#result-panel") as HTMLElement;
+    // The dashboard belongs to Investigation; Enrichment carries the depth.
+    expect(panel.textContent).not.toMatch(/On-chain wallet activity/);
+    expect(panel.textContent).toMatch(/Enrichment & OSINT Data/);
   });
 });

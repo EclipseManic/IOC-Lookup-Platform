@@ -245,12 +245,13 @@ body {
 .term-dot.y { background: #fbbf24; }
 .term-dot.g { background: #22c55e; }
 
-.term-title {
-  margin-left: 8px;
-  font-size: 11px;
-  font-family: var(--font-mono);
-  color: var(--color-text-secondary);
-}
+  .term-title {
+    margin-left: 8px;
+    font-size: 12px;
+    font-family: var(--font-mono);
+    color: var(--color-text-secondary);
+  }
+
 
 /* ── Scanline CRT overlay ── */
 .scanline-overlay {

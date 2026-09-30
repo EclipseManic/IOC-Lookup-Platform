@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+﻿import { useEffect, useState } from "react";
 
 const EXAMPLES = [
   ["IP: 8.8.8.8", "8.8.8.8"],
@@ -158,7 +158,7 @@ export default function SearchBar({
     <div role="search" aria-label="IOC lookup" className="w-full">
       <div className="rounded-2xl border border-border bg-bg-card p-2.5 shadow-[0_18px_40px_rgba(0,0,0,0.24)]">
         {/* Detection context banner */}
-        <div className="mb-2 flex items-center justify-between px-2 text-[11px]">
+        <div className="mb-2 flex items-center justify-between px-2 text-xs">
           <div className="flex items-center gap-2">
             <span className="font-semibold uppercase tracking-wider text-text-secondary">Indicator</span>
             {detected && (
@@ -167,7 +167,7 @@ export default function SearchBar({
               </span>
             )}
             {isCredentialMode && (
-              <span className="rounded-full border border-amber-500/40 bg-amber-500/10 px-2 py-0.5 text-[10px] font-semibold text-amber-300">
+              <span className="rounded-full border border-amber-500/40 bg-amber-500/10 px-2 py-0.5 text-xs font-semibold text-amber-300">
                 🔒 Zero-Knowledge HIBP Mode
               </span>
             )}
@@ -176,9 +176,9 @@ export default function SearchBar({
             <button
               type="button"
               onClick={() => setShowSecret((prev) => !prev)}
-              className="text-[11px] font-medium text-text-secondary hover:text-accent transition-colors"
+              className="text-xs font-medium text-text-secondary hover:text-accent transition-colors"
             >
-              {showSecret ? "Hide input 🙈" : "Show input 👁️"}
+              {showSecret ? "Hide input 🙈" : "Show input ðŸ‘ï¸"}
             </button>
           )}
         </div>
@@ -223,6 +223,7 @@ export default function SearchBar({
             <option value="domain">Domain Name</option>
             <option value="url">Web URL</option>
             <option value="email">Email Address</option>
+            <option value="phone">Phone Number</option>
             <option value="md5">MD5 Hash</option>
             <option value="sha1">SHA-1 Hash</option>
             <option value="sha256">SHA-256 Hash</option>
@@ -250,7 +251,7 @@ export default function SearchBar({
       )}
 
       <div className="mt-3 flex flex-wrap items-center gap-2" role="group" aria-label="Example IOCs">
-        <span className="mr-1 text-[10px] font-semibold uppercase tracking-wider text-text-secondary">
+        <span className="mr-1 text-xs font-semibold uppercase tracking-wider text-text-secondary">
           Examples
         </span>
         {EXAMPLES.map(([label, example]) => (
@@ -269,7 +270,7 @@ export default function SearchBar({
               }
             }}
             disabled={disabled}
-            className="rounded-full border border-border bg-bg-elevated px-3 py-1.5 font-mono text-[11px] text-text-secondary hover:border-accent/60 hover:text-accent transition-colors disabled:opacity-50"
+            className="rounded-full border border-border bg-bg-elevated px-3 py-1.5 font-mono text-xs text-text-secondary hover:border-accent/60 hover:text-accent transition-colors disabled:opacity-50"
           >
             {label}
           </button>

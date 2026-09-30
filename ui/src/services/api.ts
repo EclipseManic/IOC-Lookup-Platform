@@ -1,4 +1,4 @@
-const API_BASE = "/api";
+﻿const API_BASE = "/api";
 const DEFAULT_TIMEOUT_MS = 30_000;
 const API_KEY_STORAGE = "ioc-platform-api-key";
 export const AUTH_REQUIRED_EVENT = "ioc-auth-required";
@@ -445,7 +445,7 @@ export interface AbuseReport {
 // ─── Context-based enrichment payloads (enrichment.extra.*) ───
 // The backend enriches "context" IOC types into structured objects under
 // `extra`. These are typed so the Investigation view can render dedicated
-// cards instead of forcing the analyst into the Raw Data tab.
+// cards instead of forcing the analyst into the Sources tab.
 export interface AsnContext {
   resource: string;
   holder?: string;

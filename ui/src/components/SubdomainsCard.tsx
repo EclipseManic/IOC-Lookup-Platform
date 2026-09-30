@@ -1,4 +1,4 @@
-import { useState } from "react";
+﻿import { useState } from "react";
 import type { SubdomainInfo } from "../services/api";
 
 export default function SubdomainsCard({
@@ -37,16 +37,16 @@ export default function SubdomainsCard({
           <h4 className="text-xs font-bold uppercase tracking-wider text-text-primary">
             Certificate Transparency Subdomains
           </h4>
-          <span className="rounded-full bg-accent/10 border border-accent/30 px-2 py-0.2 text-[10px] font-mono text-accent">
+          <span className="rounded-full bg-accent/10 border border-accent/30 px-2 py-0.2 text-xs font-mono text-accent">
             {allSubs.length}
           </span>
         </div>
         <div className="flex items-center gap-2">
-          <span className="text-[10px] text-text-secondary">Source: Certificate Transparency (crt.sh)</span>
+          <span className="text-xs text-text-secondary">Source: Certificate Transparency (crt.sh)</span>
           <button
             type="button"
             onClick={handleCopy}
-            className="rounded border border-border px-2 py-0.5 text-[11px] text-text-secondary hover:text-accent hover:border-accent transition-colors"
+            className="rounded border border-border px-2 py-0.5 text-xs text-text-secondary hover:text-accent hover:border-accent transition-colors"
           >
             {copied ? "Copied!" : "Copy all"}
           </button>
@@ -69,7 +69,7 @@ export default function SubdomainsCard({
               onClick={() => setFilter("")}
               className="absolute right-2.5 top-1/2 -translate-y-1/2 text-xs text-text-secondary hover:text-text-primary"
             >
-              ✕
+              âœ•
             </button>
           )}
         </div>
@@ -86,7 +86,7 @@ export default function SubdomainsCard({
           </div>
         ))}
         {filtered.length > 50 && (
-          <div className="text-center text-[10px] text-text-secondary py-1">
+          <div className="text-center text-xs text-text-secondary py-1">
             Showing first 50 of {filtered.length} subdomains
           </div>
         )}

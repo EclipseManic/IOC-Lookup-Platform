@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState } from "react";
+﻿import { useCallback, useEffect, useState } from "react";
 import { deleteRecentIOC, getRecentIOCs, getBatchesFromServer, deleteBatchFromServer, getSavedBatches, deleteSavedBatch, type RecentIOC, type SavedBatch } from "../services/api";
 import { showToast } from "../components/Toast";
 import type { NavigateEvent } from "../App";
@@ -22,7 +22,7 @@ function VerdictBadge({ label, count }: { label: string; count: number }) {
   if (count === 0) return null;
   const color = getVerdictColor(label).badge;
   return (
-    <span className={`inline-flex items-center gap-1 text-[10px] font-semibold px-1.5 py-0.5 rounded border ${color}`}>
+    <span className={`inline-flex items-center gap-1 text-xs font-semibold px-1.5 py-0.5 rounded border ${color}`}>
       {count} {label}
     </span>
   );
@@ -196,7 +196,7 @@ export default function History() {
                 Historical batch scans persisted on the server. Select one to reopen its full report.
               </p>
             </div>
-            <span className="rounded-full bg-accent/10 px-2 py-1 text-[10px] font-semibold text-accent">
+            <span className="rounded-full bg-accent/10 px-2 py-1 text-xs font-semibold text-accent">
               {batches.length}
             </span>
           </div>
@@ -225,7 +225,7 @@ export default function History() {
                       <VerdictBadge label="unknown" count={summary.unknown ?? 0} />
                       <VerdictBadge label="error" count={summary.error ?? 0} />
                     </div>
-                    <div className="mt-1 text-[10px] text-text-secondary">
+                    <div className="mt-1 text-xs text-text-secondary">
                       {formatDateTime(batch.created_at)}
                     </div>
                   </div>
@@ -314,7 +314,7 @@ export default function History() {
             <div className="flex-1 min-w-0">
               <div className="font-mono text-xs truncate">{item.value}</div>
               <div className="flex items-center gap-2 mt-1">
-                <span className="text-[10px] font-mono px-1.5 py-0.5 bg-bg-elevated rounded text-text-secondary uppercase">
+                <span className="text-xs font-mono px-1.5 py-0.5 bg-bg-elevated rounded text-text-secondary uppercase">
                   {item.ioc_type}
                 </span>
                 {displayScore(item) && (

@@ -1,4 +1,4 @@
-import { Component, type ReactNode } from "react";
+﻿import { Component, type ReactNode } from "react";
 
 interface Props {
   /** Human-readable name of the panel, shown in the degraded state. */
@@ -48,14 +48,14 @@ export default class PanelBoundary extends Component<Props, State> {
           <p className="text-xs font-semibold text-verdict-malicious mb-1">
             {this.props.label} could not be displayed
           </p>
-          <p className="text-[11px] text-text-secondary mb-3">
+          <p className="text-xs text-text-secondary mb-3">
             This panel hit an unexpected data shape. The rest of the result is
             unaffected.
           </p>
           <button
             type="button"
             onClick={() => this.setState({ hasError: false, error: null })}
-            className="px-3 py-1 text-[11px] bg-bg-elevated text-text-primary border border-border rounded-lg hover:border-accent transition-colors"
+            className="px-3 py-1 text-xs bg-bg-elevated text-text-primary border border-border rounded-lg hover:border-accent transition-colors"
           >
             Retry panel
           </button>

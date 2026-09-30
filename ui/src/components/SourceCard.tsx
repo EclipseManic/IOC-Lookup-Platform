@@ -1,9 +1,10 @@
-import { useState } from "react";
+﻿import { useState } from "react";
 import type { EvidenceObservation, NormalizedResult } from "../services/api";
 import { formatDate, formatDuration, formatValue, titleCase } from "../lib/format";
 import { EVIDENCE_CLASS_LABELS, tidyTags, type ProviderGroup } from "../lib/providerEvidence";
 import { getVerdictBand } from "../lib/verdictColors";
 import { TagList } from "./Tag";
+import { buildPayloadSections, countPayloadFields } from "../lib/rawPayload";
 import VerdictBadge from "./VerdictBadge";
 
 
@@ -48,6 +49,7 @@ export default function SourceCard({
   group?: ProviderGroup;
 }) {
   const [expanded, setExpanded] = useState(false);
+  const [showJson, setShowJson] = useState(false);
   const verdict = (observation?.normalized_verdict || result.normalized_verdict || result.verdict || "unknown").toLowerCase();
   const evidenceClass = observation?.evidence_class;
   const tone = cardTone(group, verdict, evidenceClass);
@@ -64,33 +66,35 @@ export default function SourceCard({
   const badgeVerdict = group === "context" ? "context_only" : verdict;
   const badgeLabel = group === "context" ? "context" : undefined;
   const evidenceLabel = evidenceClass ? EVIDENCE_CLASS_LABELS[evidenceClass] : undefined;
+  const fieldCount = countPayloadFields(buildPayloadSections(result.raw_data));
 
   return (
-    <article className={`flex flex-col justify-between overflow-hidden rounded-xl border-l-2 border-y border-r bg-bg-card shadow-[0_10px_26px_rgba(0,0,0,0.18)] transition-all ${tone.border}`}>
-      <div className="p-4">
-        <div className="flex items-start justify-between gap-3">
+    <article className={`flex h-full flex-col overflow-hidden rounded-lg border-l-2 border-y border-r bg-bg-card transition-colors ${tone.border}`}>
+      <div className="p-2.5">
+        <div className="flex items-start justify-between gap-2">
           <div className="min-w-0 flex-1">
-            <div className="flex items-center gap-2">
-              <span className={`h-2 w-2 shrink-0 rounded-full ${tone.dot}`} />
-              <h3 className="truncate text-sm font-semibold text-text-primary">{result.source}</h3>
+            <div className="flex items-center gap-1.5">
+              <span className={`h-1.5 w-1.5 shrink-0 rounded-full ${tone.dot}`} />
+              <h3 className="truncate text-sm font-semibold leading-tight text-text-primary">{result.source}</h3>
               {evidenceLabel && group === "finding" && (
-                <span className="text-[10px] uppercase tracking-wider text-text-secondary">{evidenceLabel}</span>
+                <span className="text-xs uppercase tracking-wider text-text-secondary">{evidenceLabel}</span>
               )}
             </div>
-            <p className="mt-2 text-sm font-medium text-text-primary">{summaryLine(result, verdict)}</p>
-            {details.length > 0 && <p className="mt-1 line-clamp-2 text-xs text-text-secondary">{details.join(" · ")}</p>}
+            <p className="mt-1 text-xs leading-snug text-text-primary">{summaryLine(result, verdict)}</p>
+            {details.length > 0 && <p className="mt-0.5 line-clamp-1 text-xs text-text-secondary">{details.join(" · ")}</p>}
           </div>
-          <div className="flex shrink-0 flex-col items-end gap-1">
+          <div className="flex shrink-0 flex-col items-end gap-0.5">
             <VerdictBadge verdict={badgeVerdict} label={badgeLabel} />
             {result.cached && (
-              <span className="text-[10px] uppercase tracking-wider text-text-secondary">
+              <span className="text-xs uppercase tracking-wider text-text-secondary">
                 {result.stale ? "stale cache" : "cached"}
               </span>
             )}
           </div>
         </div>
 
-        <div className="mt-3 flex flex-wrap items-center gap-x-4 gap-y-1 text-[10px] text-text-secondary">
+        <div className="mt-1.5 flex flex-wrap items-center gap-x-3 gap-y-0.5 text-xs text-text-secondary">
+          {result.confidence && <span>{result.confidence} confidence</span>}
           {result.latency_ms != null && <span>{formatDuration(result.latency_ms)}</span>}
           {result.source_timestamp && formatDate(result.source_timestamp) !== "—" && <span>source time {formatDate(result.source_timestamp)}</span>}
           {result.provider_verdict && result.provider_verdict !== result.verdict && result.provider_verdict !== "unknown" && (
@@ -99,22 +103,43 @@ export default function SourceCard({
         </div>
 
         {chips.length > 0 && (
-          <div className="mt-3">
+          <div className="mt-1.5">
             <TagList labels={chips} max={6} />
+          </div>
+        )}
+
+        {/* Deliberately NOT the full provider payload. Dumping every returned
+            field here made each card a wall of text and buried the verdict it
+            was supposed to support; the card carries the finding only. The
+            structured fields live on the Sources tab and the raw JSON is one
+            click away on either. */}
+        {hasRaw && fieldCount > 0 && (
+          <div className="mt-1.5 text-xs text-text-secondary">
+            {fieldCount} field{fieldCount === 1 ? "" : "s"} returned · full payload on the Sources tab
           </div>
         )}
       </div>
 
-      <div className="border-t border-border bg-bg-card/60 p-3 pt-2">
-        <div className="flex items-center gap-2">
-          {(hasRaw || attributes.length > 0) && (
+      <div className="mt-auto border-t border-border bg-bg-card/60 px-2.5 py-1.5">
+        <div className="flex items-center gap-1.5">
+          {hasRaw && (
+            <button
+              type="button"
+              onClick={() => setShowJson((value) => !value)}
+              aria-expanded={showJson}
+              className="rounded border border-border bg-bg-elevated px-2 py-1 text-xs font-semibold text-text-secondary hover:border-accent/50 hover:text-accent transition-colors"
+            >
+              {showJson ? "Hide raw JSON" : "Raw JSON"}
+            </button>
+          )}
+          {(attributes.length > 0) && (
             <button
               type="button"
               onClick={() => setExpanded((value) => !value)}
               aria-expanded={expanded}
-              className="rounded-md border border-border bg-bg-elevated px-2.5 py-1.5 text-[11px] font-semibold text-text-secondary hover:border-accent/50 hover:text-accent transition-colors"
+              className="rounded border border-border bg-bg-elevated px-2 py-1 text-xs font-semibold text-text-secondary hover:border-accent/50 hover:text-accent transition-colors"
             >
-              {expanded ? "Hide details" : "Details"}
+              {expanded ? "Hide tags" : "Tags"}
             </button>
           )}
           {result.source_link && (
@@ -122,33 +147,34 @@ export default function SourceCard({
               href={result.source_link}
               target="_blank"
               rel="noopener noreferrer"
-              className="rounded-md border border-border px-2.5 py-1.5 text-[11px] font-semibold text-text-secondary hover:border-accent/50 hover:text-accent transition-colors"
+              className="rounded border border-border px-2 py-1 text-xs font-semibold text-text-secondary hover:border-accent/50 hover:text-accent transition-colors"
             >
-              Open source ↗
+              Open source â†—
             </a>
           )}
         </div>
 
-        {expanded && (
-          <div className="mt-3 space-y-3 border-t border-border pt-3">
-            {attributes.length > 0 && (
-              <dl className="grid grid-cols-[minmax(0,10rem)_minmax(0,1fr)] gap-x-3 gap-y-1 text-[11px]">
-                {attributes.map(([key, value]) => (
-                  <div key={key} className="contents">
-                    <dt className="truncate text-text-secondary">{key}</dt>
-                    <dd className="break-words text-text-primary">{formatValue(value)}</dd>
-                  </div>
-                ))}
-              </dl>
-            )}
-            {hasRaw && (
-              <div>
-                <div className="mb-2 text-[10px] font-semibold uppercase tracking-wider text-text-secondary">Raw provider payload</div>
-                <pre className="max-h-72 overflow-auto whitespace-pre-wrap break-all rounded-lg border border-border bg-[#080b12] p-3 font-mono text-[10px] leading-relaxed text-slate-300">
-                  {JSON.stringify(result.raw_data, null, 2)}
-                </pre>
-              </div>
-            )}
+        {expanded && attributes.length > 0 && (
+          <div className="mt-2 space-y-2 border-t border-border pt-2">
+            <dl className="grid grid-cols-[minmax(0,8rem)_minmax(0,1fr)] gap-x-2 gap-y-0.5 text-xs">
+              {attributes.map(([key, value]) => (
+                <div key={key} className="contents">
+                  <dt className="truncate text-text-secondary">{key}</dt>
+                  <dd className="break-words text-text-primary">{formatValue(value)}</dd>
+                </div>
+              ))}
+            </dl>
+          </div>
+        )}
+
+        {showJson && hasRaw && (
+          <div className="mt-2 space-y-2 border-t border-border pt-2">
+            <div>
+              <div className="mb-1.5 text-xs font-semibold uppercase tracking-wider text-text-secondary">Raw provider payload</div>
+              <pre className="max-h-72 overflow-auto whitespace-pre-wrap break-all rounded border border-border bg-[#080b12] p-2 font-mono text-xs leading-relaxed text-slate-300">
+                {JSON.stringify(result.raw_data, null, 2)}
+              </pre>
+            </div>
           </div>
         )}
       </div>

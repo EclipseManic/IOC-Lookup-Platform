@@ -1,4 +1,4 @@
-import { useMemo, useState } from "react";
+﻿import { useMemo, useState } from "react";
 import type { GroupedProviders, ProviderRow } from "../lib/providerEvidence";
 import { STATE_LABELS } from "../lib/providerEvidence";
 import { titleCase } from "../lib/format";
@@ -16,7 +16,7 @@ function SectionHeading({ title, count, hint }: { title: string; count: number; 
       <h4 className="text-xs font-bold uppercase tracking-[0.14em] text-text-primary">
         {title} <span className="ml-1 font-mono text-text-secondary">{count}</span>
       </h4>
-      <span className="text-[11px] text-text-secondary">{hint}</span>
+      <span className="text-xs text-text-secondary">{hint}</span>
     </div>
   );
 }
@@ -31,7 +31,7 @@ function CompactRow({ row, tone }: { row: ProviderRow; tone: "neutral" | "proble
       <span className={`min-w-0 flex-1 text-right ${tone === "problem" ? "text-amber-200/90" : "text-text-secondary"}`}>
         {summary}
       </span>
-      {row.result?.cached && <span className="text-[10px] uppercase tracking-wider text-text-secondary">cached</span>}
+      {row.result?.cached && <span className="text-xs uppercase tracking-wider text-text-secondary">cached</span>}
     </li>
   );
 }
@@ -66,11 +66,11 @@ export default function ProviderEvidenceList({
   }, [grouped.problems]);
 
   return (
-    <div className="space-y-4">
-      <div className="flex flex-wrap items-center justify-between gap-3 rounded-xl border border-border bg-bg-card p-4">
+    <div className="space-y-3">
+      <div className="flex flex-wrap items-center justify-between gap-3 rounded-xl border border-border bg-bg-card px-3 py-2.5">
         <div>
           <h3 className="text-xs font-bold uppercase tracking-[0.14em] text-text-primary">Provider evidence</h3>
-          <p className="mt-0.5 text-[11px] text-text-secondary">
+          <p className="mt-0.5 text-xs text-text-secondary">
             {grouped.findings.length} with findings · {grouped.context.length} context · {grouped.notFound.length} not found · {grouped.problems.length} could not answer
           </p>
         </div>
@@ -86,10 +86,10 @@ export default function ProviderEvidenceList({
         )}
       </div>
 
-      <section className="space-y-2" aria-label="Provider findings">
+      <section className="space-y-1.5" aria-label="Provider findings">
         <SectionHeading title="Findings" count={view.findings.length} hint="positive and negative provider verdicts" />
         {view.findings.length > 0 ? (
-          <div className="grid grid-cols-1 gap-3">
+          <div className="grid grid-cols-1 gap-2 md:grid-cols-2 2xl:grid-cols-3">
             {view.findings.map((row) =>
               row.result ? (
                 <SourceCard key={row.source} result={row.result} observation={row.observation} group="finding" />
@@ -109,9 +109,9 @@ export default function ProviderEvidenceList({
       </section>
 
       {view.context.length > 0 && (
-        <section className="space-y-2" aria-label="Context providers">
+        <section className="space-y-1.5" aria-label="Context providers">
           <SectionHeading title="Context" count={view.context.length} hint="infrastructure and enrichment; does not score" />
-          <div className="grid grid-cols-1 gap-3">
+          <div className="grid grid-cols-1 gap-2 md:grid-cols-2 2xl:grid-cols-3">
             {view.context.map((row) =>
               row.result ? (
                 <SourceCard key={row.source} result={row.result} observation={row.observation} group="context" />
@@ -122,7 +122,7 @@ export default function ProviderEvidenceList({
       )}
 
       {view.notFound.length > 0 && (
-        <section className="space-y-2" aria-label="Providers without a record">
+        <section className="space-y-1.5" aria-label="Providers without a record">
           <SectionHeading title="Not found" count={view.notFound.length} hint="no record — not evidence of benignness" />
           <ul className="divide-y divide-border/60 rounded-xl border border-border bg-bg-card">
             {view.notFound.map((row) => <CompactRow key={row.source} row={row} tone="neutral" />)}
@@ -136,7 +136,7 @@ export default function ProviderEvidenceList({
             <span className="text-xs font-bold uppercase tracking-[0.14em] text-amber-200">
               Provider problems <span className="ml-1 font-mono">{view.problems.length}</span>
             </span>
-            <span className="text-[11px] text-text-secondary">{problemSummary} — excluded from the verdict</span>
+            <span className="text-xs text-text-secondary">{problemSummary} — excluded from the verdict</span>
           </summary>
           <ul className="divide-y divide-border/60 border-t border-amber-500/20">
             {view.problems.map((row) => <CompactRow key={row.source} row={row} tone="problem" />)}

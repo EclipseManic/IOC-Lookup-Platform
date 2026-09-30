@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useRef, useState } from "react";
+﻿import { useCallback, useEffect, useRef, useState } from "react";
 import * as d3 from "d3";
 import { List, type ListProps } from "react-window";
 import type { Relationship } from "../services/api";
@@ -31,6 +31,7 @@ function inferType(label: string): string {
   if (/^[\w.-]+\.[a-z]{2,}$/.test(label)) return "domain";
   if (/^(?:[13][a-km-zA-HJ-NP-Z1-9]{25,34}|bc1[a-z\d]{38,58})$/i.test(label)) return "btc";
   if (/^0x[a-f\d]{40}$/i.test(label)) return "eth";
+  if (/^\+?\d{7,15}$/.test(label)) return "phone";
   return "default";
 }
 
@@ -69,7 +70,7 @@ function RelationshipRow({ index, style, data }: { index: number; style: React.C
         <span className="font-mono text-xs truncate block" title={rel.source_ioc}>{rel.source_ioc}</span>
       </div>
       <div className="w-28 shrink-0 px-3">
-        <span className="text-[10px] px-1.5 py-0.5 bg-accent/10 text-accent rounded" title={rel.relationship}>{rel.relationship}</span>
+        <span className="text-xs px-1.5 py-0.5 bg-accent/10 text-accent rounded" title={rel.relationship}>{rel.relationship}</span>
       </div>
       <div className="flex-1 min-w-0 px-3 py-2">
         <span className="font-mono text-xs truncate block" title={rel.target_ioc}>{rel.target_ioc}</span>
@@ -208,7 +209,7 @@ export default function RelationshipGraph({ mainIoc, relationships, onNodeClick 
           <>
             <p className="font-semibold text-text-primary mb-0.5">{d.label}</p>
             <p className="text-text-secondary">Type: {d.type}</p>
-            {d.isMain && <p className="text-accent text-[10px]">Main IOC</p>}
+            {d.isMain && <p className="text-accent text-xs">Main IOC</p>}
           </>
         ),
       });
@@ -278,7 +279,7 @@ export default function RelationshipGraph({ mainIoc, relationships, onNodeClick 
         <div className="relative bg-bg-card border border-border rounded-lg overflow-hidden">
           <svg ref={svgRef} className="w-full" style={{ height: 500 }} />
           {nodesCountExceedsMax(relationships) && (
-            <p className="absolute top-2 left-2 text-[10px] text-text-secondary bg-bg-card/80 rounded px-2 py-1">
+            <p className="absolute top-2 left-2 text-xs text-text-secondary bg-bg-card/80 rounded px-2 py-1">
               Graph limited to {MAX_GRAPH_NODES} nodes; table view shows all.
             </p>
           )}
@@ -290,7 +291,7 @@ export default function RelationshipGraph({ mainIoc, relationships, onNodeClick 
           )}
           <div className="absolute bottom-3 left-3 flex flex-wrap gap-2">
             {Array.from(activeTypes).filter(t => t !== "default").map((type) => (
-              <div key={type} className="flex items-center gap-1 text-[10px]">
+              <div key={type} className="flex items-center gap-1 text-xs">
                 <span className="w-2 h-2 rounded-full" style={{ backgroundColor: NODE_COLORS[type] || NODE_COLORS.default }} />
                 <span className="text-text-secondary">{type}</span>
               </div>

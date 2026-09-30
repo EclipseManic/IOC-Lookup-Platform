@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+﻿import { useEffect, useState } from "react";
 import { fetchProtectedImage } from "../services/api";
 import type { WebPreviewInfo } from "../services/api";
 
@@ -83,9 +83,9 @@ export default function WebPreviewCard({ preview, domainOrUrl }: WebPreviewCardP
             href={`https://urlscan.io/result/${scan_uuid}/`}
             target="_blank"
             rel="noopener noreferrer"
-            className="text-[10px] text-accent hover:underline flex items-center gap-1"
+            className="text-xs text-accent hover:underline flex items-center gap-1"
           >
-            urlscan.io report ↗
+            urlscan.io report â†—
           </a>
         )}
       </div>
@@ -138,7 +138,7 @@ export default function WebPreviewCard({ preview, domainOrUrl }: WebPreviewCardP
         <div className="md:col-span-2 space-y-3">
           {page_title && (
             <div>
-              <div className="text-[10px] uppercase tracking-wider text-text-secondary">Page Title</div>
+              <div className="text-xs uppercase tracking-wider text-text-secondary">Page Title</div>
               <div className="text-sm font-semibold text-text-primary line-clamp-2">{page_title}</div>
             </div>
           )}
@@ -146,13 +146,13 @@ export default function WebPreviewCard({ preview, domainOrUrl }: WebPreviewCardP
           <div className="grid grid-cols-2 gap-2 text-xs font-mono">
             {server && (
               <div className="rounded bg-bg-elevated/60 p-2 border border-border/50">
-                <span className="text-text-secondary text-[10px] uppercase block">Server</span>
+                <span className="text-text-secondary text-xs uppercase block">Server</span>
                 <span className="text-text-primary font-medium">{server}</span>
               </div>
             )}
             {domain_age_days !== undefined && (
               <div className="rounded bg-bg-elevated/60 p-2 border border-border/50">
-                <span className="text-text-secondary text-[10px] uppercase block">Domain Age</span>
+                <span className="text-text-secondary text-xs uppercase block">Domain Age</span>
                 <span className={`font-semibold ${isNewlyRegistered ? "text-red-400" : "text-emerald-400"}`}>
                   {domain_age_days} days {isNewlyRegistered ? "(New)" : ""}
                 </span>
@@ -160,7 +160,7 @@ export default function WebPreviewCard({ preview, domainOrUrl }: WebPreviewCardP
             )}
             {tls_issuer && (
               <div className="rounded bg-bg-elevated/60 p-2 border border-border/50">
-                <span className="text-text-secondary text-[10px] uppercase block">TLS Certificate</span>
+                <span className="text-text-secondary text-xs uppercase block">TLS Certificate</span>
                 <span className="text-text-primary truncate block" title={tls_issuer}>
                   {tls_issuer} {tls_valid_days ? `(${tls_valid_days}d valid)` : ""}
                 </span>
@@ -168,19 +168,19 @@ export default function WebPreviewCard({ preview, domainOrUrl }: WebPreviewCardP
             )}
             {asn_name && (
               <div className="rounded bg-bg-elevated/60 p-2 border border-border/50">
-                <span className="text-text-secondary text-[10px] uppercase block">Host Network</span>
+                <span className="text-text-secondary text-xs uppercase block">Host Network</span>
                 <span className="text-text-primary truncate block" title={asn_name}>{asn_name}</span>
               </div>
             )}
             {language && (
               <div className="rounded bg-bg-elevated/60 p-2 border border-border/50">
-                <span className="text-text-secondary text-[10px] uppercase block">Language</span>
+                <span className="text-text-secondary text-xs uppercase block">Language</span>
                 <span className="text-text-primary">{language.toUpperCase()}</span>
               </div>
             )}
             {mime_type && (
               <div className="rounded bg-bg-elevated/60 p-2 border border-border/50">
-                <span className="text-text-secondary text-[10px] uppercase block">Content-Type</span>
+                <span className="text-text-secondary text-xs uppercase block">Content-Type</span>
                 <span className="text-text-primary truncate block">{mime_type}</span>
               </div>
             )}
@@ -188,14 +188,14 @@ export default function WebPreviewCard({ preview, domainOrUrl }: WebPreviewCardP
 
           {detected_technologies.length > 0 && (
             <div>
-              <div className="text-[10px] uppercase tracking-wider text-text-secondary mb-1">
+              <div className="text-xs uppercase tracking-wider text-text-secondary mb-1">
                 Detected Technologies
               </div>
               <div className="flex flex-wrap gap-1">
                 {detected_technologies.map((tech) => (
                   <span
                     key={tech}
-                    className="rounded bg-bg-elevated px-2 py-0.5 text-[11px] font-mono text-text-secondary border border-border/50"
+                    className="rounded bg-bg-elevated px-2 py-0.5 text-xs font-mono text-text-secondary border border-border/50"
                   >
                     {tech}
                   </span>
