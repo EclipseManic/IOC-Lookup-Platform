@@ -24,7 +24,10 @@ class CensysAdapter(SourceAdapter):
     def __init__(self):
         self.api_key = settings.censys_api_key
         self.organization_id = settings.censys_organization_id
-        self._has_credentials = is_valid_api_key(self.api_key) and bool(self.organization_id)
+        # A Platform Personal Access Token is sufficient for the Free tier.
+        # Organization IDs identify paid-organization entitlements and are
+        # optional according to the Platform API documentation.
+        self._has_credentials = is_valid_api_key(self.api_key)
 
     def _auth_header(self) -> str:
         if ":" in self.api_key:
@@ -35,18 +38,14 @@ class CensysAdapter(SourceAdapter):
         return f"Bearer {self.api_key}"
 
     def _request_headers(self) -> dict:
-        """Platform API headers (PAT auth + vendor-specific accept version).
-
-        docs.censys.com (2026-07-28): the Platform API requires the vendor
-        Accept header ``application/vnd.censys.api.v3.host.v1+json`` and
-        authenticates with a Personal Access Token. The organization ID is
-        also mandatory; without it every request is rejected with HTTP 422.
-        """
-        return {
+        """Platform API headers for a PAT-authenticated host lookup."""
+        headers = {
             "Authorization": self._auth_header(),
             "Accept": "application/vnd.censys.api.v3.host.v1+json",
-            "X-Organization-ID": self.organization_id,
         }
+        if self.organization_id:
+            headers["X-Organization-ID"] = self.organization_id
+        return headers
 
     def _check_credits(self) -> bool:
         now = time.time()
@@ -57,15 +56,7 @@ class CensysAdapter(SourceAdapter):
 
     async def lookup(self, ioc_value: str, ioc_type: str) -> NormalizedResult:
         if not self._has_credentials:
-            if not is_valid_api_key(self.api_key):
-                return not_configured(self.name, ioc_value, ioc_type)
-            # A configuration gap is "unavailable", never a successful lookup.
-            return failure(
-                self.name, ioc_value, ioc_type, "unavailable", ["censys_organization_id_missing"],
-                "Censys unavailable: CENSYS_ORGANIZATION_ID is not configured "
-                "(the Platform API rejects requests without an organization ID)",
-                request_made=False,
-            )
+            return not_configured(self.name, ioc_value, ioc_type)
 
         if not self._check_credits():
             return failure(

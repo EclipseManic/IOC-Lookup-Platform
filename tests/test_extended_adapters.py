@@ -373,14 +373,15 @@ class TestShodanAdapter:
         assert a.supported_types == ["ipv4"]
 
     @pytest.mark.asyncio
-    async def test_no_key(self):
+    async def test_no_free_data_does_not_call_paid_host_api(self):
         a = ShodanAdapter()
-        a.api_key = ""
+        a.api_key = "valid"
         mock_class = _mock_async_router({"internetdb": (404, {})})
         with patch("httpx.AsyncClient", mock_class):
             r = await a.lookup("8.8.8.8", "ipv4")
         assert r.verdict == "unknown"
-        assert "no_api_key_configured" in r.tags
+        assert r.execution_state == "not_found"
+        assert "internetdb_no_data" in r.tags
 
     @pytest.mark.asyncio
     async def test_401_unauthorized(self):
@@ -390,8 +391,8 @@ class TestShodanAdapter:
         with patch("httpx.AsyncClient", mock_class):
             r = await a.lookup("8.8.8.8", "ipv4")
         assert r.verdict == "unknown"
-        assert r.execution_state == "unavailable"
-        assert "invalid_api_key" in r.tags
+        assert r.execution_state == "not_found"
+        assert "internetdb_no_data" in r.tags
 
     @pytest.mark.asyncio
     async def test_404_not_found(self):
@@ -401,48 +402,30 @@ class TestShodanAdapter:
         with patch("httpx.AsyncClient", mock_class):
             r = await a.lookup("10.0.0.1", "ipv4")
         assert r.verdict == "unknown"
-        assert r.raw_score is None
+        assert r.execution_state == "not_found"
 
     @pytest.mark.asyncio
     async def test_normal_response(self):
         """Shodan always returns unknown (enrichment-only)."""
-        data = {
-            "ports": [80, 443, 22],
-            "hostnames": ["example.com", "www.example.com"],
-            "org": "Example Corp",
-            "isp": "Example ISP",
-            "os": "Linux 4.x",
-            "vulns": ["CVE-2021-1234"],
-        }
         a = ShodanAdapter()
         a.api_key = "valid"
-        mock_class = _mock_async_router({"internetdb": (404, {}), "shodan.io": (200, data)})
+        mock_class = _mock_async_router({"internetdb": (404, {}), "shodan.io": (200, {})})
         with patch("httpx.AsyncClient", mock_class):
             r = await a.lookup("1.2.3.4", "ipv4")
         assert r.verdict == "unknown"
-        assert r.raw_score is None
-        # Ports, vulnerabilities and hostnames are structured raw_data.
-        assert r.raw_data["vulns"] == ["CVE-2021-1234"]
-        assert r.raw_data["ports"] == [80, 443, 22]
-        assert r.raw_data["hostnames"] == ["example.com", "www.example.com"]
-        assert r.raw_data["org"] == "Example Corp"
-        assert "known_vulnerabilities" in r.tags
-        assert r.categories is not None
-        assert "Example Corp" in r.categories
+        assert r.execution_state == "not_found"
+        assert "internetdb_no_data" in r.tags
 
     @pytest.mark.asyncio
     async def test_empty_response(self):
-        """Response with ports but no hostnames/vulns."""
-        data = {"ports": [80], "hostnames": [], "org": "Test Org", "isp": "", "vulns": []}
+        """A host-API result is never used as a free-tier fallback."""
         a = ShodanAdapter()
         a.api_key = "valid"
-        mock_class = _mock_async_router({"internetdb": (404, {}), "shodan.io": (200, data)})
+        mock_class = _mock_async_router({"internetdb": (404, {}), "shodan.io": (200, {})})
         with patch("httpx.AsyncClient", mock_class):
             r = await a.lookup("1.2.3.4", "ipv4")
         assert r.verdict == "unknown"
-        assert r.raw_score is None
-        assert r.raw_data["ports"] == [80]
-        assert r.categories is not None
+        assert r.execution_state == "not_found"
 
 
 # ============================================================
@@ -876,18 +859,18 @@ class TestCensysAdapter:
         assert headers["Accept"] == "application/vnd.censys.api.v3.host.v1+json"
 
     @pytest.mark.asyncio
-    async def test_missing_organization_id_reports_config_gap(self):
+    async def test_missing_organization_id_uses_free_tier_pat(self):
         a = CensysAdapter()
         a.api_key = "censys_valid_token"
         a.organization_id = ""
-        a._has_credentials = False
-        r = await a.lookup("1.2.3.4", "ipv4")
-        assert r.verdict == "unknown"
-        # A configuration gap is unavailable, never a successful lookup.
-        assert r.execution_state == "unavailable"
-        assert r.request_made is False
-        assert "censys_organization_id_missing" in r.tags
-        assert "CENSYS_ORGANIZATION_ID" in r.provider_summary
+        a._has_credentials = True
+        mock_class, _ = _mock_async_client(json_data={"result": {"resource": {"ip": "1.2.3.4"}}})
+        with patch("httpx.AsyncClient", mock_class) as mock:
+            r = await a.lookup("1.2.3.4", "ipv4")
+        assert r.execution_state == "success"
+        assert r.request_made is True
+        headers = mock.return_value.get.await_args.kwargs["headers"]
+        assert "X-Organization-ID" not in headers
 
     @pytest.mark.asyncio
     async def test_422_is_not_reported_as_a_provider_outage(self):

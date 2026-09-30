@@ -245,11 +245,8 @@ async def enrich_ip(value: str) -> EnrichmentData:
     completeness["whois"] = _completeness_label(whois)
 
     from app.backend.config import settings
-    from app.backend.adapters.base import is_valid_api_key
-
     host_intel: HostIntelligence | None = None
     open_ports_result: list[int] = []
-    shodan_key = settings.shodan_api_key
     ip_version = ipaddress.ip_address(value).version
 
     # Tier 1: Shodan InternetDB (Keyless, instant, rich)
@@ -266,31 +263,8 @@ async def enrich_ip(value: str) -> EnrichmentData:
     else:
         completeness["host_intel"] = "unavailable"
 
-    # Tier 2: Shodan full API (if key present and needed)
-    if not open_ports_result and is_valid_api_key(shodan_key) and ip_version == 4:
-        from app.backend.adapters.shodan import ShodanAdapter
-        try:
-            shodan = ShodanAdapter()
-            shodan.set_client(_get_http_client())
-            shodan_result = await shodan.lookup(value, "ipv4")
-            shodan_ports = (shodan_result.raw_data or {}).get("ports")
-            if not isinstance(shodan_ports, list):
-                # Older results carried the port list as a "ports:80,443" tag.
-                port_tag = next((t for t in shodan_result.tags or [] if t.startswith("ports:")), None)
-                shodan_ports = port_tag.replace("ports:", "").split(",") if port_tag else []
-            if shodan_ports:
-                open_ports_result = [int(p) for p in shodan_ports if str(p).strip().isdigit()]
-                completeness["port_scan"] = "ok"
-                port_services = {p: _PORT_SERVICES.get(p, "Unknown") for p in open_ports_result}
-                host_intel = HostIntelligence(
-                    open_ports=open_ports_result,
-                    port_services=port_services,
-                    source="shodan_api",
-                )
-        except Exception as exc:
-            logger.debug("Shodan port scan enrichment failed for %s: %s", value, exc)
-
-    # Tier 3: Active port scan (fallback)
+    # Tier 2: Optional active port scan (fallback). Shodan's paid host API is
+    # deliberately never used as a fallback for missing free InternetDB data.
     if not open_ports_result and ip_version == 4 and settings.enable_active_port_scan:
         open_ports_result = await _quick_port_scan(value)
         if open_ports_result:
