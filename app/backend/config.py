@@ -144,6 +144,13 @@ class Settings(BaseSettings):
 
     greynoise_api_key: str = Field("", alias="GREYNOISE_API_KEY")
     abstractapi_api_key: str = Field("", validation_alias=AliasChoices("ABSTRACTAPI_API_KEY", "ABSTRACT_API_KEY"))
+    # AbstractAPI issues one key per product, and a key for one product is
+    # rejected by the others.  Each field below is scoped to a single endpoint.
+    abstractapi_email_api_key: str = Field("", alias="ABSTRACTAPI_EMAIL_KEY")
+    abstractapi_ip_api_key: str = Field("", alias="ABSTRACTAPI_IP_KEY")
+    abstractapi_phone_api_key: str = Field(
+        "", validation_alias=AliasChoices("ABSTRACTAPI_No_KEY", "ABSTRACTAPI_PHONE_KEY")
+    )
     hunterio_api_key: str = Field("", validation_alias=AliasChoices("HUNTERIO_API_KEY", "HUNTER_IO_API_KEY", "HUNTER_API_KEY"))
     alienvault_otx_api_key: str = Field("", validation_alias=AliasChoices("OTX_API_KEY", "ALIENVAULT_OTX_KEY"))
     shodan_api_key: str = Field("", alias="SHODAN_API_KEY")
@@ -161,6 +168,7 @@ class Settings(BaseSettings):
     log_level: str = Field("INFO", alias="LOG_LEVEL")
     api_keys: str = Field("", alias="API_KEYS")
     fail_fast_missing_keys: bool = Field(False, alias="FAIL_FAST_MISSING_KEYS")
+    reload: bool = Field(False, alias="RELOAD")
     host: str = Field("127.0.0.1", alias="HOST")
     port: int = Field(8000, alias="PORT")
     allow_network_bind: bool = Field(False, alias="ALLOW_NETWORK_BIND")
@@ -329,6 +337,9 @@ _API_KEY_FIELDS = (
     "censys_api_key",
     "ipinfo_api_key",
     "abstractapi_api_key",
+    "abstractapi_email_api_key",
+    "abstractapi_ip_api_key",
+    "abstractapi_phone_api_key",
     "hunterio_api_key",
 )
 

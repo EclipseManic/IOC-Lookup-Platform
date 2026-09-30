@@ -313,6 +313,9 @@ CACHE_TTL = {
     "Censys": 3600,
     "IPinfo": 3600,
     "AbstractAPI": 3600,
+    "AbstractAPI IP": 3600,
+    "AbstractAPI Phone": 3600,
+
     "Hunter.io": 3600,
     "Team Cymru": 3600,
     "cve.org": 3600,

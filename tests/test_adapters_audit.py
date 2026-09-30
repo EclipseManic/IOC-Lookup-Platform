@@ -143,14 +143,15 @@ async def test_threatfox_marks_exact_matches_and_ignores_related_urls():
     assert exact.raw_data["match_type"] == "exact"
 
 
-async def test_censys_missing_organization_id_is_unavailable():
+async def test_censys_pat_without_organization_id_is_allowed():
     adapter = CensysAdapter()
     adapter.api_key = "censys_valid_token_0123456789"
     adapter.organization_id = ""
-    adapter._has_credentials = False
+    adapter._has_credentials = True
+    adapter.set_client(client_for(respond(200, {"result": {"resource": {"ip": "1.2.3.4"}}})))
     result = await adapter.lookup("1.2.3.4", "ipv4")
-    assert result.execution_state == "unavailable"
-    assert result.request_made is False
+    assert result.execution_state == "success"
+    assert result.request_made is True
 
 
 async def test_abstractapi_invalid_key_is_unavailable():
@@ -168,11 +169,21 @@ async def test_nvd_sends_the_configured_api_key_and_raises_the_rate_limit():
         seen["key"] = request.headers.get("apiKey")
         return httpx.Response(200, json={"vulnerabilities": []})
 
-    keyless = NvdAdapter()
-    assert keyless.rate_limit.requests_per_minute == 10
-
     from app.backend.config import settings
     original = settings.nvd_api_key
+
+    # The keyless adapter must be built with the key actually absent. conftest
+    # sets IOC_ENV_FILE="" to disable .env loading, but Settings still falls back
+    # to the process environment, so a real NVD_API_KEY exported on the host
+    # (here it is a User-scope Windows variable) reached the adapter and raised
+    # the rate limit to the keyed value.
+    settings.nvd_api_key = ""
+    try:
+        keyless = NvdAdapter()
+    finally:
+        settings.nvd_api_key = original
+    assert keyless.rate_limit.requests_per_minute == 10
+
     settings.nvd_api_key = "nvd-test-key-0123456789"
     try:
         adapter = NvdAdapter()

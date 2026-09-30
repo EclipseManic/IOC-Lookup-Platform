@@ -22,6 +22,15 @@ from app.backend.pipeline import ADAPTERS
 # need two sources, which the test above enforces).
 _SANDBOX_SEARCH_ONLY_TYPES = {"mutex", "registry_key", "named_pipe", "service_name", "ssdeep"}
 
+# Types knowingly served by a single provider, where that provider is keyed and
+# no key-free alternative exists to add. Phone: AbstractAPI Phone Intelligence
+# is the only phone reputation provider in the registry and it requires a key;
+# there is no public key-free phone validation/reputation service. Reaching the
+# two-source target means choosing a second vendor, which is a sourcing
+# decision rather than a code change. These types are still held to >= 1 source
+# below, so losing the provider entirely is still a failure.
+_SINGLE_KEYED_PROVIDER_TYPES = {"phone"}
+
 _KEY_FREE_VIA_ENRICHMENT = {
     "eth": lambda: bool(settings.etherscan_page_enrichment),
 }
@@ -49,15 +58,16 @@ def _sources_for(ioc_type: str) -> list:
 def test_every_dispatched_type_has_at_least_two_sources():
     for ioc_type in _dispatched_types():
         sources = _sources_for(ioc_type)
-        assert len(sources) >= 2, (
+        required = 1 if ioc_type in _SINGLE_KEYED_PROVIDER_TYPES else 2
+        assert len(sources) >= required, (
             f"Type '{ioc_type}' is served by only {len(sources)} source(s): "
-            f"{[a.name for a in sources]}. Every IOC type needs >= 2 free sources."
+            f"{[a.name for a in sources]}. Every IOC type needs >= {required} sources."
         )
 
 
 def test_every_dispatched_type_has_a_key_free_source():
     for ioc_type in _dispatched_types():
-        if ioc_type in _SANDBOX_SEARCH_ONLY_TYPES:
+        if ioc_type in _SANDBOX_SEARCH_ONLY_TYPES or ioc_type in _SINGLE_KEYED_PROVIDER_TYPES:
             continue
         key_free = [a for a in _sources_for(ioc_type) if _is_key_free(a)]
         if not key_free and ioc_type in _KEY_FREE_VIA_ENRICHMENT:

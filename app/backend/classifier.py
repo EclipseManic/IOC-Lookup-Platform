@@ -90,6 +90,20 @@ def is_password_candidate(text: str) -> bool:
     return False
 
 
+def normalize_phone(text: str) -> str | None:
+    """Canonicalize a phone IOC, or return None when it is not a usable number.
+
+    Formatting characters are dropped so ``+1 (415) 200-7986`` and
+    ``+14152007986`` share one cache entry.  A leading ``+`` is preserved
+    because it is what makes the country code explicit; bare national numbers
+    stay bare rather than being given a ``+`` that was never supplied.
+    """
+    compact = re.sub(r"[\s().\-‐-―]", "", text)
+    if not re.fullmatch(r"\+?\d{7,15}", compact):
+        return None
+    return compact
+
+
 def normalize_ioc(value: str, expected_type: str | None = None) -> NormalizedIOC:
     """Deterministically normalize and validate an IOC before planning."""
     raw_str = str(value or "")
@@ -180,6 +194,11 @@ def normalize_ioc(value: str, expected_type: str | None = None) -> NormalizedIOC
                 return NormalizedIOC(text, "asn", (), 0.0, False)
             text = "AS" + re.sub(r"^AS", "", text, flags=re.IGNORECASE)
             return NormalizedIOC(text, "asn", ("asn",), 1.0, True)
+        elif expected_type == "phone":
+            compact = normalize_phone(text)
+            if compact is None:
+                return NormalizedIOC(text, "phone", (), 0.0, False)
+            return NormalizedIOC(compact, "phone", ("phone",), 1.0, True)
         else:
             # For btc, eth, mac, filename, mutex, etc. — accept as-is
             return NormalizedIOC(text, expected_type, (expected_type,), 1.0, True)
@@ -253,6 +272,11 @@ def normalize_ioc(value: str, expected_type: str | None = None) -> NormalizedIOC
         text = text.upper()
     elif primary == "asn":
         text = "AS" + re.sub(r"^AS", "", text, flags=re.IGNORECASE)
+    elif primary == "phone":
+        compact = normalize_phone(text)
+        if compact is None:
+            return NormalizedIOC(text, "unknown", tuple(candidates), 0.0, False)
+        text = compact
     elif primary == "windows_path":
         text = text.replace("/", "\\")
     elif primary == "linux_path":
@@ -289,6 +313,12 @@ PATTERNS: list[tuple[str, str]] = [
     ("btc", r"^bc1[a-zA-Z0-9]{38,58}$"),
     ("mitre_attack", r"^(TA\d{4}|T\d{4}(\.\d{3})?)$"),
     ("asn", r"^AS\d+$", re.IGNORECASE),
+    # Phone numbers.  An explicit leading '+' is unambiguous and may carry
+    # formatting; bare digits are only accepted in the E.164 7-15 digit range
+    # with no formatting, so short numeric secrets still classify as passwords
+    # and service names are never swallowed.  ``normalize_phone`` does the
+    # strict validation once the pattern has picked the type.
+    ("phone", r"(?:\+\s?[\d\s().\-]{6,}|\d{7,15})"),
     ("user_agent", r"^(?:Mozilla|curl|wget|python-requests|Go-http-client|Java)/[^\s]+$", re.IGNORECASE),
     ("named_pipe", r"^\\\\[^\\]+\\pipe\\"),
     # Registry keys must start with a known hive to avoid swallowing mutexes like Global\MyMutex
@@ -307,7 +337,7 @@ _SEARCH_BASED_TYPES = {"mutex", "registry_key", "named_pipe", "service_name"}
 SUPPORTED_IOC_TYPES = {
     "cve", "ipv4", "ipv6", "domain", "url", "email", "md5", "sha1", "sha256", "sha512",
     "ssdeep", "tlsh", "btc", "eth", "mitre_attack", "asn", "mac", "ja3", "ja4", "user_agent", "filename", "windows_path", "linux_path",
-    "mutex", "named_pipe", "registry_key", "service_name", "password", "password_sha1", "username",
+    "mutex", "named_pipe", "registry_key", "service_name", "password", "password_sha1", "username", "phone",
 }
 
 # Aliases that map user-friendly short prefixes to canonical type names.
@@ -351,6 +381,9 @@ _TYPE_PREFIX_ALIASES: dict[str, str] = {
     "windows_path": "windows_path",
     "linux_path": "linux_path",
     "user_agent": "user_agent",
+    "phone": "phone",
+    "tel": "phone",
+    "msisdn": "phone",
 }
 
 

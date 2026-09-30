@@ -64,6 +64,7 @@ _EVIDENCE_WEIGHTS = {
     "URLhaus": 0.95, "OpenPhish": 0.95, "Tria.ge": 0.95,
     "Hybrid Analysis": 0.90, "AlienVault OTX": 0.65, "urlscan.io": 0.65,
     "AbuseIPDB": 0.55, "StopForumSpam": 0.45, "AbstractAPI": 0.50, "Hunter.io": 0.50,
+    "AbstractAPI IP": 0.50, "AbstractAPI Phone": 0.50,
     "Hashlookup": 0.45, "cve.org": 0.85, "NVD": 0.85,
     "GreyNoise": 0.0, "IPinfo": 0.0, "Shodan": 0.0, "Censys": 0.0,
     "Team Cymru": 0.0, "Tor Exit": 0.60,
@@ -87,7 +88,7 @@ _PROVENANCE_GROUPS = {
 INTELLIGENCE_ONLY = {
     "GreyNoise", "IPinfo", "Shodan", "Censys", "Team Cymru", "Etherscan", "Blockchain.info",
 }
-SUPPORTING_SOURCES = {"AbuseIPDB", "StopForumSpam", "AbstractAPI", "Hunter.io", "Hashlookup", "LeakCheck.io", "Tor Exit"}
+SUPPORTING_SOURCES = {"AbuseIPDB", "StopForumSpam", "AbstractAPI", "Hunter.io", "Hashlookup", "LeakCheck.io", "Tor Exit", "AbstractAPI IP", "AbstractAPI Phone"}
 # Backwards-compatible export for integrations that only need the qualitative
 # labels. The aggregation engine does not use these values for fusion.
 VERDICT_SCORES = {"malicious": 1.0, "suspicious": 0.6, "clean": 0.0, "benign": 0.0, "unknown": 0.0, "error": 0.0}
@@ -370,6 +371,8 @@ def _signal(result: NormalizedResult, status: str, detection_count: int | None, 
         "urlscan.io": 0.58,
         "StopForumSpam": 0.38,
         "AbstractAPI": 0.50,
+        "AbstractAPI IP": 0.50,
+        "AbstractAPI Phone": 0.50,
         "Hunter.io": 0.50,
         "Hashlookup": 0.20,
         "ChainAbuse": 0.95,

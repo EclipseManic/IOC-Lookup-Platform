@@ -28,6 +28,8 @@ ADAPTER_TIMEOUTS: dict[str, Timeout] = {
     "IPinfo": Timeout(5.0, connect=3.0, read=10.0),
     "urlscan.io": Timeout(10.0, connect=5.0, read=20.0),
     "AbstractAPI": Timeout(10.0, connect=5.0, read=15.0),
+    "AbstractAPI IP": Timeout(10.0, connect=5.0, read=15.0),
+    "AbstractAPI Phone": Timeout(10.0, connect=5.0, read=15.0),
     "Hunter.io": Timeout(10.0, connect=5.0, read=15.0),
     "Team Cymru": Timeout(5.0, connect=3.0, read=10.0),
     "cve.org": Timeout(5.0, connect=3.0, read=10.0),

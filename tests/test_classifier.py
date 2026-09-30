@@ -200,3 +200,42 @@ def test_password_digest_detector():
     assert is_password_digest("a" * 39) is False
     assert is_password_digest("S3cret!") is False
     assert is_password_digest("") is False
+
+
+def test_classify_phone_international():
+    assert classify_ioc("+14152007986") == "phone"
+    assert classify_ioc("+447700900123") == "phone"
+
+
+def test_classify_phone_bare_digits():
+    # 7-15 digits is the E.164 digit-count range and collides with no hash.
+    assert classify_ioc("14152007986") == "phone"
+
+
+def test_phone_formatting_is_normalized_to_one_cache_identity():
+    assert normalize_ioc("+1 (415) 200-7986").value == "+14152007986"
+    assert normalize_ioc("+1-415-200-7986").value == "+14152007986"
+    assert normalize_ioc("+1.415.200.7986").value == "+14152007986"
+    # A bare national number is never given a '+' that was not supplied.
+    assert normalize_ioc("14152007986").value == "14152007986"
+
+
+def test_phone_typed_prefixes():
+    for value in ("tel:+14152007986", "phone:+14152007986", "msisdn:+447700900123"):
+        result = normalize_ioc(value)
+        assert result.ioc_type == "phone"
+        assert result.value.startswith("+")
+
+
+def test_short_numeric_secret_is_still_a_password_not_a_phone():
+    # A 6-digit PIN must not become a phone number now that phone exists.
+    assert classify_ioc("123456") == "password"
+    # More digits than E.164 allows is not a phone number either.
+    assert normalize_ioc("+1234567890123456").valid is False
+
+
+def test_explicit_phone_type_validates_and_normalizes():
+    assert normalize_ioc("+1 (415) 200-7986", expected_type="phone").value == "+14152007986"
+    assert normalize_ioc("415.200.7986", expected_type="phone").value == "4152007986"
+    for bad in ("not-a-phone", "12345", "+", ""):
+        assert normalize_ioc(bad, expected_type="phone").valid is False

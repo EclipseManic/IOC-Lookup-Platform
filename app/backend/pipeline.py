@@ -19,7 +19,11 @@ from app.backend.http_client import get_client
 from app.backend.rate_limiter import RateLimiter
 from app.backend.adapters.cve_org import CveOrgAdapter
 from app.backend.adapters.hashlookup import HashlookupAdapter
-from app.backend.adapters.abstract_api import AbstractAPIAdapter
+from app.backend.adapters.abstract_api import (
+    AbstractAPIAdapter,
+    AbstractAPIIPAdapter,
+    AbstractAPIPhoneAdapter,
+)
 from app.backend.adapters.hunter_io import HunterIOAdapter
 from app.backend.adapters.team_cymru import TeamCymruAdapter
 from app.backend.adapters.nvd import NvdAdapter
@@ -92,6 +96,8 @@ def _init_adapters():
         IPinfoAdapter(),
         StopForumSpamAdapter(),
         AbstractAPIAdapter(),
+        AbstractAPIIPAdapter(),
+        AbstractAPIPhoneAdapter(),
         HunterIOAdapter(),
         TeamCymruAdapter(),
         CveOrgAdapter(),

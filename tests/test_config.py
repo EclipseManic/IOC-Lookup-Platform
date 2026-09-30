@@ -22,6 +22,9 @@ VALID_KEYS = {
     "censys_api_key": "a" * 40,
     "ipinfo_api_key": "a" * 40,
     "abstractapi_api_key": "a" * 32,
+    "abstractapi_email_api_key": "a" * 32,
+    "abstractapi_ip_api_key": "a" * 32,
+    "abstractapi_phone_api_key": "a" * 32,
     "hunterio_api_key": "a" * 40,
 }
 
@@ -41,6 +44,9 @@ ALIAS_KEYS = {
     "censys_api_key": "CENSYS_API_KEY",
     "ipinfo_api_key": "IPINFO_API_KEY",
     "abstractapi_api_key": "ABSTRACTAPI_API_KEY",
+    "abstractapi_email_api_key": "ABSTRACTAPI_EMAIL_KEY",
+    "abstractapi_ip_api_key": "ABSTRACTAPI_IP_KEY",
+    "abstractapi_phone_api_key": "ABSTRACTAPI_No_KEY",
     "hunterio_api_key": "HUNTERIO_API_KEY",
 }
 
