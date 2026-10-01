@@ -51,7 +51,7 @@ class HIBPAdapter(SourceAdapter):
         url = f"https://api.pwnedpasswords.com/range/{prefix}"
         headers = {
             "Add-Padding": "true",
-            "User-Agent": "IOC-Platform/1.0",
+            "User-Agent": "IOC-Lookup-Platform/1.0",
             "Accept": "text/plain",
         }
 

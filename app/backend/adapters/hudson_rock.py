@@ -41,7 +41,7 @@ logger = get_logger("adapter.hudson_rock")
 _BASE = "https://cavalier.hudsonrock.com/api/json/v2/osint-tools"
 _HEADERS = {
     "Accept": "application/json",
-    "User-Agent": "IOC-Platform/1.0",
+    "User-Agent": "IOC-Lookup-Platform/1.0",
 }
 
 

@@ -1,4 +1,4 @@
-# IOC Platform
+# IOC Lookup Platform
 
 A self-hosted indicator-of-compromise lookup tool. Give it an IP, domain, URL,
 email address, phone number, hash, CVE or wallet address and it queries the

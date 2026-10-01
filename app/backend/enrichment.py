@@ -1986,7 +1986,7 @@ async def _crt_sh_subdomains(domain: str) -> SubdomainInfo | None:
         for attempt in range(2):
             r = await c.get(
                 f"https://crt.sh/?q=%25.{domain}&output=json",
-                headers={"User-Agent": "IOC-Platform/1.0", "Accept": "application/json"},
+                headers={"User-Agent": "IOC-Lookup-Platform/1.0", "Accept": "application/json"},
                 timeout=10,
             )
             if r.status_code == 502 and attempt < 1:
@@ -2132,7 +2132,7 @@ async def _nvd_cve(cve_id: str) -> dict:
     from app.backend.config import settings
 
     try:
-        headers = {"User-Agent": "IOC-Platform/1.0"}
+        headers = {"User-Agent": "IOC-Lookup-Platform/1.0"}
         if settings.nvd_api_key:
             headers["X-Api-Key"] = settings.nvd_api_key
         c = _get_http_client()

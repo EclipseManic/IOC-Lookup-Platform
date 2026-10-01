@@ -187,7 +187,7 @@ class Settings(BaseSettings):
     require_network_tls: bool = Field(True, alias="REQUIRE_NETWORK_TLS")
     allow_global_feedback: bool = Field(False, alias="ALLOW_GLOBAL_FEEDBACK")
     cache_dir: str = Field("", alias="CACHE_DIR")
-    app_name: str = "IOC Platform"
+    app_name: str = "IOC Lookup Platform"
     debug: bool = False
     ioc_timeout: int = Field(60, alias="IOC_TIMEOUT")
     batch_deadline_seconds: int = Field(300, alias="BATCH_DEADLINE_SECONDS")

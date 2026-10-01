@@ -63,7 +63,7 @@ def test_defaults_applied():
     s = _settings()
     assert s.port == 8000
     assert s.host == "127.0.0.1"
-    assert s.app_name == "IOC Platform"
+    assert s.app_name == "IOC Lookup Platform"
     assert s.enable_active_port_scan is False
     assert s.enable_url_content_fetch is False
     assert s.webhooks_enabled is False

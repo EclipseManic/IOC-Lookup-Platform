@@ -34,7 +34,7 @@ class HybridAnalysisAdapter(SourceAdapter):
     def _headers(self, json_body: bool = False) -> dict:
         headers = {
             "api-key": self.api_key,
-            "user-agent": "IOC-Platform/1.0",
+            "user-agent": "IOC-Lookup-Platform/1.0",
             "Accept": "application/json",
         }
         if json_body:
