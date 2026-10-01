@@ -867,6 +867,7 @@ _BATCH_COUNTER_DEFAULTS = {
 }
 _BATCH_SUMMARY_DEFAULTS = {
     "malicious": 0,
+    "breached": 0,
     "suspicious": 0,
     "clean": 0,
     "unknown": 0,
@@ -1190,8 +1191,8 @@ def consolidate_batch_results(batch: BatchTask) -> dict:
     # ``summary`` keeps the legacy reputation buckets for existing clients.
     # Domain-aware reporting lives beside it so vulnerability and ATT&CK
     # records cannot be mistaken for reputation verdicts.
-    summary = {"malicious": 0, "suspicious": 0, "clean": 0, "unknown": 0, "error": 0}
-    assessment_distribution = {"malicious": 0, "suspicious": 0, "benign": 0, "unknown": 0, "context_only": 0, "vulnerability": 0, "attack_technique": 0}
+    summary = {"malicious": 0, "breached": 0, "suspicious": 0, "clean": 0, "unknown": 0, "error": 0}
+    assessment_distribution = {"malicious": 0, "breached": 0, "suspicious": 0, "benign": 0, "unknown": 0, "context_only": 0, "vulnerability": 0, "attack_technique": 0}
     execution_health = {"applicable_provider_lookups": 0, "successful": 0, "not_found": 0, "rate_limited": 0, "timeout": 0, "errors": 0, "not_applicable": 0, "cached": 0, "partial": 0, "batch_deadline_exceeded": 0}
 
     for task in batch.subtasks:
@@ -1216,9 +1217,20 @@ def consolidate_batch_results(batch: BatchTask) -> dict:
                 summary["unknown"] += 1
         elif domain_bucket in {"attack_technique", "context_only"}:
             summary["unknown"] += 1
-        elif verdict in {"breached", "compromised"}:
+        elif verdict in {"breached", "pwned"}:
+            # Exposure, not proven malice. A credential appearing in a breach
+            # corpus means it is at risk, not that whoever holds it is an
+            # attacker, so it gets its own bucket. Folding it into
+            # `malicious` -- as this did -- made the History page report
+            # breached addresses as malicious detections.
+            summary["breached"] += 1
+            assessment_distribution["breached"] += 1
+        elif verdict == "compromised":
+            # An account or host that is actively taken over is a different
+            # claim from having appeared in a breach list.
             summary["malicious"] += 1
             assessment_distribution["malicious"] += 1
+
         elif verdict in {"not_breached", "uncompromised", "benign", "clean", "harmless", "whitelisted"}:
             summary["clean"] += 1
             assessment_distribution["benign"] += 1

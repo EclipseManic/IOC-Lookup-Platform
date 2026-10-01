@@ -995,6 +995,8 @@ export interface BatchStatus {
 
 export interface BatchResultSummary {
   malicious: number;
+  /** Credentials/addresses found in a breach corpus. Exposure, not proven malice. */
+  breached?: number;
   suspicious: number;
   clean: number;
   unknown: number;
@@ -1003,6 +1005,7 @@ export interface BatchResultSummary {
   vulnerability?: number;
   attack_technique?: number;
 }
+
 
 export interface BatchResultItem extends NormalizedResult {
   _ioc?: string;

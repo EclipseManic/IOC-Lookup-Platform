@@ -183,6 +183,9 @@ async def test_legacy_batch_payload_gets_complete_api_contract():
     assert result["subtasks"] == []
     assert result["summary"] == {
         "malicious": 1,
+        # A legacy stored summary has no `breached` key; the API contract fills
+        # it with zero so clients can rely on the shape.
+        "breached": 0,
         "suspicious": 0,
         "clean": 0,
         "unknown": 0,

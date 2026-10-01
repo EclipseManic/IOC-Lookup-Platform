@@ -1,4 +1,4 @@
-ï»¿import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { showToast } from "../components/Toast";
 import IocAssessmentCard from "../components/IocAssessmentCard";
 import VerdictBadge from "../components/VerdictBadge";
@@ -21,20 +21,44 @@ import {
 import type { NavigateEvent } from "../App";
 import { formatDuration } from "../lib/format";
 import { problemReason } from "../lib/providerEvidence";
+import { getVerdictBucket, type VerdictBucket } from "../lib/verdictColors";
 
-type VerdictBucket = "malicious" | "breached" | "suspicious" | "benign" | "not_breached" | "unknown";
+/**
+ * Verdict bucketing comes from lib/verdictColors, which is the single source of
+ * truth. A local reimplementation used to live here and disagreed with it: it had
+ * no case for the vulnerability severity vocabulary (critical/high/medium/low),
+ * so every CVE in a batch bucketed to "unknown" and the verdict filter could not
+ * isolate any of them. The shared map resolves critical/high to "malicious",
+ * medium to "suspicious" and low to "benign".
+ */
 type BatchGroup = { key: string; assessment?: IOCAssessment; results: BatchResultItem[]; value: string; type: string };
 
+/** Donut/legend colours, taken from the shared palette so the two never drift. */
 const VERDICT_COLORS: Record<VerdictBucket, string> = {
   malicious: "#ef4444",
   breached: "#f43f5e",
   suspicious: "#f59e0b",
   benign: "#22c55e",
   not_breached: "#10b981",
+  context_only: "#6b7280",
+  malicious_test_artifact: "#3b82f6",
   unknown: "#6b7280",
+  error: "#ef4444",
 };
 
-const VERDICT_ORDER: VerdictBucket[] = ["malicious", "breached", "suspicious", "benign", "not_breached", "unknown"];
+/** Severity order for sorting, most severe first. */
+const VERDICT_ORDER: VerdictBucket[] = [
+  "malicious",
+  "breached",
+  "suspicious",
+  "context_only",
+  "benign",
+  "not_breached",
+  "malicious_test_artifact",
+  "unknown",
+  "error",
+];
+
 const CREDENTIAL_MARKERS = ["password", "passwd", "secret", "admin", "root", "qwerty", "letmein", "welcome", "login", "auth", "user", "service"];
 
 function isCredentialCandidate(value: string): boolean {
@@ -76,32 +100,12 @@ async function prepareBatchValues(values: string[]): Promise<string[]> {
   return prepared;
 }
 
-// Verdicts that carry NO reputation signal and must never reach the
-// malicious/benign buckets:
-//   - `malicious_test_artifact` is the EICAR-style TEST sentinel. It contains the
-//     substring "malicious", so it has to be matched BEFORE the
-//     `.includes("malicious")` check below or the donut reports fake detections.
-//   - `context_only` is emitted by context-only providers (scorer.py).
-//   - `vulnerability` / `attack_technique` are typed assessment domains (CVE and
-//     ATT&CK). They already fell through to "unknown"; listing them here makes
-//     that deliberate so a future `.includes()` style check cannot capture them.
-const NON_REPUTATION_VERDICTS = new Set([
-  "malicious_test_artifact",
-  "context_only",
-  "vulnerability",
-  "attack_technique",
-]);
+// Verdict bucketing is delegated to lib/verdictColors (getVerdictBucket). The
+// implementation that used to live here had no case for the vulnerability
+// severity vocabulary, so critical/high/medium/low all fell through to
+// "unknown" and a batch of CVEs could not be filtered by verdict at all.
+const verdictBucket = getVerdictBucket;
 
-function verdictBucket(verdict: string): VerdictBucket {
-  const value = verdict.trim().toLowerCase();
-  if (NON_REPUTATION_VERDICTS.has(value)) return "unknown";
-  if (value === "breached" || value === "pwned") return "breached";
-  if (value === "not_breached" || value === "not_pwned") return "not_breached";
-  if (value.includes("malicious") || value === "compromised") return "malicious";
-  if (value === "suspicious") return "suspicious";
-  if (value === "benign" || value === "clean") return "benign";
-  return "unknown";
-}
 function verdictLabel(verdict: VerdictBucket): string {
   if (verdict === "not_breached") return "Not Breached";
   if (verdict === "breached") return "Breached";
@@ -223,7 +227,7 @@ function UnassessedGroup({ group }: { group: BatchGroup }) {
   return (
     <article className="overflow-hidden rounded-xl border border-border bg-bg-card">
       <button type="button" onClick={() => setExpanded((value) => !value)} aria-expanded={expanded} className="w-full p-4 text-left hover:bg-bg-elevated/30">
-        <div className="flex flex-wrap items-center justify-between gap-3"><div className="min-w-0"><div className="mb-1 text-xs uppercase tracking-wider text-text-secondary">{group.type} Â· assessment unavailable</div><div className="truncate font-mono text-sm" title={group.value}>{group.value}</div></div><div className="flex items-center gap-2"><VerdictBadge verdict="unknown" /><span className="rounded-full border border-rose-500/40 bg-rose-500/10 px-2 py-0.5 text-xs font-semibold uppercase text-rose-300">Pipeline health</span><span className="text-text-secondary">{expanded ? "âŒƒ" : "âŒ„"}</span></div></div>
+        <div className="flex flex-wrap items-center justify-between gap-3"><div className="min-w-0"><div className="mb-1 text-xs uppercase tracking-wider text-text-secondary">{group.type} · assessment unavailable</div><div className="truncate font-mono text-sm" title={group.value}>{group.value}</div></div><div className="flex items-center gap-2"><VerdictBadge verdict="unknown" /><span className="rounded-full border border-rose-500/40 bg-rose-500/10 px-2 py-0.5 text-xs font-semibold uppercase text-rose-300">Pipeline health</span><span className="text-text-secondary">{expanded ? "^" : "?"}</span></div></div>
         <p className="mt-2 text-xs text-text-secondary">The IOC-level assessment was not returned. Provider results are retained below for audit.</p>
       </button>
       {expanded && <div className="space-y-2 border-t border-border p-4">{group.results.map((item) => <div key={item.source} className="rounded border border-border bg-bg-elevated/40 p-2 text-xs"><div className="flex justify-between gap-2"><span className="font-semibold">{item.source}</span><span className="text-text-secondary">{item.execution_state || item.status}</span></div><div className="mt-1 text-text-secondary">{(item.execution_state || item.status) === "success" ? `Provider verdict: ${item.provider_verdict ?? item.verdict}` : problemReason(item)}</div></div>)}</div>}
@@ -233,14 +237,7 @@ function UnassessedGroup({ group }: { group: BatchGroup }) {
 
 function BatchSummary({ result, groups }: { result: BatchResult; groups: BatchGroup[] }) {
   const counts = useMemo(() => {
-    const next: Record<VerdictBucket, number> = {
-      malicious: 0,
-      breached: 0,
-      suspicious: 0,
-      benign: 0,
-      not_breached: 0,
-      unknown: 0,
-    };
+    const next = Object.fromEntries(VERDICT_ORDER.map((bucket) => [bucket, 0])) as Record<VerdictBucket, number>;
     for (const group of groups) {
       next[verdictBucket(group.assessment?.final_verdict ?? "unknown")] += 1;
     }
@@ -277,13 +274,13 @@ function BatchSummary({ result, groups }: { result: BatchResult; groups: BatchGr
     ["Timeouts", timeouts],
     ["Errors / unavailable", errors],
     ["Batch deadline", deadline],
-    ["Avg provider latency", health.length ? formatDuration(averageLatency) : "â€”"],
+    ["Avg provider latency", health.length ? formatDuration(averageLatency) : "—"],
   ] as const;
   return (
     <section className="rounded-xl border border-border bg-bg-card p-5">
       <div className="flex flex-wrap items-start justify-between gap-5">
         <div><h3 className="text-sm font-semibold uppercase tracking-wider text-text-secondary">IOC reputation summary</h3><p className="mt-1 text-xs text-text-secondary">Only reputation-domain verdicts appear in this chart; typed domains stay separate.</p><div className="mt-4"><VerdictDonut counts={counts} /></div><div className="mt-4 flex flex-wrap gap-2">{domainCounts.map(([domain, count]) => <span key={domain} className="rounded-full border border-border bg-bg-elevated px-2.5 py-1 text-xs text-text-secondary">{domain.replace(/_/g, " ")}: <span className="font-semibold text-text-primary">{count}</span></span>)}</div></div>
-        <div className="min-w-[min(100%,34rem)] flex-1"><h3 className="text-sm font-semibold uppercase tracking-wider text-text-secondary">Provider lookup health</h3><div className="mt-3 grid grid-cols-2 gap-2 sm:grid-cols-3">{healthMetrics.map(([name, value]) => <div key={name} className="rounded-md border border-border bg-bg-elevated/60 p-2.5"><div className="text-xs uppercase tracking-wider text-text-secondary">{name}</div><div className={`mt-1 text-lg font-semibold ${name === "Rate limited" || name === "Timeouts" || name === "Errors / unavailable" ? "text-amber-300" : "text-text-primary"}`}>{value}</div></div>)}</div><div className="mt-3 flex flex-wrap gap-2 text-xs text-text-secondary"><span>{count(result.completed)}/{count(result.total)} IOCs complete</span><span>Â·</span><span>{count(result.not_found_lookups)} not found (not clean)</span><span>Â·</span><span>{groups.filter((group) => group.assessment?.needs_review).length} needs review</span></div></div>
+        <div className="min-w-[min(100%,34rem)] flex-1"><h3 className="text-sm font-semibold uppercase tracking-wider text-text-secondary">Provider lookup health</h3><div className="mt-3 grid grid-cols-2 gap-2 sm:grid-cols-3">{healthMetrics.map(([name, value]) => <div key={name} className="rounded-md border border-border bg-bg-elevated/60 p-2.5"><div className="text-xs uppercase tracking-wider text-text-secondary">{name}</div><div className={`mt-1 text-lg font-semibold ${name === "Rate limited" || name === "Timeouts" || name === "Errors / unavailable" ? "text-amber-300" : "text-text-primary"}`}>{value}</div></div>)}</div><div className="mt-3 flex flex-wrap gap-2 text-xs text-text-secondary"><span>{count(result.completed)}/{count(result.total)} IOCs complete</span><span>·</span><span>{count(result.not_found_lookups)} not found (not clean)</span><span>·</span><span>{groups.filter((group) => group.assessment?.needs_review).length} needs review</span></div></div>
       </div>
       {(rateLimited > 0 || timeouts > 0 || errors > 0 || deadline > 0) && <p className="mt-4 rounded-md border border-amber-500/30 bg-amber-500/10 px-3 py-2 text-xs text-amber-200">Provider-health failures and deadline aborts are shown as execution status and excluded from malicious/benign scoring. UNKNOWN with incomplete coverage is not proof of safety.</p>}
     </section>
@@ -323,7 +320,7 @@ export default function Batch({
   const [batchFailure, setBatchFailure] = useState<string | null>(null);
   // Non-null while a batch is being fetched/started but has produced no status,
   // result or error yet. Without it that window renders the "paste IOCs" form.
-  const [loadingNotice, setLoadingNotice] = useState<string | null>(initialBatchId ? "Loading saved batchâ€¦" : null);
+  const [loadingNotice, setLoadingNotice] = useState<string | null>(initialBatchId ? "Loading saved batch…" : null);
   const [openingKey, setOpeningKey] = useState<string | null>(null);
   const pollingRef = useRef<number | null>(null);
   const pollingGenerationRef = useRef(0);
@@ -349,7 +346,7 @@ export default function Batch({
     }
     let cancelled = false;
     setLoading(true);
-    setLoadingNotice(initialBatchId ? "Loading saved batchâ€¦" : "Resuming batchâ€¦");
+    setLoadingNotice(initialBatchId ? "Loading saved batch…" : "Resuming batch…");
     getBatchResult(resumeId).then((loaded) => {
       if (!cancelled) {
         setBatchId(loaded.batch_id || resumeId);
@@ -362,7 +359,7 @@ export default function Batch({
       if (error instanceof ApiError && error.status === 425) {
         // Still running on the server: follow its progress instead of failing.
         setBatchId(resumeId);
-        setLoadingNotice("Batch still running â€” reconnectingâ€¦");
+        setLoadingNotice("Batch still running — reconnecting…");
         void pollBatchRef.current?.(resumeId);
         return;
       }
@@ -423,7 +420,7 @@ export default function Batch({
           const stoppedGeneration = stopPolling();
           // `stopPolling()` already bumped the generation, so a throw here would
           // fall into the outer catch and be discarded by its stale-generation
-          // guard â€” leaving `loading` true and the progress card spinning with no
+          // guard — leaving `loading` true and the progress card spinning with no
           // error. This branch therefore recovers on its own.
           let finalResult: BatchResult;
           try {
@@ -435,7 +432,7 @@ export default function Batch({
             // `status` is intentionally kept: setting `pollError` hides the
             // progress card (it requires `!pollError`) and shows the retry card.
             setPollError("Batch finished but results could not be loaded. Retry to fetch them.");
-            showToast("Batch finished but results could not be loaded â€” retry to fetch them", "error");
+            showToast("Batch finished but results could not be loaded — retry to fetch them", "error");
             return;
           }
           if (stoppedGeneration !== pollingGenerationRef.current) return;
@@ -456,7 +453,7 @@ export default function Batch({
             ? "The server no longer knows this batch (it may have restarted)."
             : `Batch polling failed: ${errorMessage(error)}. The batch may still be running on the server.`;
           setPollError(message);
-          showToast(notFound ? message : "Batch polling failed â€” retry to resume", "error");
+          showToast(notFound ? message : "Batch polling failed — retry to resume", "error");
           return;
         }
       }
@@ -492,7 +489,7 @@ export default function Batch({
       showToast(error instanceof Error ? error.message : "Could not secure batch input", "error");
       return;
     }
-    setLoading(true); setBatchId(null); setStatus(null); setResult(null); setBatchFailure(null); setLoadingNotice("Starting batchâ€¦");
+    setLoading(true); setBatchId(null); setStatus(null); setResult(null); setBatchFailure(null); setLoadingNotice("Starting batch…");
     try { const started = await startBatch(preparedList); setBatchId(started.batch_id); await pollBatch(started.batch_id); } catch (error) { showToast(errorMessage(error, "Could not start batch"), "error"); setLoading(false); setLoadingNotice(null); }
   }
 
@@ -510,7 +507,7 @@ export default function Batch({
       showToast("Could not inspect batch file", "error");
       return;
     }
-    setLoading(true); setBatchId(null); setStatus(null); setResult(null); setBatchFailure(null); setLoadingNotice("Uploading batch fileâ€¦");
+    setLoading(true); setBatchId(null); setStatus(null); setResult(null); setBatchFailure(null); setLoadingNotice("Uploading batch file…");
     try { const started = await uploadBatchFile(file); setBatchId(started.batch_id); await pollBatch(started.batch_id); } catch (error) { showToast(errorMessage(error, "Could not upload batch"), "error"); setLoading(false); setLoadingNotice(null); }
   }
 
@@ -561,7 +558,7 @@ export default function Batch({
     setStatus(null);
     setResult(null);
     setBatchFailure(null);
-    setLoadingNotice("Starting re-scanâ€¦");
+    setLoadingNotice("Starting re-scan…");
     try {
       const started = await startBatch(list);
       setBatchId(started.batch_id);
@@ -596,6 +593,14 @@ export default function Batch({
     ...(group.assessment?.provider_plan ?? []).map((item) => String(item.provider ?? "")),
   ].filter(Boolean)))].sort(), [groups]);
   const domainOptions = useMemo(() => [...new Set(groups.map((group) => domainFor(group.assessment)))].sort(), [groups]);
+  // Only offer the verdict buckets that actually occur in this batch. A fixed
+  // list means selecting "Malicious" on a batch of clean IOCs silently shows an
+  // empty table with no indication that the bucket was simply absent, and a
+  // bucket the backend can emit but the list omits is unreachable entirely.
+  const verdictOptions = useMemo(() => {
+    const present = new Set(groups.map((group) => verdictBucket(group.assessment?.final_verdict ?? "unknown")));
+    return VERDICT_ORDER.filter((bucket) => present.has(bucket));
+  }, [groups]);
   const visibleGroups = useMemo(() => {
     const filtered = groups.filter((group) => {
       const assessment = group.assessment;
@@ -624,8 +629,9 @@ export default function Batch({
       if (sortBy === "duration") return Math.max(...right.results.map((item) => item.latency_ms ?? 0), 0) - Math.max(...left.results.map((item) => item.latency_ms ?? 0), 0);
       if (sortBy === "confidence") return ({ high: 0, medium: 1, low: 2 }[left.assessment?.confidence ?? "low"] ?? 2) - ({ high: 0, medium: 1, low: 2 }[right.assessment?.confidence ?? "low"] ?? 2);
       if (sortBy === "ioc") return left.value.localeCompare(right.value);
-      const severity = (group: BatchGroup) => ({ malicious: 0, breached: 1, suspicious: 2, benign: 3, not_breached: 4, unknown: 5 }[verdictBucket(group.assessment?.final_verdict ?? "unknown")] ?? 5);
+      const severity = (group: BatchGroup) => VERDICT_ORDER.indexOf(verdictBucket(group.assessment?.final_verdict ?? "unknown"));
       return severity(left) - severity(right);
+
     });
   }, [confidenceFilter, coverageFilter, domainFilter, freshnessFilter, groups, malwareFilter, providerFilter, query, reviewOnly, riskFilter, sortBy, statusFilter, typeFilter, verdictFilter]);
 
@@ -637,17 +643,17 @@ export default function Batch({
 
       {loadingNotice && !status && !result && !pollError && <div role="status" className="rounded-lg border border-border bg-bg-card p-6 text-center text-sm text-text-secondary">{loadingNotice}</div>}
 
-      {!batchId && !loadingNotice && <div className="space-y-4"><label role="button" tabIndex={0} aria-label="Upload CSV or JSON file" className={`flex h-32 flex-col items-center justify-center rounded-lg border-2 border-dashed transition-colors focus:outline-none focus:border-accent focus:ring-1 focus:ring-accent ${dragOver ? "border-accent bg-accent/5" : "border-border hover:border-accent/50"}`} onKeyDown={(event) => { if (event.key === "Enter" || event.key === " ") { event.preventDefault(); (event.currentTarget.querySelector("input[type=file]") as HTMLInputElement | null)?.click(); } }} onDragOver={(event) => { event.preventDefault(); setDragOver(true); }} onDragLeave={() => setDragOver(false)} onDrop={(event) => { event.preventDefault(); setDragOver(false); const file = event.dataTransfer.files?.[0]; if (file) { const dataTransfer = new DataTransfer(); dataTransfer.items.add(file); handleFileUpload({ target: { files: dataTransfer.files } } as React.ChangeEvent<HTMLInputElement>); } }}><svg className="mb-2 h-8 w-8 text-text-secondary" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={1.5} d="M7 16a4 4 0 01-.88-7.903A5 5 0 1115.9 6L16 6a5 5 0 011 9.9M15 13l-3-3m0 0l-3 3m3-3v12" /></svg><span className="text-xs text-text-secondary">Drop CSV/JSON/TXT file or click to browse</span><input type="file" accept=".csv,.json,.txt" onChange={handleFileUpload} className="hidden" /></label><div><textarea value={iocs} onChange={(event) => setIocs(event.target.value)} placeholder={"Paste IOCs here, one per line â€” auto-detected or typed:\n185.199.108.153\nexample.com\ndomain:eclipsemanic.me\nip:8.8.8.8\nsha256:d41d8cd98f00b204e9800998ecf8427e..."} className="h-40 w-full resize-y rounded-lg border border-border bg-bg-card px-4 py-3 font-mono text-sm text-text-primary outline-none transition-all placeholder-text-secondary focus:border-accent focus:ring-1 focus:ring-accent" disabled={loading} /><div className="mt-1.5 rounded-md border border-accent/20 bg-accent/5 px-3 py-1.5 text-xs text-text-secondary"><span className="font-semibold text-accent">ðŸ’¡ Typed prefixes:</span> Force IOC type with <code className="rounded bg-bg-elevated px-1 py-0.5 font-mono text-accent">type:value</code> syntax â€” e.g. <code className="rounded bg-bg-elevated px-1 py-0.5 font-mono">domain:eclipsemanic.me</code>, <code className="rounded bg-bg-elevated px-1 py-0.5 font-mono">ip:1.1.1.1</code>, <code className="rounded bg-bg-elevated px-1 py-0.5 font-mono">cve:CVE-2021-44228</code>, <code className="rounded bg-bg-elevated px-1 py-0.5 font-mono">sha256:abc123â€¦</code></div><div className="mt-2 flex items-center justify-between"><span className={`text-xs font-mono ${overLimit ? "text-verdict-malicious" : "text-text-secondary"}`}>{inputList.length} IOC{inputList.length !== 1 ? "s" : ""}{overLimit ? " (max 100)" : ""}</span><button onClick={handleSubmit} disabled={loading || inputList.length === 0 || overLimit} className="rounded-lg bg-accent px-5 py-2 text-sm font-medium text-[#06070d] transition-colors hover:bg-accent/90 disabled:cursor-not-allowed disabled:opacity-40">{loading ? "Starting..." : "Analyze Batch"}</button></div></div></div>}
+      {!batchId && !loadingNotice && <div className="space-y-4"><label role="button" tabIndex={0} aria-label="Upload CSV or JSON file" className={`flex h-32 flex-col items-center justify-center rounded-lg border-2 border-dashed transition-colors focus:outline-none focus:border-accent focus:ring-1 focus:ring-accent ${dragOver ? "border-accent bg-accent/5" : "border-border hover:border-accent/50"}`} onKeyDown={(event) => { if (event.key === "Enter" || event.key === " ") { event.preventDefault(); (event.currentTarget.querySelector("input[type=file]") as HTMLInputElement | null)?.click(); } }} onDragOver={(event) => { event.preventDefault(); setDragOver(true); }} onDragLeave={() => setDragOver(false)} onDrop={(event) => { event.preventDefault(); setDragOver(false); const file = event.dataTransfer.files?.[0]; if (file) { const dataTransfer = new DataTransfer(); dataTransfer.items.add(file); handleFileUpload({ target: { files: dataTransfer.files } } as React.ChangeEvent<HTMLInputElement>); } }}><svg className="mb-2 h-8 w-8 text-text-secondary" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={1.5} d="M7 16a4 4 0 01-.88-7.903A5 5 0 1115.9 6L16 6a5 5 0 011 9.9M15 13l-3-3m0 0l-3 3m3-3v12" /></svg><span className="text-xs text-text-secondary">Drop CSV/JSON/TXT file or click to browse</span><input type="file" accept=".csv,.json,.txt" onChange={handleFileUpload} className="hidden" /></label><div><textarea value={iocs} onChange={(event) => setIocs(event.target.value)} placeholder={"Paste IOCs here, one per line — auto-detected or typed:\n185.199.108.153\nexample.com\ndomain:eclipsemanic.me\nip:8.8.8.8\nsha256:d41d8cd98f00b204e9800998ecf8427e..."} className="h-40 w-full resize-y rounded-lg border border-border bg-bg-card px-4 py-3 font-mono text-sm text-text-primary outline-none transition-all placeholder-text-secondary focus:border-accent focus:ring-1 focus:ring-accent" disabled={loading} /><div className="mt-1.5 rounded-md border border-accent/20 bg-accent/5 px-3 py-1.5 text-xs text-text-secondary"><span className="font-semibold text-accent">?? Typed prefixes:</span> Force IOC type with <code className="rounded bg-bg-elevated px-1 py-0.5 font-mono text-accent">type:value</code> syntax — e.g. <code className="rounded bg-bg-elevated px-1 py-0.5 font-mono">domain:eclipsemanic.me</code>, <code className="rounded bg-bg-elevated px-1 py-0.5 font-mono">ip:1.1.1.1</code>, <code className="rounded bg-bg-elevated px-1 py-0.5 font-mono">cve:CVE-2021-44228</code>, <code className="rounded bg-bg-elevated px-1 py-0.5 font-mono">sha256:abc123…</code></div><div className="mt-2 flex items-center justify-between"><span className={`text-xs font-mono ${overLimit ? "text-verdict-malicious" : "text-text-secondary"}`}>{inputList.length} IOC{inputList.length !== 1 ? "s" : ""}{overLimit ? " (max 100)" : ""}</span><button onClick={handleSubmit} disabled={loading || inputList.length === 0 || overLimit} className="rounded-lg bg-accent px-5 py-2 text-sm font-medium text-[#06070d] transition-colors hover:bg-accent/90 disabled:cursor-not-allowed disabled:opacity-40">{loading ? "Starting..." : "Analyze Batch"}</button></div></div></div>}
 
-      {status && !result && !pollError && <div className="rounded-lg border border-border bg-bg-card p-6 text-center"><div role="progressbar" aria-label="Batch progress" aria-valuemin={0} aria-valuemax={100} aria-valuenow={Math.round(count(status.progress))} className="mb-4 h-2 w-full rounded-full bg-bg-elevated"><div className="h-2 rounded-full bg-gradient-to-r from-accent to-accent-secondary transition-all duration-500" style={{ width: `${Math.max(0, Math.min(100, count(status.progress)))}%` }} /></div><p className="text-sm text-text-secondary" aria-live="polite">Processing {count(status.completed)}/{count(status.total)} IOCsâ€¦</p><p className="mt-1 text-xs text-text-secondary">{count(status.progress) > 0 && count(status.expected_lookups) > 0 ? `${count(status.progress).toFixed(0)}% complete Â· ${count(status.completed_lookups)}/${count(status.expected_lookups)} provider lookups` : status.active_iocs?.length ? `Analyzing ${status.active_iocs.length} IOC${status.active_iocs.length === 1 ? "" : "s"} Â· provider plan in progressâ€¦` : "Preparing provider plansâ€¦"}</p><button onClick={async () => { if (!batchId) return; try { await cancelBatch(batchId); showToast("Batch cancellation requested", "info"); } catch (error) { showToast(errorMessage(error, "Could not cancel batch"), "error"); } }} className="mt-4 rounded-md border border-border bg-bg-elevated px-3 py-1.5 text-xs text-text-secondary transition-colors hover:border-red-400/40 hover:text-red-400">Cancel Batch</button></div>}
+      {status && !result && !pollError && <div className="rounded-lg border border-border bg-bg-card p-6 text-center"><div role="progressbar" aria-label="Batch progress" aria-valuemin={0} aria-valuemax={100} aria-valuenow={Math.round(count(status.progress))} className="mb-4 h-2 w-full rounded-full bg-bg-elevated"><div className="h-2 rounded-full bg-gradient-to-r from-accent to-accent-secondary transition-all duration-500" style={{ width: `${Math.max(0, Math.min(100, count(status.progress)))}%` }} /></div><p className="text-sm text-text-secondary" aria-live="polite">Processing {count(status.completed)}/{count(status.total)} IOCs…</p><p className="mt-1 text-xs text-text-secondary">{count(status.progress) > 0 && count(status.expected_lookups) > 0 ? `${count(status.progress).toFixed(0)}% complete · ${count(status.completed_lookups)}/${count(status.expected_lookups)} provider lookups` : status.active_iocs?.length ? `Analyzing ${status.active_iocs.length} IOC${status.active_iocs.length === 1 ? "" : "s"} · provider plan in progress…` : "Preparing provider plans…"}</p><button onClick={async () => { if (!batchId) return; try { await cancelBatch(batchId); showToast("Batch cancellation requested", "info"); } catch (error) { showToast(errorMessage(error, "Could not cancel batch"), "error"); } }} className="mt-4 rounded-md border border-border bg-bg-elevated px-3 py-1.5 text-xs text-text-secondary transition-colors hover:border-red-400/40 hover:text-red-400">Cancel Batch</button></div>}
 
-      {pollError && !result && <div className="rounded-lg border border-verdict-malicious/30 bg-verdict-malicious/10 p-6 text-center"><p className="mb-2 font-medium text-verdict-malicious">Batch polling interrupted</p><p className="mb-4 text-sm text-text-secondary">{pollError}</p><div className="flex justify-center gap-2"><button onClick={handleRetryPoll} disabled={loading || !batchId} className="rounded-lg bg-accent px-4 py-1.5 text-sm text-[#06070d] transition-colors hover:bg-accent/90 disabled:cursor-not-allowed disabled:opacity-40">{loading ? "Retryingâ€¦" : "Retry"}</button><button onClick={clearBatch} className="rounded-lg border border-border bg-bg-elevated px-4 py-1.5 text-sm text-text-secondary transition-colors hover:text-text-primary">New Batch</button></div></div>}
+      {pollError && !result && <div className="rounded-lg border border-verdict-malicious/30 bg-verdict-malicious/10 p-6 text-center"><p className="mb-2 font-medium text-verdict-malicious">Batch polling interrupted</p><p className="mb-4 text-sm text-text-secondary">{pollError}</p><div className="flex justify-center gap-2"><button onClick={handleRetryPoll} disabled={loading || !batchId} className="rounded-lg bg-accent px-4 py-1.5 text-sm text-[#06070d] transition-colors hover:bg-accent/90 disabled:cursor-not-allowed disabled:opacity-40">{loading ? "Retrying…" : "Retry"}</button><button onClick={clearBatch} className="rounded-lg border border-border bg-bg-elevated px-4 py-1.5 text-sm text-text-secondary transition-colors hover:text-text-primary">New Batch</button></div></div>}
 
-      {result && <div className="space-y-5"><BatchSummary result={result} groups={groups} /><div className="flex flex-wrap items-center justify-between gap-2"><div><h3 className="text-sm font-semibold uppercase tracking-wider text-text-secondary">IOC assessments</h3><p className="mt-1 text-xs text-text-secondary">Showing {visibleGroups.length} of {groups.length} unique IOCs Â· each card contains all provider evidence.</p></div><div className="flex gap-2"><button onClick={() => setExpandAll((value) => !value)} className="rounded-md border border-border bg-bg-elevated px-3 py-1.5 text-xs text-text-secondary hover:text-text-primary">{expandAll ? "Collapse all evidence" : "Expand all evidence"}</button><button onClick={() => handleRescanBatch()} disabled={loading} className="rounded-md border border-accent/40 bg-accent/10 px-3 py-1.5 text-xs font-semibold text-accent hover:bg-accent/20 transition-colors">Re-scan Batch</button><button onClick={() => { const blob = new Blob([JSON.stringify(result, null, 2)], { type: "application/json" }); const url = URL.createObjectURL(blob); const anchor = document.createElement("a"); anchor.href = url; anchor.download = "batch-results.json"; anchor.click(); URL.revokeObjectURL(url); }} className="rounded-md bg-accent px-3 py-1.5 text-xs text-[#06070d] hover:bg-accent/90">Download JSON</button><button onClick={clearBatch} className="rounded-md border border-border bg-bg-elevated px-3 py-1.5 text-xs text-text-secondary hover:text-text-primary">New Batch</button></div></div>
+      {result && <div className="space-y-5"><BatchSummary result={result} groups={groups} /><div className="flex flex-wrap items-center justify-between gap-2"><div><h3 className="text-sm font-semibold uppercase tracking-wider text-text-secondary">IOC assessments</h3><p className="mt-1 text-xs text-text-secondary">Showing {visibleGroups.length} of {groups.length} unique IOCs · each card contains all provider evidence.</p></div><div className="flex gap-2"><button onClick={() => setExpandAll((value) => !value)} className="rounded-md border border-border bg-bg-elevated px-3 py-1.5 text-xs text-text-secondary hover:text-text-primary">{expandAll ? "Collapse all evidence" : "Expand all evidence"}</button><button onClick={() => handleRescanBatch()} disabled={loading} className="rounded-md border border-accent/40 bg-accent/10 px-3 py-1.5 text-xs font-semibold text-accent hover:bg-accent/20 transition-colors">Re-scan Batch</button><button onClick={() => { const blob = new Blob([JSON.stringify(result, null, 2)], { type: "application/json" }); const url = URL.createObjectURL(blob); const anchor = document.createElement("a"); anchor.href = url; anchor.download = "batch-results.json"; anchor.click(); URL.revokeObjectURL(url); }} className="rounded-md bg-accent px-3 py-1.5 text-xs text-[#06070d] hover:bg-accent/90">Download JSON</button><button onClick={clearBatch} className="rounded-md border border-border bg-bg-elevated px-3 py-1.5 text-xs text-text-secondary hover:text-text-primary">New Batch</button></div></div>
 
-        <section className="rounded-lg border border-border bg-bg-card p-3"><div className="grid grid-cols-1 gap-2 md:grid-cols-2 lg:grid-cols-4"><input value={query} onChange={(event) => setQuery(event.target.value)} placeholder="Search IOC, type, provider, family" className="rounded-md border border-border bg-bg-elevated px-3 py-2 text-xs text-text-primary outline-none focus:border-accent" /><select value={verdictFilter} onChange={(event) => setVerdictFilter(event.target.value)} className="rounded-md border border-border bg-bg-elevated px-3 py-2 text-xs text-text-primary"><option value="all">All verdicts</option><option value="malicious">Malicious</option><option value="breached">Breached</option><option value="suspicious">Suspicious</option><option value="benign">Benign</option><option value="not_breached">Not Breached</option><option value="unknown">Unknown</option></select><select value={domainFilter} onChange={(event) => setDomainFilter(event.target.value)} className="rounded-md border border-border bg-bg-elevated px-3 py-2 text-xs text-text-primary"><option value="all">All assessment domains</option>{domainOptions.map((domain) => <option key={domain} value={domain}>{domain.replace(/_/g, " ")}</option>)}</select><select value={typeFilter} onChange={(event) => setTypeFilter(event.target.value)} className="rounded-md border border-border bg-bg-elevated px-3 py-2 text-xs text-text-primary"><option value="all">All IOC types</option>{[...new Set(groups.map((group) => group.type))].sort().map((type) => <option key={type} value={type}>{type}</option>)}</select><select value={providerFilter} onChange={(event) => setProviderFilter(event.target.value)} className="rounded-md border border-border bg-bg-elevated px-3 py-2 text-xs text-text-primary"><option value="all">All providers</option>{providerOptions.map((provider) => <option key={provider} value={provider}>{provider}</option>)}</select><select value={statusFilter} onChange={(event) => setStatusFilter(event.target.value)} className="rounded-md border border-border bg-bg-elevated px-3 py-2 text-xs text-text-primary"><option value="all">All lookup status</option><option value="complete">Complete</option><option value="partial">Partial</option><option value="rate_limited">Rate limited</option><option value="not_applicable">Not applicable</option><option value="unavailable">Unavailable</option><option value="batch_deadline_exceeded">Deadline exceeded</option></select><select value={confidenceFilter} onChange={(event) => setConfidenceFilter(event.target.value)} className="rounded-md border border-border bg-bg-elevated px-3 py-2 text-xs text-text-primary"><option value="all">All confidence</option><option value="high">High confidence</option><option value="medium">Medium confidence</option><option value="low">Low confidence</option></select><select value={freshnessFilter} onChange={(event) => setFreshnessFilter(event.target.value)} className="rounded-md border border-border bg-bg-elevated px-3 py-2 text-xs text-text-primary"><option value="all">All freshness</option><option value="fresh">Fresh</option><option value="cached">Cached</option><option value="historical">Historical</option><option value="unavailable">Unavailable</option></select><select value={riskFilter} onChange={(event) => setRiskFilter(event.target.value)} className="rounded-md border border-border bg-bg-elevated px-3 py-2 text-xs text-text-primary"><option value="all">All risk scores</option><option value="high">High risk (70+)</option><option value="medium">Medium risk (30-69)</option><option value="low">Low risk (&lt;30)</option></select><select value={coverageFilter} onChange={(event) => setCoverageFilter(event.target.value)} className="rounded-md border border-border bg-bg-elevated px-3 py-2 text-xs text-text-primary"><option value="all">All coverage</option><option value="low">Low coverage (&lt;50%)</option><option value="adequate">Adequate coverage</option></select><input value={malwareFilter} onChange={(event) => setMalwareFilter(event.target.value)} placeholder="Malware family" className="rounded-md border border-border bg-bg-elevated px-3 py-2 text-xs text-text-primary outline-none focus:border-accent" /><select value={sortBy} onChange={(event) => setSortBy(event.target.value)} className="rounded-md border border-border bg-bg-elevated px-3 py-2 text-xs text-text-primary"><option value="severity">Sort: severity</option><option value="risk">Sort: highest risk</option><option value="evidence">Sort: evidence strength</option><option value="coverage">Sort: lowest coverage</option><option value="confidence">Sort: confidence</option><option value="newest">Sort: newest observation</option><option value="oldest">Sort: oldest observation</option><option value="duration">Sort: slowest provider</option><option value="ioc">Sort: IOC value</option></select><label className="flex items-center gap-2 rounded-md border border-border bg-bg-elevated px-3 py-2 text-xs text-text-secondary"><input type="checkbox" checked={reviewOnly} onChange={(event) => setReviewOnly(event.target.checked)} /> Needs analyst review</label></div></section>
+        <section className="rounded-lg border border-border bg-bg-card p-3"><div className="grid grid-cols-1 gap-2 md:grid-cols-2 lg:grid-cols-4"><input aria-label="Search indicators" value={query} onChange={(event) => setQuery(event.target.value)} placeholder="Search IOC, type, provider, family" className="rounded-md border border-border bg-bg-elevated px-3 py-2 text-xs text-text-primary outline-none focus:border-accent" /><select aria-label="Filter by verdict" value={verdictFilter} onChange={(event) => setVerdictFilter(event.target.value)} className="rounded-md border border-border bg-bg-elevated px-3 py-2 text-xs text-text-primary"><option value="all">All verdicts</option>{verdictOptions.map((bucket) => <option key={bucket} value={bucket}>{verdictLabel(bucket)}</option>)}</select><select aria-label="Filter by assessment domain" value={domainFilter} onChange={(event) => setDomainFilter(event.target.value)} className="rounded-md border border-border bg-bg-elevated px-3 py-2 text-xs text-text-primary"><option value="all">All assessment domains</option>{domainOptions.map((domain) => <option key={domain} value={domain}>{domain.replace(/_/g, " ")}</option>)}</select><select aria-label="Filter by IOC type" value={typeFilter} onChange={(event) => setTypeFilter(event.target.value)} className="rounded-md border border-border bg-bg-elevated px-3 py-2 text-xs text-text-primary"><option value="all">All IOC types</option>{[...new Set(groups.map((group) => group.type))].sort().map((type) => <option key={type} value={type}>{type}</option>)}</select><select aria-label="Filter by provider" value={providerFilter} onChange={(event) => setProviderFilter(event.target.value)} className="rounded-md border border-border bg-bg-elevated px-3 py-2 text-xs text-text-primary"><option value="all">All providers</option>{providerOptions.map((provider) => <option key={provider} value={provider}>{provider}</option>)}</select><select aria-label="Filter by lookup status" value={statusFilter} onChange={(event) => setStatusFilter(event.target.value)} className="rounded-md border border-border bg-bg-elevated px-3 py-2 text-xs text-text-primary"><option value="all">All lookup status</option><option value="complete">Complete</option><option value="partial">Partial</option><option value="rate_limited">Rate limited</option><option value="not_applicable">Not applicable</option><option value="unavailable">Unavailable</option><option value="batch_deadline_exceeded">Deadline exceeded</option></select><select aria-label="Filter by confidence" value={confidenceFilter} onChange={(event) => setConfidenceFilter(event.target.value)} className="rounded-md border border-border bg-bg-elevated px-3 py-2 text-xs text-text-primary"><option value="all">All confidence</option><option value="high">High confidence</option><option value="medium">Medium confidence</option><option value="low">Low confidence</option></select><select aria-label="Filter by freshness" value={freshnessFilter} onChange={(event) => setFreshnessFilter(event.target.value)} className="rounded-md border border-border bg-bg-elevated px-3 py-2 text-xs text-text-primary"><option value="all">All freshness</option><option value="fresh">Fresh</option><option value="cached">Cached</option><option value="historical">Historical</option><option value="unavailable">Unavailable</option></select><select aria-label="Filter by risk band" value={riskFilter} onChange={(event) => setRiskFilter(event.target.value)} className="rounded-md border border-border bg-bg-elevated px-3 py-2 text-xs text-text-primary"><option value="all">All risk scores</option><option value="high">High risk (70+)</option><option value="medium">Medium risk (30-69)</option><option value="low">Low risk (&lt;30)</option></select><select aria-label="Filter by coverage" value={coverageFilter} onChange={(event) => setCoverageFilter(event.target.value)} className="rounded-md border border-border bg-bg-elevated px-3 py-2 text-xs text-text-primary"><option value="all">All coverage</option><option value="low">Low coverage (&lt;50%)</option><option value="adequate">Adequate coverage</option></select><input aria-label="Filter by malware family" value={malwareFilter} onChange={(event) => setMalwareFilter(event.target.value)} placeholder="Malware family" className="rounded-md border border-border bg-bg-elevated px-3 py-2 text-xs text-text-primary outline-none focus:border-accent" /><select aria-label="Sort results by" value={sortBy} onChange={(event) => setSortBy(event.target.value)} className="rounded-md border border-border bg-bg-elevated px-3 py-2 text-xs text-text-primary"><option value="severity">Sort: severity</option><option value="risk">Sort: highest risk</option><option value="evidence">Sort: evidence strength</option><option value="coverage">Sort: lowest coverage</option><option value="confidence">Sort: confidence</option><option value="newest">Sort: newest observation</option><option value="oldest">Sort: oldest observation</option><option value="duration">Sort: slowest provider</option><option value="ioc">Sort: IOC value</option></select><label className="flex items-center gap-2 rounded-md border border-border bg-bg-elevated px-3 py-2 text-xs text-text-secondary"><input type="checkbox" checked={reviewOnly} onChange={(event) => setReviewOnly(event.target.checked)} /> Needs analyst review</label></div></section>
 
-        <div className="space-y-3">{visibleGroups.length === 0 ? <div className="rounded-lg border border-border bg-bg-card p-8 text-center text-sm text-text-secondary">No IOCs match the current filters.</div> : visibleGroups.map((group) => group.assessment ? <div key={group.key} className="relative">{openingKey === group.key && <div className="absolute inset-0 z-10 flex items-center justify-center rounded-xl bg-bg-card/70 backdrop-blur-[1px]" aria-live="polite"><span className="rounded-md border border-accent/40 bg-accent/10 px-3 py-1.5 text-xs font-semibold text-accent">Loading full analysisâ€¦</span></div>}<IocAssessmentCard assessment={group.assessment} results={group.results} forceExpanded={expandAll} onOpen={() => { void handleOpenGroup(group); }} /></div> : <UnassessedGroup key={group.key} group={group} />)}</div>
+        <div className="space-y-3">{visibleGroups.length === 0 ? <div className="rounded-lg border border-border bg-bg-card p-8 text-center text-sm text-text-secondary">No IOCs match the current filters.</div> : visibleGroups.map((group) => group.assessment ? <div key={group.key} className="relative">{openingKey === group.key && <div className="absolute inset-0 z-10 flex items-center justify-center rounded-xl bg-bg-card/70 backdrop-blur-[1px]" aria-live="polite"><span className="rounded-md border border-accent/40 bg-accent/10 px-3 py-1.5 text-xs font-semibold text-accent">Loading full analysis…</span></div>}<IocAssessmentCard assessment={group.assessment} results={group.results} forceExpanded={expandAll} onOpen={() => { void handleOpenGroup(group); }} /></div> : <UnassessedGroup key={group.key} group={group} />)}</div>
       </div>}
     </div>
   );

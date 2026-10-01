@@ -219,11 +219,13 @@ export default function History() {
                       <span className="text-xs text-text-secondary">
                         {batch.completed}/{batch.total} IOCs
                       </span>
-                      <VerdictBadge label="malicious" count={summary.malicious ?? 0} />
-                      <VerdictBadge label="suspicious" count={summary.suspicious ?? 0} />
-                      <VerdictBadge label="clean" count={summary.clean ?? 0} />
-                      <VerdictBadge label="unknown" count={summary.unknown ?? 0} />
-                      <VerdictBadge label="error" count={summary.error ?? 0} />
+        <VerdictBadge label="malicious" count={summary.malicious ?? 0} />
+        <VerdictBadge label="breached" count={summary.breached ?? 0} />
+        <VerdictBadge label="suspicious" count={summary.suspicious ?? 0} />
+        <VerdictBadge label="clean" count={summary.clean ?? 0} />
+        <VerdictBadge label="unknown" count={summary.unknown ?? 0} />
+        <VerdictBadge label="error" count={summary.error ?? 0} />
+
                     </div>
                     <div className="mt-1 text-xs text-text-secondary">
                       {formatDateTime(batch.created_at)}

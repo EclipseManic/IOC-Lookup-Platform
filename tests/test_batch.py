@@ -148,7 +148,7 @@ def test_consolidate_counts_per_ioc_not_per_result():
     bt.subtasks = [t1, t2, t3]
     bt.completed = 3
     out = consolidate_batch_results(bt)
-    assert out["summary"] == {"malicious": 1, "suspicious": 0, "clean": 1, "unknown": 1, "error": 0}
+    assert out["summary"] == {"malicious": 1, "breached": 0, "suspicious": 0, "clean": 1, "unknown": 1, "error": 0}
 
 
 def test_consolidate_error_subtask_counts_as_error():

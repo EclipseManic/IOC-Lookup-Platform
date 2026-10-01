@@ -1237,8 +1237,18 @@ async def recent_lookups(db: AsyncSession = Depends(get_db)):
     # re-scanned IOC moves to the top, and reports that lookup's verdict and
     # time.  Only summary columns are read: loading every stored full_response
     # (the IOC.lookup_results relationship) just to pick the newest was heavy.
+    #
+    # Batch rows are excluded.  ``_persist_batch`` writes every completed
+    # subtask to LookupResult tagged with its batch_id so a batch survives a
+    # restart, which meant a 100-IOC batch injected 100 entries into the
+    # single-scan history.  Those IOCs belong to the batch, and they are still
+    # reachable through /api/batches and /api/batch/{id}/result.  The filter is
+    # applied INSIDE the latest-per-IOC subquery as well, so an IOC whose most
+    # recent result happened to come from a batch still reports its latest
+    # genuine single-scan verdict rather than being dropped.
     latest_id = (
         select(LookupResult.ioc_id, func.max(LookupResult.id).label("latest_id"))
+        .where(LookupResult.batch_id.is_(None))
         .group_by(LookupResult.ioc_id)
         .subquery()
     )
@@ -1255,6 +1265,10 @@ async def recent_lookups(db: AsyncSession = Depends(get_db)):
         )
         .outerjoin(latest_id, latest_id.c.ioc_id == IOC.id)
         .outerjoin(LookupResult, LookupResult.id == latest_id.c.latest_id)
+        .where(
+            # An IOC known only through a batch must not appear here at all.
+            LookupResult.id.isnot(None)
+        )
         .order_by(
             func.coalesce(LookupResult.created_at, IOC.created_at).desc(),
             func.coalesce(LookupResult.id, 0).desc(),
