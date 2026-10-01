@@ -125,7 +125,7 @@ describe("request error reporting", () => {
 
     expect((error as ApiError).status).toBe(0);
     expect((error as ApiError).detail).toBe(NETWORK_ERROR_DETAIL);
-    expect((error as ApiError).message).toMatch(/Cannot reach the IOC platform backend/);
+    expect((error as ApiError).message).toMatch(/Cannot reach the IOC Lookup Platform backend/);
   });
 
   it("asks for the API key on 401", async () => {

@@ -145,7 +145,7 @@ async def test_hybrid_analysis():
             params={"hash": "d41d8cd98f00b204e9800998ecf8427e"},
             headers={
                 "api-key": k,
-                "user-agent": "IOC-Platform/1.0",
+                "user-agent": "IOC-Lookup-Platform/1.0",
                 "Accept": "application/json",
             },
         )

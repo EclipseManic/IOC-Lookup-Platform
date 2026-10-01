@@ -72,7 +72,7 @@ def build_misp_event(response: dict) -> dict:
         "type": _MISP_ATTR_TYPE_MAP.get(ioc_type, "text"),
         "category": "Network activity",
         "value": ioc_value,
-        "comment": f"IOC Platform lookup — {verdict} (score: {score})",
+        "comment": f"IOC Lookup Platform lookup — {verdict} (score: {score})",
         # Only indicators assessed as threats are flagged for IDS use; a
         # benign/unknown/context result must not end up in detection rules.
         "to_ids": verdict in {"malicious", "suspicious"},
@@ -171,7 +171,7 @@ def build_misp_event(response: dict) -> dict:
         "Event": {
             "id": event_id,
             "uuid": event_id,
-            "info": f"IOC Platform lookup: {ioc_value} ({ioc_type})",
+            "info": f"IOC Lookup Platform lookup: {ioc_value} ({ioc_type})",
             "published": False,
             "analysis": 2,
             "timestamp": _ts(),

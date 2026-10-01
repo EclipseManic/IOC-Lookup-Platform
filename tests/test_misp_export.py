@@ -30,7 +30,7 @@ def _make_response(verdict="malicious", score=85.0, results=None, rels=None):
 def test_misp_event_structure():
     event = build_misp_event(_make_response())
     assert "Event" in event
-    assert event["Event"]["info"] == "IOC Platform lookup: 8.8.8.8 (ipv4)"
+    assert event["Event"]["info"] == "IOC Lookup Platform lookup: 8.8.8.8 (ipv4)"
     assert event["Event"]["Tag"][0]["name"] == "tlp:red"
 
 

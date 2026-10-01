@@ -177,7 +177,7 @@ def export_leef(response: dict) -> str:
             ("malwareFamily", r.get("malware_family", "")),
         ]
         kv = "\t".join(f"{k}={v}" for k, v in pairs)
-        lines.append(f"LEEF:2.0|IOC Platform|ioc-platform|0.2.0|IOC Lookup|{kv}")
+        lines.append(f"LEEF:2.0|IOC Lookup Platform|ioc-lookup-platform|0.2.0|IOC Lookup|{kv}")
     return "\n".join(lines)
 
 

@@ -70,7 +70,7 @@ def test_export_ecs_validation_rejects_malformed():
 
 def test_export_leef_basic():
     text = export_leef(_make_response())
-    assert text.startswith("LEEF:2.0|IOC Platform|ioc-platform|0.2.0|IOC Lookup|")
+    assert text.startswith("LEEF:2.0|IOC Lookup Platform|ioc-lookup-platform|0.2.0|IOC Lookup|")
     assert "cat=IOC Lookup" in text
 
 

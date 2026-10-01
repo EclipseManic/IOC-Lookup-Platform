@@ -173,7 +173,7 @@ SERVICES = [
         "params_fn": lambda: {"hash": PROBE_HASH},
         "headers_fn": lambda k: {
             "api-key": k,
-            "user-agent": "IOC-Platform/1.0",
+            "user-agent": "IOC-Lookup-Platform/1.0",
             "Accept": "application/json",
         },
         "expected_fields": [
@@ -333,7 +333,7 @@ SERVICES = [
         "probe_desc": "GET /range/5BAA6 (SHA-1 prefix for 'password')",
         "method": "GET",
         "url": "https://api.pwnedpasswords.com/range/5BAA6",
-        "headers_fn": lambda k: {"Add-Padding": "true", "User-Agent": "IOC-Platform/1.0"},
+        "headers_fn": lambda k: {"Add-Padding": "true", "User-Agent": "IOC-Lookup-Platform/1.0"},
         "expected_fields": [
             "k-anonymity SHA-1 hash suffix matches",
             "breach occurrence count per hash",

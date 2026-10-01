@@ -212,7 +212,7 @@ describe("Batch polling terminal states", () => {
 
   it("keeps polling through a transient status failure instead of aborting", async () => {
     getBatchStatus
-      .mockRejectedValueOnce(new Error("Cannot reach the IOC platform backend."))
+      .mockRejectedValueOnce(new Error("Cannot reach the IOC Lookup Platform backend."))
       .mockResolvedValue(STATUS_DONE);
     await startBatchAndWait();
     await vi.advanceTimersByTimeAsync(1500);
@@ -224,7 +224,7 @@ describe("Batch polling terminal states", () => {
   });
 
   it("shows the retry card after repeated polling failures", async () => {
-    getBatchStatus.mockRejectedValue(new Error("Cannot reach the IOC platform backend."));
+    getBatchStatus.mockRejectedValue(new Error("Cannot reach the IOC Lookup Platform backend."));
     await startBatchAndWait();
     await vi.advanceTimersByTimeAsync(8000);
 

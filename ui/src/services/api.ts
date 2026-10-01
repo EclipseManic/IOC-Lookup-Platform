@@ -103,7 +103,7 @@ function describeFailure(status: number, detail: string | undefined, retryAfter:
     return `${detail || "Too many requests: the platform's lookup rate limit was reached."}${retry}`.trim();
   }
   if (status === 502 || status === 503 || status === 504) {
-    return detail ? `Backend unavailable (${status}): ${detail}` : `Backend unavailable (HTTP ${status}). Check that the IOC platform server is running.`;
+    return detail ? `Backend unavailable (${status}): ${detail}` : `Backend unavailable (HTTP ${status}). Check that the IOC Lookup Platform server is running.`;
   }
   if (status >= 500) return detail ? `Server error (${status}): ${detail}` : `Server error (HTTP ${status}).`;
   return detail || `Request failed (HTTP ${status}).`;
@@ -157,7 +157,7 @@ async function request<T>(path: string, options: RequestOptions = {}): Promise<T
     }
     if (err instanceof TypeError) {
       // fetch() rejects with a TypeError when the backend is unreachable.
-      throw new ApiError("Cannot reach the IOC platform backend. Check that the server is running.", 0, NETWORK_ERROR_DETAIL);
+      throw new ApiError("Cannot reach the IOC Lookup Platform backend. Check that the server is running.", 0, NETWORK_ERROR_DETAIL);
     }
     if (err instanceof SyntaxError) {
       throw new ApiError("The server returned an unreadable response.", 0, "invalid_response");

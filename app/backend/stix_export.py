@@ -307,7 +307,7 @@ def build_stix_bundle(response: dict) -> dict:
         "id": _stix_id("identity"),
         "created": _ts(),
         "modified": _ts(),
-        "name": "IOC Platform",
+        "name": "IOC Lookup Platform",
         "identity_class": "system",
     })
 

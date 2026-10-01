@@ -288,7 +288,7 @@ export default function App() {
           className="text-lg font-bold bg-gradient-to-r from-accent to-accent-secondary bg-clip-text text-transparent"
           aria-label="Home"
         >
-          IOC Platform
+          IOC Lookup Platform
         </a>
 
         <div className="flex-1 flex justify-center">
