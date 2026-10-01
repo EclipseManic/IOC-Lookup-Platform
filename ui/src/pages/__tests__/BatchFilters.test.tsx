@@ -90,6 +90,13 @@ const ROWS: Row[] = [
   { ioc: "cov-050", type: "domain", verdict: "unknown", confidence: "low", score: 0, coverage: 0.5, freshness: "fresh", provider: "VirusTotal" },
   // freshness + review + malware
   { ioc: "stale-ip", type: "ipv4", verdict: "malicious", confidence: "high", score: 75, coverage: 0.2, freshness: "historical", review: true, malware: ["TrickBot"], provider: "AbuseIPDB" },
+  // provider-level failures, each in a different bucket
+  { ioc: "prov-unavail", type: "domain", verdict: "unknown", confidence: "low", score: 0, coverage: 0.9, freshness: "fresh", provider: "Censys", unavailable: ["Censys"] },
+  { ioc: "prov-error", type: "domain", verdict: "unknown", confidence: "low", score: 0, coverage: 0.9, freshness: "fresh", provider: "Shodan", errors: ["Shodan"] },
+  // whole-lookup outcomes that had no dropdown entry at all
+  { ioc: "lookup-error", type: "ipv4", verdict: "unknown", confidence: "low", score: 0, coverage: 0, freshness: "unavailable", provider: "GreyNoise", status: "error" },
+  { ioc: "lookup-cancelled", type: "ipv4", verdict: "unknown", confidence: "low", score: 0, coverage: 0, freshness: "unavailable", provider: "GreyNoise", status: "cancelled" },
+  { ioc: "lookup-notapplicable", type: "ipv4", verdict: "context_only", confidence: "low", score: 0, coverage: 0, freshness: "unavailable", provider: "GreyNoise", status: "not_applicable" },
 ];
 
 function makeResult() {
@@ -144,6 +151,7 @@ function makeResult() {
       coverage: r.coverage ?? 1,
       freshness: r.freshness ?? "fresh",
       needs_review: r.review ?? false,
+      assessment_status: r.status ?? "complete",
       malware_families: r.malware ?? [],
       rate_limited_sources: r.rateLimited ?? [],
       unavailable_sources: r.unavailable ?? [],
@@ -236,7 +244,7 @@ describe("every batch filter, against a dummy dataset", () => {
 
   it("FILTER: provider", async () => {
     await renderBatch();
-    setSelect(/filter by provider/i, "HIBP");
+    setSelect(/^filter by provider$/i, "HIBP");
     expect(shown()).toEqual(["pwned-mail"]);
   });
 
@@ -323,7 +331,72 @@ describe("every batch filter, against a dummy dataset", () => {
   it("FILTER: lookup status = partial, which is where a single failed provider lands", async () => {
     await renderBatch();
     setSelect(/lookup status/i, "partial");
+    expect(shown().sort()).toEqual(["prov-error", "prov-unavail", "susp-ip"]);
+  });
+
+  it("FILTER: lookup status = error is now selectable", async () => {
+    // statusFor() could always return "error"; the dropdown had no such option,
+    // so an indicator that failed outright was unreachable.
+    await renderBatch();
+    setSelect(/lookup status/i, "error");
+    expect(shown()).toEqual(["lookup-error"]);
+  });
+
+  it("FILTER: lookup status = cancelled is now selectable", async () => {
+    await renderBatch();
+    setSelect(/lookup status/i, "cancelled");
+    expect(shown()).toEqual(["lookup-cancelled"]);
+  });
+
+  it("FILTER: lookup status = not_applicable", async () => {
+    await renderBatch();
+    setSelect(/lookup status/i, "not_applicable");
+    expect(shown()).toEqual(["lookup-notapplicable"]);
+  });
+
+  it("FILTER: provider issue finds a single rate-limited provider that statusFor folds into partial", async () => {
+    // The whole point: susp-ip is "partial" as a status, but one of its
+    // providers was rate limited, and that is only visible here.
+    await renderBatch();
+    setSelect(/provider issue/i, "rate_limited");
     expect(shown()).toEqual(["susp-ip"]);
+  });
+
+  it("FILTER: provider issue = unavailable", async () => {
+    await renderBatch();
+    setSelect(/provider issue/i, "unavailable");
+    expect(shown()).toEqual(["prov-unavail"]);
+  });
+
+  it("FILTER: provider issue = error", async () => {
+    await renderBatch();
+    setSelect(/provider issue/i, "error");
+    expect(shown()).toEqual(["prov-error"]);
+  });
+
+  it("FILTER: provider issue = any failure", async () => {
+    await renderBatch();
+    setSelect(/provider issue/i, "any");
+    expect(shown().sort()).toEqual(["prov-error", "prov-unavail", "susp-ip"]);
+  });
+
+  it("FILTER: provider issue = none, the complement", async () => {
+    await renderBatch();
+    setSelect(/provider issue/i, "any");
+    const failed = shown().length;
+    setSelect(/provider issue/i, "none");
+    expect(shown().length).toBe(ROWS.length - failed);
+    expect(shown()).not.toContain("susp-ip");
+  });
+
+  it("provider issue and lookup status combine rather than conflict", async () => {
+    await renderBatch();
+    setSelect(/provider issue/i, "rate_limited");
+    setSelect(/lookup status/i, "partial");
+    expect(shown()).toEqual(["susp-ip"]);
+    // Same provider issue, but a status that rules it out.
+    setSelect(/lookup status/i, "cancelled");
+    expect(shown()).toEqual([]);
   });
 
   it("FILTERS combine with AND rather than replacing each other", async () => {
@@ -365,6 +438,8 @@ describe("every batch filter, against a dummy dataset", () => {
   it("SORT: coverage orders ascending", async () => {
     await renderBatch();
     setSelect(/sort results by/i, "coverage");
-    expect(shown()[0]).toBe("stale-ip");
-  });
-});
+    // Three rows tie at the lowest coverage of 0, and sort is stable, so the
+    // first row must be one of them rather than a specific one.
+    expect(["lookup-error", "lookup-cancelled", "lookup-notapplicable"]).toContain(shown()[0]);
+    expect(shown()).toContain("stale-ip");
+  });});
