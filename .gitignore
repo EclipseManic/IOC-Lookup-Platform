@@ -34,16 +34,7 @@ data/*.db-journal
 .cache/
 .coverage
 data-test
-.mimocode/
 ui/tsconfig.tsbuildinfo
-.playwright-mcp/
-
-# OpenCode config
-.opencode/
-
-# Kilo agent worktrees and session state
-.kilo/
-
 
 # Planning / working dirs
 .planning/
